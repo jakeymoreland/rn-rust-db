@@ -1,19 +1,27 @@
+type ChangeEvent = { channel: string; payload: string };
+
+function makeOnChange() {
+  const onChange = (fn: (e: ChangeEvent) => void) => {
+    onChange.listeners.push(fn);
+    return { remove: () => { onChange.listeners = onChange.listeners.filter((l) => l !== fn); } };
+  };
+  onChange.listeners = [] as Array<(e: ChangeEvent) => void>;
+  onChange.emit = (e: ChangeEvent) => {
+    onChange.listeners.forEach((l) => l(e));
+  };
+  return onChange;
+}
+
 export const mockNative = {
   open: jest.fn(),
   close: jest.fn(),
   execute: jest.fn(),
   executeSync: jest.fn(),
   installFastPath: jest.fn(() => true),
-  onChange: {
-    listeners: [] as Array<(e: { channel: string; payload: string }) => void>,
-    addListener(fn: (e: { channel: string; payload: string }) => void) {
-      this.listeners.push(fn);
-      return { remove: () => { this.listeners = this.listeners.filter((l) => l !== fn); } };
-    },
-    emit(e: { channel: string; payload: string }) {
-      this.listeners.forEach((l) => l(e));
-    },
-  },
+  // Matches the real TurboModule's runtime shape: `onChange` is itself a
+  // callable subscribe function (`onChange(listener) => { remove() }`),
+  // not an EventEmitter object with `.addListener`.
+  onChange: makeOnChange(),
 };
 
 export const TurboModuleRegistry = {
