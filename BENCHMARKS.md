@@ -3,6 +3,15 @@
 Method: Experiments screen in apps/sandbox, release-ish dev-client build,
 physical device where noted. Paste "Copy as markdown" output below per platform.
 
+Two run modes: **quick** (default button; skips the 100k block, so
+`queryBuffer100kMs`/`storageMaxGapMs` show `--` and the scorecard denominator
+shrinks accordingly) and **full** (includes the 100k block — the complete
+scored run; expect ~30 s of deliberate JS-thread punishment during it). The
+separate **Industry** tab runs an 8-row comparison against indicative
+industry-reference ranges for JSI/Rust stacks (bridge roundtrip, kv ops, 1 MB
+ingest, SQLite single/bulk insert, 10k-object marshaling, DLQ flush); rows
+whose reference measures less work than ours carry a caveat.
+
 Assessment matrix coverage:
 1. Call overhead (sync vs async)          -> call-overhead rows
 2. Marshaling (objects vs JSON vs buffer) -> query N rows

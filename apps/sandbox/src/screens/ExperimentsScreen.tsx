@@ -33,6 +33,17 @@ export function ExperimentsScreen() {
     return () => registerListVisibility(null);
   }, []);
 
+  const run = async (includeHeavy: boolean) => {
+    setRunning(true);
+    setProgress([]);
+    setOutput(null);
+    try {
+      setOutput(await runAll((m) => setProgress((p) => [...p, m]), { includeHeavy }));
+    } finally {
+      setRunning(false);
+    }
+  };
+
   // The FlatList phases swap the whole screen to the list route: a
   // VirtualizedList must not be nested inside this ScrollView.
   if (listVisible) {
@@ -42,18 +53,14 @@ export function ExperimentsScreen() {
   return (
     <ScrollView style={{ padding: 16 }}>
       <Button
-        title={running ? 'Running…' : 'Run benchmarks'}
+        title={running ? 'Running…' : 'Run benchmarks (quick)'}
         disabled={running}
-        onPress={async () => {
-          setRunning(true);
-          setProgress([]);
-          setOutput(null);
-          try {
-            setOutput(await runAll((m) => setProgress((p) => [...p, m])));
-          } finally {
-            setRunning(false);
-          }
-        }}
+        onPress={() => run(false)}
+      />
+      <Button
+        title={running ? 'Running…' : 'Run full benchmarks (incl. 100k)'}
+        disabled={running}
+        onPress={() => run(true)}
       />
       {output && (
         <Button

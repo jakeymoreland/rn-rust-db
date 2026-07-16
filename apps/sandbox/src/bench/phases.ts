@@ -34,7 +34,15 @@ import { setListVisible, waitForListDriver } from './listBridge';
 export type { BenchResult };
 export type { RunOutput };
 
-export async function runAll(onProgress: (msg: string) => void): Promise<RunOutput> {
+export type RunOptions = {
+  // The 100k-row block takes ~30 s of deliberately heavy JS-thread work and
+  // feeds queryBuffer100kMs + storageMaxGapMs. Quick runs skip it; those
+  // metrics then show as unmeasured (--/max) in the scorecard.
+  includeHeavy?: boolean;
+};
+
+export async function runAll(onProgress: (msg: string) => void, opts: RunOptions = {}): Promise<RunOutput> {
+  const { includeHeavy = false } = opts;
   const results: BenchResult[] = [];
   const metrics: BenchMetrics = {};
   const push = async (p: Promise<BenchResult> | BenchResult) => {
@@ -130,7 +138,9 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
       timestamp_field: null,
       priority: 1,
     });
-    for (const n of REALISTIC_SIZES) {
+    const sizes = includeHeavy ? REALISTIC_SIZES : REALISTIC_SIZES.filter((n) => n < 100_000);
+    if (!includeHeavy) onProgress('quick run: skipping the 100k block (query/max-gap metrics will show --)');
+    for (const n of sizes) {
       onProgress(`building ${n} realistic rows...`);
       const payload = await realisticRowsChunked(n);
       const bytesPerRecord = Math.round(payload.length / n);

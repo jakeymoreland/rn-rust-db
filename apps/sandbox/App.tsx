@@ -8,8 +8,9 @@ import { setEnginePath } from './src/enginePath';
 import { SourcesScreen } from './src/screens/SourcesScreen';
 import { EntriesScreen } from './src/screens/EntriesScreen';
 import { ExperimentsScreen } from './src/screens/ExperimentsScreen';
+import { IndustryScreen } from './src/screens/IndustryScreen';
 
-type Tab = 'sources' | 'entries' | 'experiments';
+type Tab = 'sources' | 'entries' | 'experiments' | 'industry';
 
 export default function App() {
   const [ready, setReady] = useState(false);
@@ -62,11 +63,13 @@ export default function App() {
         {tab === 'sources' && <SourcesScreen />}
         {tab === 'entries' && <EntriesScreen />}
         {tab === 'experiments' && <ExperimentsScreen />}
+        {tab === 'industry' && <IndustryScreen />}
       </View>
       <View style={styles.tabBar}>
         <Button title="Sources" onPress={() => setTab('sources')} />
         <Button title="Entries" onPress={() => setTab('entries')} />
         <Button title="Experiments" onPress={() => setTab('experiments')} />
+        <Button title="Industry" onPress={() => setTab('industry')} />
       </View>
       <StatusBar style="auto" />
     </View>
