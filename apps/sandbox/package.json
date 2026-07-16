@@ -22,15 +22,5 @@
     "ios": "expo run:ios",
     "web": "expo start --web"
   },
-  "codegenConfig": {
-    "name": "SandboxSpecs",
-    "type": "modules",
-    "jsSrcsDir": "specs",
-    "ios": {
-      "modulesProvider": {
-        "NativeReconcileEngine": "ReconcileEngineProvider"
-      }
-    }
-  },
   "private": true
 }

@@ -17,6 +17,11 @@
   "codegenConfig": {
     "name": "ReconcileEngineSpec",
     "type": "modules",
-    "jsSrcsDir": "src"
+    "jsSrcsDir": "src",
+    "ios": {
+      "modulesProvider": {
+        "NativeReconcileEngine": "ReconcileEngineProvider"
+      }
+    }
   }
 }
