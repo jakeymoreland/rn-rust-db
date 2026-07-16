@@ -328,8 +328,14 @@ pub fn reconcile(
         }
     }
 
-    const PARALLEL_THRESHOLD: usize = 128;
-    let outcomes: Vec<Result<GroupOutcome, EngineError>> = if groups.len() >= PARALLEL_THRESHOLD {
+    // Overridable for perf experiments (RECONCILE_PAR_THRESHOLD=0 disables
+    // parallelism entirely; usize::MAX effectively, since 0 parses as "off").
+    let parallel_threshold: usize = std::env::var("RECONCILE_PAR_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| if v == 0 { usize::MAX } else { v })
+        .unwrap_or(128);
+    let outcomes: Vec<Result<GroupOutcome, EngineError>> = if groups.len() >= parallel_threshold {
         use rayon::prelude::*;
         groups
             .into_par_iter()

@@ -69,18 +69,23 @@ export async function runIndustry(onProgress: (msg: string) => void): Promise<In
   onProgress('~1 MB JSON ingest (3 update waves)...');
   {
     // ~1300 realistic rows ≈ 1 MB; a fresh rev each wave forces real updates
-    // instead of content-hash skips.
+    // instead of content-hash skips. Payloads are PRE-BUILT: generating rows
+    // in Hermes costs tens of ms on device and must not pollute the timing.
+    const base = Math.floor(performance.now()) % 100000;
+    const payloads = [0, 1, 2].map((i) => realisticRows(1300, 900, base + i));
+    let w = 0;
     const waves = await timed(3, async () => {
-      await ingest('industry', realisticRows(1300, 900, Math.floor(performance.now()) % 100000));
+      await ingest('industry', payloads[w++]);
     });
     done('parse1mb', median(waves));
   }
 
   onProgress('SQLite single-row inserts (20 x 1 row)...');
   {
-    let rev = 0;
+    const payloads = Array.from({ length: 20 }, (_, rev) => realisticRows(1, 901, rev));
+    let w = 0;
     const waves = await timed(20, async () => {
-      await ingest('industry', realisticRows(1, 901, rev++));
+      await ingest('industry', payloads[w++]);
     });
     done('sqliteSingle', median(waves));
     // same measurement graded against the offline-first DB comparison suite
@@ -89,9 +94,10 @@ export async function runIndustry(onProgress: (msg: string) => void): Promise<In
 
   onProgress('SQLite bulk insert (3 x 1000 rows)...');
   {
-    let rev = 0;
+    const payloads = [0, 1, 2].map((rev) => realisticRows(1000, 902, rev));
+    let w = 0;
     const waves = await timed(3, async () => {
-      await ingest('industry', realisticRows(1000, 902, rev++));
+      await ingest('industry', payloads[w++]);
     });
     done('sqliteBulk1k', median(waves));
   }
@@ -122,10 +128,15 @@ export async function runIndustry(onProgress: (msg: string) => void): Promise<In
 
   onProgress('dead-letter 100 bad payloads (3 waves)...');
   {
-    // rows missing the natural key field are dead-lettered, not stored
-    const bad = JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ not_the_key: i, junk: 'x' })));
+    // rows missing the natural key field are dead-lettered, not stored. Each
+    // wave's payload differs so the whole-batch hash skip can't fire — every
+    // wave really writes 100 dead-letter rows.
+    const bads = [0, 1, 2].map((w) =>
+      JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ not_the_key: i, junk: `x${w}` }))),
+    );
+    let w = 0;
     const waves = await timed(3, async () => {
-      await ingest('industry', bad).catch(() => undefined);
+      await ingest('industry', bads[w++]).catch(() => undefined);
     });
     done('dlq100', median(waves));
   }
