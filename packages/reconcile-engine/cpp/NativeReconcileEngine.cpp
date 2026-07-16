@@ -16,6 +16,21 @@ std::string takeRustString(char* s) {
   engine_free_string(s);
   return out;
 }
+
+// RAII guard for buffers returned by engine_query_entries_bin. Ensures
+// engine_free_bytes runs exactly once on every exit path — normal return,
+// early throw (corrupt buffer, engine destroyed), or an exception thrown by
+// JSI/JS calls (ArrayBuffer construction, JSON.parse) — instead of only on
+// the happy path.
+struct RustBufferGuard {
+  unsigned char* data;
+  size_t len;
+  ~RustBufferGuard() {
+    if (data != nullptr) {
+      engine_free_bytes(data, len);
+    }
+  }
+};
 } // namespace
 
 NativeReconcileEngine::NativeReconcileEngine(std::shared_ptr<CallInvoker> jsInvoker)
@@ -152,11 +167,11 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         if (data == nullptr) {
           throw jsi::JSError(rt, "queryEntriesBuffer failed: " + takeRustString(engine_last_error()));
         }
+        RustBufferGuard guard{data, len};
         jsi::Function ctor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
         jsi::Object abObj = ctor.callAsConstructor(rt, static_cast<int>(len)).getObject(rt);
         jsi::ArrayBuffer ab = abObj.getArrayBuffer(rt);
         std::memcpy(ab.data(rt), data, len);
-        engine_free_bytes(data, len);
         return abObj;
       });
 
@@ -185,6 +200,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         if (data == nullptr) {
           throw jsi::JSError(rt, "queryEntriesObjects failed: " + takeRustString(engine_last_error()));
         }
+        RustBufferGuard guard{data, len};
         // Decode: LE [u32 count]([u32 klen][key][u32 jlen][json])*
         auto readU32 = [&](size_t off) -> uint32_t {
           if (off + 4 > len) {
@@ -197,6 +213,13 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         size_t off = 0;
         uint32_t rows = readU32(off);
         off += 4;
+        // Each row needs at least 8 bytes (two u32 length prefixes), so a
+        // claimed row count that can't possibly fit in the remaining buffer
+        // is corrupt — reject it before pre-allocating a jsi::Array of that
+        // size.
+        if (rows > (len - off) / 8) {
+          throw jsi::JSError(rt, "corrupt entry buffer");
+        }
         jsi::Array out(rt, rows);
         jsi::Function jsonParse = rt.global()
             .getPropertyAsObject(rt, "JSON")
@@ -217,7 +240,6 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
           row.setProperty(rt, "fields", jsonParse.call(rt, jsi::String::createFromUtf8(rt, json)));
           out.setValueAtIndex(rt, i, row);
         }
-        engine_free_bytes(data, len);
         return out;
       });
 
