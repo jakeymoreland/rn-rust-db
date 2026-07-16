@@ -42,17 +42,19 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
     let now = engine.now();
 
     match cmd.as_str() {
-        "get" => Ok(json!(commands::get(&engine.store, arg(&args, 0)?, now)?)),
+        "get" => Ok(json!(commands::get(engine, arg(&args, 0)?, now)?)),
         "set" => {
-            commands::set(&engine.store, arg(&args, 0)?, arg(&args, 1)?)?;
+            commands::set(engine, arg(&args, 0)?, arg(&args, 1)?)?;
             Ok(json!("OK"))
         }
-        "del" => Ok(json!(commands::del(&engine.store, arg(&args, 0)?)?)),
-        "mget" => Ok(json!(commands::mget(&engine.store, &args, now)?)),
-        "scan" => Ok(json!(commands::scan(&engine.store, arg(&args, 0)?, now)?)),
+        "del" => Ok(json!(commands::del(engine, arg(&args, 0)?)?)),
+        "mget" => Ok(json!(commands::mget(engine, &args, now)?)),
+        "scan" => Ok(json!(commands::scan(engine, arg(&args, 0)?, now)?)),
         "hget" => Ok(json!(commands::hget(&engine.store, arg(&args, 0)?, arg(&args, 1)?, now)?)),
         "hset" => {
             commands::hset(&engine.store, arg(&args, 0)?, arg(&args, 1)?, arg(&args, 2)?)?;
+            // hset clears the key's TTL row; keep the cache's mirror in sync
+            engine.kv.ttl.remove(arg(&args, 0)?);
             Ok(json!("OK"))
         }
         "hgetall" => Ok(json!(commands::hgetall(&engine.store, arg(&args, 0)?, now)?)),
@@ -60,10 +62,10 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
             let ttl_ms: i64 = arg(&args, 1)?
                 .parse()
                 .map_err(|_| EngineError::Command("ttl must be integer ms".into()))?;
-            commands::expire(&engine.store, arg(&args, 0)?, ttl_ms, now)?;
+            commands::expire(engine, arg(&args, 0)?, ttl_ms, now)?;
             Ok(json!("OK"))
         }
-        "ttl" => Ok(json!(commands::ttl(&engine.store, arg(&args, 0)?, now)?)),
+        "ttl" => Ok(json!(commands::ttl(engine, arg(&args, 0)?, now)?)),
         "subscribe" => Ok(json!(engine.pubsub.subscribe(arg(&args, 0)?))),
         "unsubscribe" => {
             let id: u64 = arg(&args, 0)?

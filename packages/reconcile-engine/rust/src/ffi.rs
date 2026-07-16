@@ -4,8 +4,10 @@ use crate::engine::Engine;
 use rusqlite::params;
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type EventCb = extern "C" fn(*mut c_void, *const c_char, *const c_char);
 
@@ -16,7 +18,9 @@ struct CallbackHolder {
 }
 
 pub struct EngineFfi {
-    inner: Mutex<Engine>,
+    inner: Arc<Mutex<Engine>>,
+    flusher_stop: Arc<AtomicBool>,
+    flusher: Option<JoinHandle<()>>,
 }
 
 thread_local! {
@@ -65,7 +69,23 @@ pub extern "C" fn engine_open(path: *const c_char) -> *mut c_void {
         return std::ptr::null_mut();
     };
     match Engine::open(path, Box::new(real_clock)) {
-        Ok(e) => Box::into_raw(Box::new(EngineFfi { inner: Mutex::new(e) })) as *mut c_void,
+        Ok(e) => {
+            let inner = Arc::new(Mutex::new(e));
+            let flusher_stop = Arc::new(AtomicBool::new(false));
+            // Write-behind durability: pending kv sets flush every ~100 ms even
+            // if no flush-forcing command runs. Woken early via unpark on close.
+            let (inner2, stop2) = (Arc::clone(&inner), Arc::clone(&flusher_stop));
+            let flusher = std::thread::spawn(move || loop {
+                std::thread::park_timeout(Duration::from_millis(100));
+                if stop2.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Ok(mut engine) = inner2.lock() {
+                    let _ = engine.flush_kv();
+                }
+            });
+            Box::into_raw(Box::new(EngineFfi { inner, flusher_stop, flusher: Some(flusher) })) as *mut c_void
+        }
         Err(e) => {
             set_last_error(e.code(), &e.to_string());
             std::ptr::null_mut()
@@ -284,7 +304,16 @@ pub extern "C" fn engine_free_bytes(p: *mut u8, len: usize) {
 #[no_mangle]
 pub extern "C" fn engine_close(handle: *mut c_void) {
     if !handle.is_null() {
-        unsafe { drop(Box::from_raw(handle as *mut EngineFfi)) };
+        let mut ffi = unsafe { Box::from_raw(handle as *mut EngineFfi) };
+        ffi.flusher_stop.store(true, Ordering::Relaxed);
+        if let Some(h) = ffi.flusher.take() {
+            h.thread().unpark();
+            let _ = h.join();
+        }
+        if let Ok(mut engine) = ffi.inner.lock() {
+            let _ = engine.flush_kv(); // final flush so no pending set is lost
+        }
+        drop(ffi);
     }
 }
 
@@ -438,6 +467,30 @@ mod tests {
         engine_free_bytes(p, len);
         assert_eq!(&bytes[0..4], &1u32.to_le_bytes());
         engine_close(h);
+    }
+
+    #[test]
+    fn kv_write_behind_persists_across_close() {
+        let path = std::env::temp_dir().join(format!("kvwb_{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cpath = CString::new(path.to_str().unwrap()).unwrap();
+
+        let h = engine_open(cpath.as_ptr());
+        assert!(!h.is_null());
+        let req = CString::new(r#"{"cmd":"set","args":["wb_key","wb_value"]}"#).unwrap();
+        let r = engine_execute(h, req.as_ptr());
+        engine_free_string(r);
+        engine_close(h); // must flush the pending write-behind set
+
+        let h2 = engine_open(cpath.as_ptr());
+        assert!(!h2.is_null());
+        let req2 = CString::new(r#"{"cmd":"get","args":["wb_key"]}"#).unwrap();
+        let r2 = engine_execute(h2, req2.as_ptr());
+        let resp = unsafe { CStr::from_ptr(r2) }.to_str().unwrap().to_string();
+        engine_free_string(r2);
+        engine_close(h2);
+        let _ = std::fs::remove_file(&path);
+        assert!(resp.contains("wb_value"), "expected persisted value, got: {resp}");
     }
 
     #[test]

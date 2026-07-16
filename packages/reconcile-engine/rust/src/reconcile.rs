@@ -275,9 +275,9 @@ mod tests {
 
     #[test]
     fn scan_sees_entry_virtual_keys() {
-        let mut st = Store::open(":memory:").unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
-        let keys = crate::commands::scan(&st, "entry:people:*", 0).unwrap();
+        let mut en = crate::engine::Engine::open(":memory:", Box::new(|| 0)).unwrap();
+        reconcile(&mut en.store, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        let keys = crate::commands::scan(&mut en, "entry:people:*", 0).unwrap();
         assert_eq!(keys, vec!["entry:people:a@x.com"]);
     }
 

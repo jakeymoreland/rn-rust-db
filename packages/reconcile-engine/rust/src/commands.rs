@@ -1,8 +1,12 @@
+use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::glob::glob_match;
 use crate::store::Store;
 use rusqlite::params;
 use std::collections::BTreeMap;
+
+/// How many pending write-behind sets accumulate before a synchronous flush.
+const KV_FLUSH_HIGH_WATER: usize = 256;
 
 pub const RESERVED_PREFIXES: [&str; 4] = ["entry:", "idx:", "meta:", "changes:"];
 
@@ -35,44 +39,73 @@ fn purge_if_expired(store: &Store, key: &str, now_ms: i64) -> Result<bool, Engin
     Ok(false)
 }
 
-pub fn get(store: &Store, key: &str, now_ms: i64) -> Result<Option<String>, EngineError> {
-    if purge_if_expired(store, key, now_ms)? {
+pub fn get(engine: &mut Engine, key: &str, now_ms: i64) -> Result<Option<String>, EngineError> {
+    // memory-first: TTL check, then cache hit, then cold read-through
+    if let Some(&expires_at) = engine.kv.ttl.get(key) {
+        if now_ms >= expires_at {
+            engine.kv.map.remove(key);
+            engine.kv.ttl.remove(key);
+            engine.flush_kv()?; // sqlite must agree before the purge deletes rows
+            purge_if_expired(&engine.store, key, now_ms)?;
+            return Ok(None);
+        }
+    }
+    if let Some(v) = engine.kv.map.get(key) {
+        return Ok(Some(v.clone()));
+    }
+    // A cache miss cannot be pending (pending keys are always in the map), so
+    // reading SQLite directly is safe without a flush.
+    if purge_if_expired(&engine.store, key, now_ms)? {
         return Ok(None);
     }
-    Ok(store
+    let v: Option<String> = engine
+        .store
         .conn
         .prepare_cached("SELECT value FROM kv WHERE key = ?1")?
         .query_row(params![key], |r| r.get(0))
-        .ok())
+        .ok();
+    if let Some(ref value) = v {
+        engine.kv.map.insert(key.to_string(), value.clone());
+        let expires: Option<i64> = engine
+            .store
+            .conn
+            .prepare_cached("SELECT expires_at FROM key_ttl WHERE key = ?1")?
+            .query_row(params![key], |r| r.get(0))
+            .ok();
+        if let Some(at) = expires {
+            engine.kv.ttl.insert(key.to_string(), at);
+        }
+    }
+    Ok(v)
 }
 
-pub fn set(store: &Store, key: &str, value: &str) -> Result<(), EngineError> {
+pub fn set(engine: &mut Engine, key: &str, value: &str) -> Result<(), EngineError> {
     check_writable(key)?;
-    store
-        .conn
-        .prepare_cached(
-            "INSERT INTO kv(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )?
-        .execute(params![key, value])?;
-    // Redis SET semantics: overwriting a key clears any existing TTL.
-    store
-        .conn
-        .prepare_cached("DELETE FROM key_ttl WHERE key = ?1")?
-        .execute(params![key])?;
+    engine.kv.map.insert(key.to_string(), value.to_string());
+    // Redis SET semantics: overwriting a key clears any existing TTL. The
+    // matching key_ttl row is cleared when this pending write flushes.
+    engine.kv.ttl.remove(key);
+    engine.kv.pending.push((key.to_string(), value.to_string()));
+    if engine.kv.pending.len() >= KV_FLUSH_HIGH_WATER {
+        engine.flush_kv()?;
+    }
     Ok(())
 }
 
-pub fn del(store: &Store, key: &str) -> Result<bool, EngineError> {
+pub fn del(engine: &mut Engine, key: &str) -> Result<bool, EngineError> {
     check_writable(key)?;
+    engine.flush_kv()?;
+    engine.kv.map.remove(key);
+    engine.kv.ttl.remove(key);
+    let store = &engine.store;
     let a = store.conn.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
     let b = store.conn.execute("DELETE FROM hash WHERE key = ?1", params![key])?;
     store.conn.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
     Ok(a + b > 0)
 }
 
-pub fn mget(store: &Store, keys: &[String], now_ms: i64) -> Result<Vec<Option<String>>, EngineError> {
-    keys.iter().map(|k| get(store, k, now_ms)).collect()
+pub fn mget(engine: &mut Engine, keys: &[String], now_ms: i64) -> Result<Vec<Option<String>>, EngineError> {
+    keys.iter().map(|k| get(engine, k, now_ms)).collect()
 }
 
 pub fn hset(store: &Store, key: &str, field: &str, value: &str) -> Result<(), EngineError> {
@@ -134,9 +167,11 @@ pub fn hgetall(store: &Store, key: &str, now_ms: i64) -> Result<BTreeMap<String,
     Ok(out)
 }
 
-pub fn scan(store: &Store, pattern: &str, now_ms: i64) -> Result<Vec<String>, EngineError> {
+pub fn scan(engine: &mut Engine, pattern: &str, now_ms: i64) -> Result<Vec<String>, EngineError> {
+    engine.flush_kv()?; // pending sets must be visible to the table scan
+    let store = &engine.store;
     let mut keys: Vec<String> = Vec::new();
-    let mut stmt = store.conn.prepare(
+    let mut stmt = store.conn.prepare_cached(
         "SELECT key FROM kv UNION SELECT DISTINCT key FROM hash",
     )?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -161,8 +196,10 @@ pub fn scan(store: &Store, pattern: &str, now_ms: i64) -> Result<Vec<String>, En
     Ok(out)
 }
 
-pub fn expire(store: &Store, key: &str, ttl_ms: i64, now_ms: i64) -> Result<(), EngineError> {
+pub fn expire(engine: &mut Engine, key: &str, ttl_ms: i64, now_ms: i64) -> Result<(), EngineError> {
     check_writable(key)?;
+    engine.flush_kv()?; // the key may only exist as a pending set
+    let store = &engine.store;
     let exists: bool = store
         .conn
         .query_row(
@@ -179,14 +216,21 @@ pub fn expire(store: &Store, key: &str, ttl_ms: i64, now_ms: i64) -> Result<(), 
          ON CONFLICT(key) DO UPDATE SET expires_at = excluded.expires_at",
         params![key, now_ms + ttl_ms],
     )?;
+    if engine.kv.map.contains_key(key) {
+        engine.kv.ttl.insert(key.to_string(), now_ms + ttl_ms);
+    }
     Ok(())
 }
 
-pub fn ttl(store: &Store, key: &str, now_ms: i64) -> Result<Option<i64>, EngineError> {
-    if purge_if_expired(store, key, now_ms)? {
+pub fn ttl(engine: &mut Engine, key: &str, now_ms: i64) -> Result<Option<i64>, EngineError> {
+    engine.flush_kv()?; // a pending set logically cleared any earlier TTL row
+    if purge_if_expired(&engine.store, key, now_ms)? {
+        engine.kv.map.remove(key);
+        engine.kv.ttl.remove(key);
         return Ok(None);
     }
-    let expires: Option<i64> = store
+    let expires: Option<i64> = engine
+        .store
         .conn
         .query_row(
             "SELECT expires_at FROM key_ttl WHERE key = ?1",
@@ -200,58 +244,60 @@ pub fn ttl(store: &Store, key: &str, now_ms: i64) -> Result<Option<i64>, EngineE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Store;
+    use crate::engine::Engine;
 
-    fn s() -> Store {
-        Store::open(":memory:").unwrap()
+    fn e() -> Engine {
+        Engine::open(":memory:", Box::new(|| 0)).unwrap()
     }
 
     #[test]
     fn set_get_roundtrip() {
-        let st = s();
-        set(&st, "a", "1").unwrap();
-        assert_eq!(get(&st, "a", 0).unwrap(), Some("1".into()));
-        assert_eq!(get(&st, "missing", 0).unwrap(), None);
+        let mut en = e();
+        set(&mut en, "a", "1").unwrap();
+        assert_eq!(get(&mut en, "a", 0).unwrap(), Some("1".into()));
+        assert_eq!(get(&mut en, "missing", 0).unwrap(), None);
     }
 
     #[test]
     fn del_reports_existence() {
-        let st = s();
-        set(&st, "a", "1").unwrap();
-        assert!(del(&st, "a").unwrap());
-        assert!(!del(&st, "a").unwrap());
+        let mut en = e();
+        set(&mut en, "a", "1").unwrap();
+        assert!(del(&mut en, "a").unwrap());
+        assert!(!del(&mut en, "a").unwrap());
+        assert_eq!(get(&mut en, "a", 0).unwrap(), None);
     }
 
     #[test]
     fn mget_preserves_order() {
-        let st = s();
-        set(&st, "a", "1").unwrap();
-        set(&st, "c", "3").unwrap();
-        let got = mget(&st, &["a".into(), "b".into(), "c".into()], 0).unwrap();
+        let mut en = e();
+        set(&mut en, "a", "1").unwrap();
+        set(&mut en, "c", "3").unwrap();
+        let got = mget(&mut en, &["a".into(), "b".into(), "c".into()], 0).unwrap();
         assert_eq!(got, vec![Some("1".into()), None, Some("3".into())]);
     }
 
     #[test]
     fn hash_ops() {
-        let st = s();
-        hset(&st, "h", "f1", "v1").unwrap();
-        hset(&st, "h", "f2", "v2").unwrap();
-        assert_eq!(hget(&st, "h", "f1", 0).unwrap(), Some("v1".into()));
-        let all = hgetall(&st, "h", 0).unwrap();
+        let en = e();
+        hset(&en.store, "h", "f1", "v1").unwrap();
+        hset(&en.store, "h", "f2", "v2").unwrap();
+        assert_eq!(hget(&en.store, "h", "f1", 0).unwrap(), Some("v1".into()));
+        let all = hgetall(&en.store, "h", 0).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all["f2"], "v2");
     }
 
     #[test]
     fn ttl_expires_lazily() {
-        let st = s();
-        set(&st, "a", "1").unwrap();
-        expire(&st, "a", 1000, 0).unwrap();
-        assert_eq!(ttl(&st, "a", 500).unwrap(), Some(500));
-        assert_eq!(get(&st, "a", 999).unwrap(), Some("1".into()));
-        assert_eq!(get(&st, "a", 1000).unwrap(), None);
+        let mut en = e();
+        set(&mut en, "a", "1").unwrap();
+        expire(&mut en, "a", 1000, 0).unwrap();
+        assert_eq!(ttl(&mut en, "a", 500).unwrap(), Some(500));
+        assert_eq!(get(&mut en, "a", 999).unwrap(), Some("1".into()));
+        assert_eq!(get(&mut en, "a", 1000).unwrap(), None);
         // key row physically removed after expiry read
-        let n: i64 = st
+        let n: i64 = en
+            .store
             .conn
             .query_row("SELECT count(*) FROM kv WHERE key='a'", [], |r| r.get(0))
             .unwrap();
@@ -260,59 +306,110 @@ mod tests {
 
     #[test]
     fn ttl_applies_to_hashes() {
-        let st = s();
-        hset(&st, "h", "f", "v").unwrap();
-        expire(&st, "h", 10, 0).unwrap();
-        assert!(hgetall(&st, "h", 11).unwrap().is_empty());
+        let mut en = e();
+        hset(&en.store, "h", "f", "v").unwrap();
+        expire(&mut en, "h", 10, 0).unwrap();
+        assert!(hgetall(&en.store, "h", 11).unwrap().is_empty());
     }
 
     #[test]
     fn scan_matches_glob() {
-        let st = s();
-        set(&st, "user:1", "a").unwrap();
-        set(&st, "user:2", "b").unwrap();
-        hset(&st, "cfg:app", "k", "v").unwrap();
-        let mut keys = scan(&st, "user:*", 0).unwrap();
+        let mut en = e();
+        set(&mut en, "user:1", "a").unwrap();
+        set(&mut en, "user:2", "b").unwrap();
+        hset(&en.store, "cfg:app", "k", "v").unwrap();
+        let mut keys = scan(&mut en, "user:*", 0).unwrap();
         keys.sort();
         assert_eq!(keys, vec!["user:1", "user:2"]);
-        assert_eq!(scan(&st, "*", 0).unwrap().len(), 3);
+        assert_eq!(scan(&mut en, "*", 0).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn set_is_write_behind_until_flushed() {
+        let mut en = e();
+        set(&mut en, "wb", "v", ).unwrap();
+        // not yet in SQLite...
+        let n: i64 = en
+            .store
+            .conn
+            .query_row("SELECT count(*) FROM kv WHERE key='wb'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        // ...but reads see it, and a flush persists it
+        assert_eq!(get(&mut en, "wb", 0).unwrap(), Some("v".into()));
+        en.flush_kv().unwrap();
+        let n: i64 = en
+            .store
+            .conn
+            .query_row("SELECT count(*) FROM kv WHERE key='wb'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(en.kv.pending.is_empty());
+    }
+
+    #[test]
+    fn set_after_expire_clears_ttl_even_when_flushed_later() {
+        let mut en = e();
+        set(&mut en, "k", "v1").unwrap();
+        expire(&mut en, "k", 100, 0).unwrap(); // flushes v1, sets TTL
+        set(&mut en, "k", "v2").unwrap(); // pending; clears TTL per redis SET
+        en.flush_kv().unwrap();
+        // well past the old expiry: value must survive because SET cleared it
+        assert_eq!(get(&mut en, "k", 10_000).unwrap(), Some("v2".into()));
+        assert_eq!(ttl(&mut en, "k", 10_000).unwrap(), None);
+    }
+
+    #[test]
+    fn cold_read_through_fills_cache_and_honors_ttl() {
+        let mut en = e();
+        set(&mut en, "cold", "v").unwrap();
+        expire(&mut en, "cold", 50, 0).unwrap();
+        en.flush_kv().unwrap();
+        // simulate a fresh session: empty cache, data only in SQLite
+        en.kv.map.clear();
+        en.kv.ttl.clear();
+        assert_eq!(get(&mut en, "cold", 10).unwrap(), Some("v".into()));
+        // the fill must carry the TTL so the cached value still expires
+        assert_eq!(get(&mut en, "cold", 51).unwrap(), None);
     }
 
     #[test]
     fn reserved_prefixes_are_write_protected() {
-        let st = s();
+        let mut en = e();
         assert!(matches!(
-            set(&st, "entry:people:x", "v"),
+            set(&mut en, "entry:people:x", "v"),
             Err(crate::error::EngineError::Command(_))
         ));
         assert!(matches!(
-            hset(&st, "meta:api", "f", "v"),
+            hset(&en.store, "meta:api", "f", "v"),
             Err(crate::error::EngineError::Command(_))
         ));
         assert!(matches!(
-            del(&st, "idx:people"),
+            del(&mut en, "idx:people"),
             Err(crate::error::EngineError::Command(_))
         ));
     }
 
     #[test]
     fn reset_after_expiry_survives() {
-        let st = s();
-        set(&st, "a", "1").unwrap();
-        expire(&st, "a", 10, 0).unwrap();
+        let mut en = e();
+        set(&mut en, "a", "1").unwrap();
+        expire(&mut en, "a", 10, 0).unwrap();
         // time passes well past expiry, but nothing reads the key in between
-        set(&st, "a", "2").unwrap();
-        assert_eq!(get(&st, "a", 1_000).unwrap(), Some("2".into()));
+        set(&mut en, "a", "2").unwrap();
+        assert_eq!(get(&mut en, "a", 1_000).unwrap(), Some("2".into()));
     }
 
     #[test]
     fn hset_after_expiry_survives() {
-        let st = s();
-        hset(&st, "h", "f", "1").unwrap();
-        expire(&st, "h", 10, 0).unwrap();
+        let en = e();
+        hset(&en.store, "h", "f", "1").unwrap();
+        // hash-only key: expire via the engine wrapper
+        let mut en = en;
+        expire(&mut en, "h", 10, 0).unwrap();
         // time passes well past expiry, but nothing reads the key in between
-        hset(&st, "h", "f", "2").unwrap();
-        assert_eq!(hget(&st, "h", "f", 1_000).unwrap(), Some("2".into()));
+        hset(&en.store, "h", "f", "2").unwrap();
+        assert_eq!(hget(&en.store, "h", "f", 1_000).unwrap(), Some("2".into()));
     }
 
     #[test]

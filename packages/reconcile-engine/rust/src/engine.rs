@@ -7,11 +7,24 @@ use rusqlite::params;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+/// Write-behind cache for the kv table. Reads and writes hit these maps under
+/// the engine mutex; `pending` holds sets not yet flushed to SQLite. Flushes
+/// happen when pending grows past a bound, before any command that reads the
+/// kv/key_ttl tables directly, every ~100 ms from the FFI flusher thread, and
+/// on close.
+pub struct KvCache {
+    pub map: HashMap<String, String>,
+    /// expires_at for keys this session knows have TTLs (mirrors key_ttl).
+    pub ttl: HashMap<String, i64>,
+    pub pending: Vec<(String, String)>,
+}
+
 pub struct Engine {
     pub store: Store,
     pub sources: HashMap<String, SourceConfig>,
     pub pubsub: PubSub,
     pub clock: Box<dyn Fn() -> i64 + Send>,
+    pub kv: KvCache,
 }
 
 impl Engine {
@@ -21,7 +34,41 @@ impl Engine {
             sources: HashMap::new(),
             pubsub: PubSub::new(),
             clock,
+            kv: KvCache { map: HashMap::new(), ttl: HashMap::new(), pending: Vec::new() },
         })
+    }
+
+    /// Drains pending kv sets into SQLite in one transaction. Each set also
+    /// clears any key_ttl row, matching redis SET semantics; commands that
+    /// apply a TTL after a set flush first, so ordering is preserved.
+    pub fn flush_kv(&mut self) -> Result<(), EngineError> {
+        if self.kv.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.kv.pending);
+        let result = (|| -> Result<(), EngineError> {
+            let tx = self.store.conn.transaction()?;
+            {
+                let mut ins = tx.prepare_cached(
+                    "INSERT INTO kv(key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )?;
+                let mut del_ttl = tx.prepare_cached("DELETE FROM key_ttl WHERE key = ?1")?;
+                for (k, v) in &pending {
+                    ins.execute(params![k, v])?;
+                    del_ttl.execute(params![k])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // keep the writes queued so a later flush can retry
+            let mut restored = pending;
+            restored.extend(std::mem::take(&mut self.kv.pending));
+            self.kv.pending = restored;
+        }
+        result
     }
 
     pub fn now(&self) -> i64 {
