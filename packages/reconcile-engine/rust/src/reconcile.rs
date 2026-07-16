@@ -38,11 +38,11 @@ pub fn reconcile(
     let mut changed_collections: Vec<String> = vec![];
 
     for rec in outcome.records {
-        let existing: Option<(String, String)> = tx
+        let existing: Option<(String, String, i64)> = tx
             .query_row(
-                "SELECT fields, field_meta FROM entries WHERE collection = ?1 AND natural_key = ?2",
+                "SELECT fields, field_meta, updated_at FROM entries WHERE collection = ?1 AND natural_key = ?2",
                 params![rec.collection, rec.natural_key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .ok();
 
@@ -76,7 +76,7 @@ pub fn reconcile(
                 summary.inserted += 1;
                 changed_collections.push(rec.collection.clone());
             }
-            Some((fields_json, meta_json)) => {
+            Some((fields_json, meta_json, existing_updated_at)) => {
                 let mut fields: BTreeMap<String, String> =
                     serde_json::from_str(&fields_json)
                         .map_err(|e| EngineError::Storage(e.to_string()))?;
@@ -84,6 +84,11 @@ pub fn reconcile(
                     serde_json::from_str(&meta_json)
                         .map_err(|e| EngineError::Storage(e.to_string()))?;
                 let mut dirty = false;
+                // `advanced` tracks whether any field won on (timestamp, priority) ordering,
+                // even if the winning value happens to equal the current value. Without this,
+                // a same-value win would never persist its newer FieldMeta, and a later,
+                // genuinely older-but-different value could incorrectly win against it.
+                let mut advanced = false;
                 for (k, v) in &rec.fields {
                     let wins = match meta.get(k) {
                         None => true,
@@ -92,11 +97,12 @@ pub fn reconcile(
                                 || (rec.updated_at == m.updated_at && cfg.priority > m.priority)
                         }
                     };
-                    if wins && fields.get(k) != Some(v) {
-                        fields.insert(k.clone(), v.clone());
-                        dirty = true;
-                    }
                     if wins {
+                        advanced = true;
+                        if fields.get(k) != Some(v) {
+                            fields.insert(k.clone(), v.clone());
+                            dirty = true;
+                        }
                         meta.insert(
                             k.clone(),
                             FieldMeta {
@@ -107,7 +113,10 @@ pub fn reconcile(
                         );
                     }
                 }
-                if dirty {
+                if advanced {
+                    // Row-level updated_at must never move backward: a batch that only adds
+                    // an older/new field to an already-newer row must not regress the row stamp.
+                    let new_updated_at = existing_updated_at.max(rec.updated_at);
                     tx.execute(
                         "UPDATE entries SET fields = ?3, field_meta = ?4, updated_at = ?5
                          WHERE collection = ?1 AND natural_key = ?2",
@@ -116,11 +125,17 @@ pub fn reconcile(
                             rec.natural_key,
                             serde_json::to_string(&fields).unwrap(),
                             serde_json::to_string(&meta).unwrap(),
-                            rec.updated_at.max(0)
+                            new_updated_at
                         ],
                     )?;
-                    summary.updated += 1;
-                    changed_collections.push(rec.collection.clone());
+                    if dirty {
+                        summary.updated += 1;
+                        changed_collections.push(rec.collection.clone());
+                    } else {
+                        // Advanced but same value: persisted for correctness (newer FieldMeta),
+                        // but nothing visibly changed, so no pub/sub event for this collection.
+                        summary.unchanged += 1;
+                    }
                 } else {
                     summary.unchanged += 1;
                 }
@@ -257,5 +272,40 @@ mod tests {
         reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
         let keys = crate::commands::scan(&st, "entry:people:*", 0).unwrap();
         assert_eq!(keys, vec!["entry:people:a@x.com"]);
+    }
+
+    #[test]
+    fn row_updated_at_never_regresses() {
+        let mut st = Store::open(":memory:").unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        // Second batch only adds a brand-new field with an older record timestamp.
+        // The row's updated_at must stay at 100, not regress to 50.
+        reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "addr", "123 Main St", 50)]), 0).unwrap();
+        let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
+        assert_eq!(h["_updated_at"], "100");
+        assert_eq!(h["addr"], "123 Main St");
+    }
+
+    #[test]
+    fn same_value_win_advances_meta() {
+        let mut st = Store::open(":memory:").unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        // Same value, but wins on newer timestamp with lower priority - must still advance FieldMeta.
+        let s = reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "name", "Ann", 150)]), 0).unwrap();
+        assert_eq!(s.unchanged, 1);
+        assert_eq!(s.updated, 0);
+        // A later record with an older timestamp than the persisted 150 must lose,
+        // even though its priority differs, proving the meta actually advanced to 150.
+        reconcile(&mut st, &cfg("dev", 1), outcome(vec![rec("dev", "a@x.com", "name", "Changed", 120)]), 0).unwrap();
+        let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
+        assert_eq!(h["name"], "Ann");
+    }
+
+    #[test]
+    fn same_value_win_publishes_no_change() {
+        let mut st = Store::open(":memory:").unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        let s = reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "name", "Ann", 150)]), 0).unwrap();
+        assert!(s.collections.is_empty());
     }
 }
