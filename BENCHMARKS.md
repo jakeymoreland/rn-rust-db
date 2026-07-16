@@ -148,6 +148,37 @@ zero-copy jsi::MutableBuffer handoff, bulk-prefetch reconcile):
    vs 5–8 ms band), bridge overhead, and single-row insert lands in-band while
    doing a full parse+normalize+reconcile.
 
+## Boundary shootout findings (2026-07-17, iPhone 16 Pro dev build)
+
+The transport question is settled. At ~1 MB, with all payload prep outside
+the timers:
+
+| path | wall | JS-thread cost | engine share |
+|---|---:|---:|---|
+| pure-conversion probe (no-op call) | 5.4 ms | 5.4 ms | — |
+| ingestDirect (string, async) | 17.7 ms | ~5.4 ms (conversion only) | 12.7 ms |
+| ingestBufferSync (ArrayBuffer) | 13.4 ms | 13.4 ms (sync by design) | 12.7 ms |
+| ingestFile (path only) | 15.0 ms | ~0 ms | 13.9 ms (incl. file read) |
+
+1. **The JSI string tax is exactly 5.4 ms/MB on this device** (probe), and it
+   cross-checks: the 3.9 MB bulk ingest showed a 22.1 ms JS gap = 5.7 ms/MB.
+   Byte transport costs ~0.7 ms/MB — 8x cheaper. The engine pipeline is a
+   constant ~12.7 ms/MB regardless of transport.
+2. **Production guidance:** strings are fine below ~1 MB (a one-frame JS cost
+   at 120 Hz is the worst case); use the bytes path when data already arrives
+   as bytes (fetch arrayBuffer); use ingestFile for anything large — its JS
+   cost is a path string.
+3. **Bulk update waves are in the bare-INSERT band while reconciling**: 1k-row
+   update wave = 11.4 ms engine time (12–25 ms reference). Insert waves cost
+   more (first-write SQLite work).
+4. **The 5k wave's 52.8 ms commit is the WAL autocheckpoint amortization**
+   landing inside one background-thread commit — invisible to the UI (JS gap
+   stayed at the string-conversion 22 ms), just bursty in the breakdown.
+5. **kv at equilibrium**: 3.4–5.9 µs/op sets sustained with flush spikes of
+   1–2.6 ms; coalescing turns 1k hot-key sets into a 0.24 ms flush of 100
+   rows. LTO must stay off (bitcode-in-staticlib breaks Apple's linker; see
+   Cargo.toml note).
+
 ## Observations
 
 1. **Call overhead is negligible and sync beats async everywhere.** A no-op
