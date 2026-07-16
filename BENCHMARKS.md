@@ -148,6 +148,22 @@ zero-copy jsi::MutableBuffer handoff, bulk-prefetch reconcile):
    vs 5–8 ms band), bridge overhead, and single-row insert lands in-band while
    doing a full parse+normalize+reconcile.
 
+## Profiling the Rust engine
+
+From `packages/reconcile-engine/rust` (macOS, no sudo — uses xctrace):
+
+```bash
+cargo flamegraph --release --test ingest_timing -- --nocapture   # bulk-ingest harness
+cargo flamegraph --release --test schema_stress -- --nocapture   # query paths
+cargo flamegraph --release --unit-test -- reconcile::tests::large_batches_take_the_parallel_path
+RECONCILE_PAR_THRESHOLD=0 cargo flamegraph --release --test ingest_timing -- --nocapture  # sequential merge
+```
+
+Output: `flamegraph.svg` in the crate dir (rename between runs), plus the raw
+`cargo-flamegraph.trace` for Instruments. For denser flames, raise the wave
+count in `tests/ingest_timing.rs`. This profiles the engine on the Mac only;
+the JSI boundary and Hermes need Xcode Instruments against the running app.
+
 ## Boundary shootout findings (2026-07-17, iPhone 16 Pro dev build)
 
 The transport question is settled. At ~1 MB, with all payload prep outside
