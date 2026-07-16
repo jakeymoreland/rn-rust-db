@@ -12,6 +12,8 @@ import {
 } from '../bench/markdown';
 import { BenchList } from '../bench/BenchList';
 import { registerListVisibility } from '../bench/listBridge';
+import { RealAppList, registerRealListVisibility } from '../bench/RealAppList';
+import { renderRealApp, runRealApp, type RealAppResult } from '../bench/realAppRun';
 
 if (__DEV__) {
   // Expose the harness so benchmarks can be driven over the Hermes inspector.
@@ -27,10 +29,16 @@ export function ExperimentsScreen() {
   const [output, setOutput] = useState<RunOutput | null>(null);
   const [running, setRunning] = useState(false);
   const [listVisible, setListVisible] = useState(false);
+  const [realListVisible, setRealListVisible] = useState(false);
+  const [realApp, setRealApp] = useState<RealAppResult[] | null>(null);
 
   useEffect(() => {
     registerListVisibility(setListVisible);
-    return () => registerListVisibility(null);
+    registerRealListVisibility(setRealListVisible);
+    return () => {
+      registerListVisibility(null);
+      registerRealListVisibility(null);
+    };
   }, []);
 
   const run = async (includeHeavy: boolean) => {
@@ -44,10 +52,26 @@ export function ExperimentsScreen() {
     }
   };
 
-  // The FlatList phases swap the whole screen to the list route: a
-  // VirtualizedList must not be nested inside this ScrollView.
+  const runReal = async () => {
+    setRunning(true);
+    setProgress([]);
+    setRealApp(null);
+    try {
+      setRealApp(await runRealApp((m) => setProgress((p) => [...p, m])));
+    } catch (e) {
+      setProgress((p) => [...p, `failed: ${e}`]);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  // The list phases swap the whole screen to a list route: a virtualized
+  // list must not be nested inside this ScrollView.
   if (listVisible) {
     return <BenchList />;
+  }
+  if (realListVisible) {
+    return <RealAppList />;
   }
 
   return (
@@ -62,6 +86,23 @@ export function ExperimentsScreen() {
         disabled={running}
         onPress={() => run(true)}
       />
+      <Button
+        title={running ? 'Running…' : 'Run real-app list benchmark (LegendList)'}
+        disabled={running}
+        onPress={() => void runReal()}
+      />
+      {realApp && (
+        <>
+          <Text style={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 'bold', marginTop: 8 }}>
+            Real-app list (lazy zero-copy backing)
+          </Text>
+          <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderRealApp(realApp)}</Text>
+          <Button
+            title="Copy real-app results"
+            onPress={() => void Clipboard.setStringAsync('```\n' + renderRealApp(realApp) + '\n```')}
+          />
+        </>
+      )}
       {output && (
         <Button
           title="Copy as markdown"
