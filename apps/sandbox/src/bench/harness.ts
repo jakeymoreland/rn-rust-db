@@ -7,6 +7,8 @@ export type FastPath = {
   queryEntriesObjects(collection: string): Array<{ key: string; fields: Record<string, string> }>;
   kvGet(key: string): string | undefined;
   kvSet(key: string, value: string): boolean;
+  /** Benchmark-only: synchronous byte-transport ingest (blocks the JS thread). */
+  ingestBufferSync(sourceId: string, payload: ArrayBuffer): string;
 };
 
 export function fastPath(): FastPath {

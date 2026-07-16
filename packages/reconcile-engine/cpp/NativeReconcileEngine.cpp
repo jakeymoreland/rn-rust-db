@@ -272,6 +272,36 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         return jsi::ArrayBuffer(rt, std::make_shared<RustOwnedBuffer>(data, len));
       });
 
+  auto ingestBufferSync = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "ingestBufferSync"),
+      2,
+      [weak](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        auto strong = weak.lock();
+        if (!strong) {
+          throw jsi::JSError(rt, "reconcile engine module destroyed");
+        }
+        if (count < 2 || !args[0].isString() || !args[1].isObject() || !args[1].asObject(rt).isArrayBuffer(rt)) {
+          throw jsi::JSError(rt, "ingestBufferSync(sourceId: string, payload: ArrayBuffer)");
+        }
+        std::string sourceId = args[0].asString(rt).utf8(rt);
+        jsi::ArrayBuffer buf = args[1].asObject(rt).getArrayBuffer(rt);
+        // SYNCHRONOUS: blocks the JS thread for the whole ingest. This exists
+        // to measure the byte-transport boundary (no UTF-8 string
+        // materialization — the payload bytes are read in place); production
+        // callers with large payloads should prefer ingestFile or the async
+        // string path.
+        char* resp = nullptr;
+        {
+          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          if (strong->engine_ == nullptr) {
+            throw jsi::JSError(rt, "engine not open");
+          }
+          resp = engine_ingest_bytes(strong->engine_, sourceId.c_str(), buf.data(rt), buf.size(rt));
+        }
+        return jsi::String::createFromUtf8(rt, takeRustString(resp));
+      });
+
   auto kvGet = jsi::Function::createFromHostFunction(
       rt,
       jsi::PropNameID::forAscii(rt, "kvGet"),
@@ -402,6 +432,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
   ns.setProperty(rt, "queryEntriesObjects", queryObjects);
   ns.setProperty(rt, "kvGet", kvGet);
   ns.setProperty(rt, "kvSet", kvSet);
+  ns.setProperty(rt, "ingestBufferSync", ingestBufferSync);
   rt.global().setProperty(rt, "__reconcileEngine", ns);
   return true;
 }

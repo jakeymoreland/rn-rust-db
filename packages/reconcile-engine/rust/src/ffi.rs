@@ -156,6 +156,20 @@ pub extern "C" fn engine_query_entries_bin(
 /// Ingest without the JSON command envelope: source id and payload cross as
 /// plain strings instead of being escaped into a request envelope and parsed
 /// twice. Response envelope matches engine_execute's ingest exactly.
+fn ingest_response(ffi: &EngineFfi, source_id: &str, payload: &str) -> *mut c_char {
+    let mut engine = ffi.inner.lock().unwrap();
+    match engine.ingest(source_id, payload) {
+        Ok((summary, skipped)) => {
+            let mut v = serde_json::to_value(&summary).unwrap();
+            v["skipped"] = serde_json::json!(skipped);
+            to_c_string(serde_json::json!({"ok": true, "value": v}).to_string())
+        }
+        Err(e) => to_c_string(
+            serde_json::json!({"ok": false, "code": e.code(), "message": e.to_string()}).to_string(),
+        ),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn engine_ingest_direct(
     handle: *mut c_void,
@@ -169,17 +183,35 @@ pub extern "C" fn engine_ingest_direct(
     let (Some(source_id), Some(payload)) = (unsafe { cstr(source_id) }, unsafe { cstr(payload) }) else {
         return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null argument\"}".into());
     };
-    let mut engine = ffi.inner.lock().unwrap();
-    match engine.ingest(source_id, payload) {
-        Ok((summary, skipped)) => {
-            let mut v = serde_json::to_value(&summary).unwrap();
-            v["skipped"] = serde_json::json!(skipped);
-            to_c_string(serde_json::json!({"ok": true, "value": v}).to_string())
-        }
-        Err(e) => to_c_string(
-            serde_json::json!({"ok": false, "code": e.code(), "message": e.to_string()}).to_string(),
-        ),
+    ingest_response(ffi, source_id, payload)
+}
+
+/// Byte-slice ingest: the payload arrives as (ptr, len) — no NUL-terminated
+/// C string, so callers can hand over ArrayBuffer contents without a
+/// full-string UTF-8 materialization on the JS thread. The bytes are
+/// validated as UTF-8 here (SIMD-fast, no copy).
+#[no_mangle]
+pub extern "C" fn engine_ingest_bytes(
+    handle: *mut c_void,
+    source_id: *const c_char,
+    payload: *const u8,
+    payload_len: usize,
+) -> *mut c_char {
+    if handle.is_null() {
+        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null engine handle\"}".into());
     }
+    let ffi = unsafe { &*(handle as *mut EngineFfi) };
+    let Some(source_id) = (unsafe { cstr(source_id) }) else {
+        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null source id\"}".into());
+    };
+    if payload.is_null() {
+        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null payload\"}".into());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+    let Ok(payload) = std::str::from_utf8(bytes) else {
+        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"payload is not valid UTF-8\"}".into());
+    };
+    ingest_response(ffi, source_id, payload)
 }
 
 /// Fast-path kv get: returns the value (free with engine_free_string) or NULL
@@ -574,6 +606,31 @@ mod tests {
         let resp3 = unsafe { CStr::from_ptr(r3) }.to_str().unwrap().to_string();
         engine_free_string(r3);
         assert!(resp3.contains("\"ok\":false"), "{resp3}");
+        engine_close(h);
+    }
+
+    #[test]
+    fn ingest_bytes_matches_string_path() {
+        let path = CString::new(":memory:").unwrap();
+        let h = engine_open(path.as_ptr());
+        let reg = CString::new(
+            r#"{"cmd":"registerSource","args":["{\"source_id\":\"api\",\"format\":\"Json\",\"collection\":\"people\",\"natural_key_field\":\"email\",\"timestamp_field\":null,\"priority\":10}"]}"#,
+        )
+        .unwrap();
+        engine_free_string(engine_execute(h, reg.as_ptr()));
+
+        let src = CString::new("api").unwrap();
+        let payload = r#"[{"email":"b@x.com","name":"Bób ünïcödé"}]"#; // multibyte utf-8
+        let r = engine_ingest_bytes(h, src.as_ptr(), payload.as_ptr(), payload.len());
+        let resp = unsafe { CStr::from_ptr(r) }.to_str().unwrap().to_string();
+        engine_free_string(r);
+        assert!(resp.contains("\"inserted\":1"), "{resp}");
+        // invalid utf-8 rejected cleanly
+        let bad: &[u8] = &[b'[', 0xFF, 0xFE, b']'];
+        let r2 = engine_ingest_bytes(h, src.as_ptr(), bad.as_ptr(), bad.len());
+        let resp2 = unsafe { CStr::from_ptr(r2) }.to_str().unwrap().to_string();
+        engine_free_string(r2);
+        assert!(resp2.contains("not valid UTF-8"), "{resp2}");
         engine_close(h);
     }
 

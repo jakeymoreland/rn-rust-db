@@ -39,6 +39,9 @@ unsigned char* engine_query_entries_schema_bin(engine_handle_t engine, const cha
 /* Ingest without the JSON command envelope. Returns the same response envelope JSON as engine_execute's ingest. Free with engine_free_string. */
 char* engine_ingest_direct(engine_handle_t engine, const char* source_id, const char* payload);
 
+/* Byte-slice ingest: payload as (ptr, len) — no NUL-terminated string needed, so ArrayBuffer contents cross without full string materialization. Bytes are UTF-8-validated. Free result with engine_free_string. */
+char* engine_ingest_bytes(engine_handle_t engine, const char* source_id, const unsigned char* payload, size_t payload_len);
+
 /* Fast-path kv get: returns the value (free with engine_free_string) or NULL when missing/error. */
 char* engine_kv_get(engine_handle_t engine, const char* key);
 
