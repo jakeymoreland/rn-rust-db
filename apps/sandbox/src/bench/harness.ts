@@ -26,10 +26,20 @@ export async function time(
   fn: () => Promise<void> | void,
 ): Promise<BenchResult> {
   // warmup
-  for (let i = 0; i < Math.min(5, iterations); i++) await fn();
-  const t0 = performance.now();
-  for (let i = 0; i < iterations; i++) await fn();
-  const totalMs = performance.now() - t0;
+  for (let i = 0; i < Math.min(5, iterations); i++) {
+    await fn();
+    await sleep(0);
+  }
+  // Each iteration is timed individually so the yield between ops (which lets
+  // timers fire and the progress UI paint during heavy 100k-row benchmarks)
+  // never counts against the measurement.
+  let totalMs = 0;
+  for (let i = 0; i < iterations; i++) {
+    const t0 = performance.now();
+    await fn();
+    totalMs += performance.now() - t0;
+    await sleep(0);
+  }
   return { name, iterations, totalMs, perOpMs: totalMs / iterations };
 }
 

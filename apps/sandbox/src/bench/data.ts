@@ -31,16 +31,19 @@ function hex(v: number, width: number): string {
 
 // `salt` shifts the natural keys (a different batch of records); `rev` changes
 // only the field content for the same keys (an update wave over existing rows).
-export function realisticRows(n: number, salt = 0, rev = 0): string {
+// `startIndex` offsets the row index so chunked builds produce byte-identical
+// rows to one big build.
+export function realisticRows(n: number, salt = 0, rev = 0, startIndex = 0): string {
   const rows = new Array(n);
-  for (let i = 0; i < n; i++) {
+  for (let r = 0; r < n; r++) {
+    const i = startIndex + r; // row identity; r is the slot in this chunk
     const s = i + salt * 1_000_003 + rev * 7_368_787;
     const first = FIRST[i % FIRST.length];
     const last = LAST[(i * 7) % LAST.length];
     const ci = (i * 13) % CITIES.length;
     const created = new Date(1735689600000 + (s % 500) * 86_400_000 + (s % 86_400) * 1000).toISOString();
     const updated = new Date(1750000000000 + (s % 200) * 3_600_000).toISOString();
-    rows[i] = {
+    rows[r] = {
       id: `rec_${salt}_${String(i).padStart(7, '0')}`,
       uuid: `${hex(s * 2654435761, 8)}-${hex(s * 40503, 4)}-4${hex(s * 2246822519, 3)}-9${hex(s * 3266489917, 3)}-${hex(s * 668265263, 8)}${hex(s * 374761393, 4)}`,
       first_name: first,
@@ -67,6 +70,22 @@ export function realisticRows(n: number, salt = 0, rev = 0): string {
     };
   }
   return JSON.stringify(rows);
+}
+
+// Builds the same JSON as realisticRows(n, salt, rev) but in 10k-row chunks,
+// yielding to the event loop between chunks so a 100k build (~75 MB) doesn't
+// freeze the UI in one multi-second block. Byte-identical output.
+export async function realisticRowsChunked(n: number, salt = 0, rev = 0): Promise<string> {
+  const CHUNK = 10_000;
+  if (n <= CHUNK) return realisticRows(n, salt, rev);
+  const parts: string[] = [];
+  for (let start = 0; start < n; start += CHUNK) {
+    const size = Math.min(CHUNK, n - start);
+    // strip the surrounding [] so chunks can be joined into one array
+    parts.push(realisticRows(size, salt, rev, start).slice(1, -1));
+    await new Promise<void>((r) => setTimeout(r, 0));
+  }
+  return `[${parts.join(',')}]`;
 }
 
 // If 100k realistic rows (~75 MB JSON) proves too slow / OOMs on the Android

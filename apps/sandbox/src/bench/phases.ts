@@ -25,7 +25,7 @@ import {
   startFrameMonitor,
   time,
 } from './harness';
-import { REALISTIC_FIELDS_CSV, REALISTIC_SIZES, realisticRows, toyRows } from './data';
+import { REALISTIC_FIELDS_CSV, REALISTIC_SIZES, realisticRows, realisticRowsChunked, toyRows } from './data';
 import { type BenchMetrics, score } from './score';
 import type { RunOutput } from './markdown';
 import { decodeEntriesBuffer, decodeSchemaBuffer, type Row } from './decode';
@@ -132,7 +132,7 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
     });
     for (const n of REALISTIC_SIZES) {
       onProgress(`building ${n} realistic rows...`);
-      const payload = realisticRows(n);
+      const payload = await realisticRowsChunked(n);
       const bytesPerRecord = Math.round(payload.length / n);
       onProgress(
         `ingesting ${n} realistic rows (~${bytesPerRecord} B/record, ${(payload.length / 1e6).toFixed(1)} MB payload)...`,
