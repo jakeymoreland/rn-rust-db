@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { Button, Platform, ScrollView, Text, View } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { executeRaw } from '@rn-experiments/reconcile-engine';
-import { runAll, toMarkdown, type BenchResult } from '../bench';
+import { runAll, toMarkdown, type BenchResult } from '../bench/phases';
 
 if (__DEV__) {
   // Expose the harness so benchmarks can be driven over the Hermes inspector.

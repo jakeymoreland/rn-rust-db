@@ -1,184 +1,19 @@
 import { executeRaw, executeRawSync, ingest, redis, registerSource, subscribe } from '@rn-experiments/reconcile-engine';
 
-type FastPath = {
-  queryEntriesBuffer(collection: string): ArrayBuffer;
-  queryEntriesObjects(collection: string): Array<{ key: string; fields: Record<string, string> }>;
-};
+import {
+  type BenchResult,
+  fastPath,
+  frameStats,
+  ingestWithGapMonitor,
+  median,
+  p95,
+  sleep,
+  startFrameMonitor,
+  time,
+} from './harness';
+import { REALISTIC_SIZES, realisticRows, toyRows } from './data';
 
-function fastPath(): FastPath {
-  const fp = (globalThis as unknown as { __reconcileEngine?: FastPath }).__reconcileEngine;
-  if (!fp) throw new Error('fast path not installed (call installFastPath first)');
-  return fp;
-}
-
-export type BenchResult = {
-  name: string;
-  iterations: number;
-  totalMs: number;
-  perOpMs: number;
-  note?: string;
-};
-
-async function time(name: string, iterations: number, fn: () => Promise<void> | void): Promise<BenchResult> {
-  // warmup
-  for (let i = 0; i < Math.min(5, iterations); i++) await fn();
-  const t0 = performance.now();
-  for (let i = 0; i < iterations; i++) await fn();
-  const totalMs = performance.now() - t0;
-  return { name, iterations, totalMs, perOpMs: totalMs / iterations };
-}
-
-function median(xs: number[]): number {
-  const s = [...xs].sort((a, b) => a - b);
-  const mid = s.length >> 1;
-  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
-}
-
-function p95(xs: number[]): number {
-  const s = [...xs].sort((a, b) => a - b);
-  return s[Math.min(s.length - 1, Math.ceil(s.length * 0.95) - 1)];
-}
-
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-// --- Toy shape (4 short string fields, ~70 B/record) — kept for comparison ---
-
-function toyRows(n: number): string {
-  const rows = Array.from({ length: n }, (_, i) => ({
-    email: `user${i}@bench.com`,
-    name: `User ${i}`,
-    city: i % 2 ? 'Sydney' : 'Perth',
-    score: String(i),
-  }));
-  return JSON.stringify(rows);
-}
-
-// --- Realistic shape: ~22 mixed-type fields as they'd come from a CRM-style API,
-// ~0.7-0.8 KB of JSON per record (ids/uuids, contact + address + billing fields,
-// ISO timestamps, booleans, numeric amounts, a ~300-char notes field). ---
-
-const FIRST = ['Olivia', 'Liam', 'Amelia', 'Noah', 'Isla', 'Jack', 'Charlotte', 'Oliver', 'Mia', 'William', 'Grace', 'Henry', 'Ava', 'Thomas', 'Ruby', 'James', 'Sophie', 'Lucas', 'Zoe', 'Ethan'];
-const LAST = ['Nguyen', 'Smith', 'Papadopoulos', 'Chen', 'Williams', 'Singh', 'Brown', 'Kowalski', 'Taylor', 'Ivanova', 'Jones', 'Fernandez', 'Wilson', 'Okafor', 'Anderson', 'Kim', 'White', 'Rossi', 'Martin', 'Schmidt'];
-const STREETS = ['George St', 'Collins Ave', 'Hay St', 'King William Rd', 'Elizabeth Dr', 'Flinders Ln', 'Murray Pl', 'Adelaide Tce'];
-const CITIES = ['Sydney', 'Melbourne', 'Perth', 'Brisbane', 'Adelaide', 'Hobart', 'Darwin', 'Canberra'];
-const STATES = ['NSW', 'VIC', 'WA', 'QLD', 'SA', 'TAS', 'NT', 'ACT'];
-const COMPANIES = ['Acme Health Group', 'Southern Cross Logistics', 'Initial Studios', 'Bluegum Financial', 'Harbour Medical Partners', 'Terra Analytics', 'Redback Insurance', 'Coastline Retail Co'];
-const TITLES = ['Account Manager', 'Practice Coordinator', 'Finance Analyst', 'Operations Lead', 'Registered Nurse', 'Claims Assessor', 'Sales Director', 'Support Engineer'];
-const STATUSES = ['active', 'pending_review', 'churn_risk', 'onboarding', 'suspended'];
-const NOTE_SEED =
-  'Follow-up scheduled after quarterly account review; customer expressed interest in the premium reporting module and asked about API rate limits, invoice consolidation across the two billing entities, and migration timelines for the legacy portal. ';
-
-function hex(v: number, width: number): string {
-  return (v >>> 0).toString(16).padStart(width, '0').slice(-width);
-}
-
-// `salt` shifts the natural keys (a different batch of records); `rev` changes
-// only the field content for the same keys (an update wave over existing rows).
-export function realisticRows(n: number, salt = 0, rev = 0): string {
-  const rows = new Array(n);
-  for (let i = 0; i < n; i++) {
-    const s = i + salt * 1_000_003 + rev * 7_368_787;
-    const first = FIRST[i % FIRST.length];
-    const last = LAST[(i * 7) % LAST.length];
-    const ci = (i * 13) % CITIES.length;
-    const created = new Date(1735689600000 + (s % 500) * 86_400_000 + (s % 86_400) * 1000).toISOString();
-    const updated = new Date(1750000000000 + (s % 200) * 3_600_000).toISOString();
-    rows[i] = {
-      id: `rec_${salt}_${String(i).padStart(7, '0')}`,
-      uuid: `${hex(s * 2654435761, 8)}-${hex(s * 40503, 4)}-4${hex(s * 2246822519, 3)}-9${hex(s * 3266489917, 3)}-${hex(s * 668265263, 8)}${hex(s * 374761393, 4)}`,
-      first_name: first,
-      last_name: last,
-      email: `${first.toLowerCase()}.${last.toLowerCase()}${i}@example${i % 9}.com.au`,
-      phone: `+61 4${String(10_000_000 + ((s * 97) % 89_999_999)).slice(0, 8)}`,
-      address_line1: `${(s % 380) + 1} ${STREETS[(i * 3) % STREETS.length]}`,
-      address_city: CITIES[ci],
-      address_state: STATES[ci],
-      address_postcode: String(2000 + ((s * 31) % 6999)),
-      billing_city: CITIES[(ci + 3) % CITIES.length],
-      billing_postcode: String(2000 + ((s * 53) % 6999)),
-      company: COMPANIES[(i * 5) % COMPANIES.length],
-      job_title: TITLES[(i * 11) % TITLES.length],
-      status: STATUSES[i % STATUSES.length],
-      is_active: i % 7 !== 0,
-      email_verified: i % 3 !== 0,
-      balance: Math.round(((s * 137) % 2_500_000)) / 100,
-      lifetime_value: Math.round(((s * 631) % 90_000_000)) / 100,
-      currency: 'AUD',
-      created_at: created,
-      updated_at: updated,
-      notes: `[case ${hex(s * 2654435761, 6)}] ${NOTE_SEED}${NOTE_SEED.slice(0, 60 + (i % 40))}`,
-    };
-  }
-  return JSON.stringify(rows);
-}
-
-// If 100k realistic rows (~75 MB JSON) proves too slow / OOMs on the Android
-// emulator, drop this to [1000, 10000, 50000] and note it in BENCHMARKS.md.
-const REALISTIC_SIZES = [1000, 10000, 100000];
-
-async function ingestWithGapMonitor(sourceId: string, payload: string): Promise<{ ingestMs: number; maxGap: number }> {
-  // Track JS-thread stalls while the async ingest is in flight.
-  let maxGap = 0;
-  let last = performance.now();
-  const tick = setInterval(() => {
-    const now = performance.now();
-    maxGap = Math.max(maxGap, now - last);
-    last = now;
-  }, 16);
-  const t0 = performance.now();
-  await ingest(sourceId, payload);
-  const ingestMs = performance.now() - t0;
-  clearInterval(tick);
-  return { ingestMs, maxGap };
-}
-
-// --- rAF frame monitor for the FPS benchmarks ---
-
-type FrameStats = {
-  durationMs: number;
-  frames: number;
-  effectiveFps: number;
-  dropped: number;
-  worstGapMs: number;
-  medianDeltaMs: number;
-  deltas: number[];
-};
-
-function startFrameMonitor(): { stop: () => number[] } {
-  const deltas: number[] = [];
-  // Baseline is the monitor's start time, so a stall that begins immediately
-  // (e.g. a sync read kicked off right after starting the monitor) is captured
-  // as a long first delta rather than silently swallowed.
-  let last = performance.now();
-  let running = true;
-  const loop = () => {
-    if (!running) return;
-    const now = performance.now();
-    deltas.push(now - last);
-    last = now;
-    requestAnimationFrame(loop);
-  };
-  requestAnimationFrame(loop);
-  return {
-    stop: () => {
-      running = false;
-      return deltas;
-    },
-  };
-}
-
-function frameStats(deltas: number[], budgetMs: number): FrameStats {
-  const durationMs = deltas.reduce((a, b) => a + b, 0);
-  return {
-    durationMs,
-    frames: deltas.length,
-    effectiveFps: durationMs > 0 ? (deltas.length / durationMs) * 1000 : 0,
-    dropped: deltas.filter((d) => d > budgetMs * 1.5).length,
-    worstGapMs: deltas.length ? Math.max(...deltas) : 0,
-    medianDeltaMs: deltas.length ? median(deltas) : 0,
-    deltas,
-  };
-}
+export type { BenchResult };
 
 export async function runAll(onProgress: (msg: string) => void): Promise<BenchResult[]> {
   const results: BenchResult[] = [];
