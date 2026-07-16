@@ -12,33 +12,54 @@ import {
   time,
 } from './harness';
 import { REALISTIC_SIZES, realisticRows, toyRows } from './data';
+import { type BenchMetrics, score } from './score';
+import type { RunOutput } from './markdown';
 
 export type { BenchResult };
+export type { RunOutput };
 
-export async function runAll(onProgress: (msg: string) => void): Promise<BenchResult[]> {
+export async function runAll(onProgress: (msg: string) => void): Promise<RunOutput> {
   const results: BenchResult[] = [];
+  const metrics: BenchMetrics = {};
   const push = async (p: Promise<BenchResult> | BenchResult) => {
     const r = await p;
     results.push(r);
     onProgress(`${r.name}: ${r.perOpMs.toFixed(3)} ms/op${r.note ? ` (${r.note})` : ''}`);
     return r;
   };
+  // A failed phase surrenders its metrics (category shows --/max) but the run continues.
+  const phase = async (label: string, fn: () => Promise<void>) => {
+    try {
+      await fn();
+    } catch (e) {
+      onProgress(`phase "${label}" failed: ${e}`);
+    }
+  };
+
+  let asyncOverheadMs = 0;
+  let budgetMs = 1000 / 60;
+  let refreshHz = 60;
 
   // 1. call overhead
-  const ping = JSON.stringify({ cmd: 'get', args: ['__bench_missing__'] });
-  await push(time('call-overhead sync', 1000, () => void executeRawSync(ping)));
-  const asyncOverhead = await push(time('call-overhead async', 1000, async () => void (await executeRaw(ping))));
+  await phase('call overhead', async () => {
+    const ping = JSON.stringify({ cmd: 'get', args: ['__bench_missing__'] });
+    const sync = await push(time('call-overhead sync', 1000, () => void executeRawSync(ping)));
+    const async_ = await push(time('call-overhead async', 1000, async () => void (await executeRaw(ping))));
+    metrics.nativeSyncCallMs = sync.perOpMs;
+    metrics.nativeAsyncCallMs = async_.perOpMs;
+    asyncOverheadMs = async_.perOpMs;
+  });
 
   // 2a. toy shape at 10k, kept as an in-run baseline against the realistic shape
-  await registerSource({
-    source_id: 'bench',
-    format: 'Json',
-    collection: 'bench',
-    natural_key_field: 'email',
-    timestamp_field: null,
-    priority: 1,
-  });
-  {
+  await phase('toy shape', async () => {
+    await registerSource({
+      source_id: 'bench',
+      format: 'Json',
+      collection: 'bench',
+      natural_key_field: 'email',
+      timestamp_field: null,
+      priority: 1,
+    });
     const payload = toyRows(10000);
     const bytesPerRecord = Math.round(payload.length / 10000);
     onProgress(`ingesting 10k toy rows (~${bytesPerRecord} B/record)...`);
@@ -59,76 +80,80 @@ export async function runAll(onProgress: (msg: string) => void): Promise<BenchRe
     await push(time('toy query 10000 rows: ArrayBuffer', 10, () => {
       new Uint8Array(fastPath().queryEntriesBuffer('bench'));
     }));
-  }
+  });
 
   // 2b. realistic shape: marshaling + ingest at each size
-  await registerSource({
-    source_id: 'bench_real',
-    format: 'Json',
-    collection: 'bench_real',
-    natural_key_field: 'id',
-    timestamp_field: null,
-    priority: 1,
-  });
-  for (const n of REALISTIC_SIZES) {
-    onProgress(`building ${n} realistic rows...`);
-    const payload = realisticRows(n);
-    const bytesPerRecord = Math.round(payload.length / n);
-    onProgress(`ingesting ${n} realistic rows (~${bytesPerRecord} B/record, ${(payload.length / 1e6).toFixed(1)} MB payload)...`);
-    const { ingestMs, maxGap } = await ingestWithGapMonitor('bench_real', payload);
-    await push({
-      name: `realistic ingest ${n} rows`,
-      iterations: 1,
-      totalMs: ingestMs,
-      perOpMs: ingestMs,
-      note: `~${bytesPerRecord} B/record JSON, ${(payload.length / 1e6).toFixed(1)} MB payload, max JS-thread gap ${maxGap.toFixed(0)} ms`,
+  await phase('realistic shape', async () => {
+    await registerSource({
+      source_id: 'bench_real',
+      format: 'Json',
+      collection: 'bench_real',
+      natural_key_field: 'id',
+      timestamp_field: null,
+      priority: 1,
     });
+    for (const n of REALISTIC_SIZES) {
+      onProgress(`building ${n} realistic rows...`);
+      const payload = realisticRows(n);
+      const bytesPerRecord = Math.round(payload.length / n);
+      onProgress(`ingesting ${n} realistic rows (~${bytesPerRecord} B/record, ${(payload.length / 1e6).toFixed(1)} MB payload)...`);
+      const { ingestMs, maxGap } = await ingestWithGapMonitor('bench_real', payload);
+      await push({
+        name: `realistic ingest ${n} rows`,
+        iterations: 1,
+        totalMs: ingestMs,
+        perOpMs: ingestMs,
+        note: `~${bytesPerRecord} B/record JSON, ${(payload.length / 1e6).toFixed(1)} MB payload, max JS-thread gap ${maxGap.toFixed(0)} ms`,
+      });
+      if (n === 10000) metrics.storageIngestUsPerRow = (ingestMs / n) * 1000;
+      if (n === 100000) metrics.storageMaxGapMs = maxGap;
 
-    const iters = n >= 100000 ? 3 : n >= 10000 ? 5 : 10;
-    await push(time(`realistic query ${n} rows: JSON string`, iters, async () => {
-      JSON.parse(await executeRaw(JSON.stringify({ cmd: 'scan', args: ['entry:bench_real:*'] })));
-    }));
-    await push(time(`realistic query ${n} rows: JSI objects`, iters, () => {
-      fastPath().queryEntriesObjects('bench_real');
-    }));
-    await push(time(`realistic query ${n} rows: ArrayBuffer`, iters, () => {
-      new Uint8Array(fastPath().queryEntriesBuffer('bench_real'));
-    }));
-  }
+      const iters = n >= 100000 ? 3 : n >= 10000 ? 5 : 10;
+      await push(time(`realistic query ${n} rows: JSON string`, iters, async () => {
+        JSON.parse(await executeRaw(JSON.stringify({ cmd: 'scan', args: ['entry:bench_real:*'] })));
+      }));
+      const objects = await push(time(`realistic query ${n} rows: JSI objects`, iters, () => {
+        fastPath().queryEntriesObjects('bench_real');
+      }));
+      const buffer = await push(time(`realistic query ${n} rows: ArrayBuffer`, iters, () => {
+        new Uint8Array(fastPath().queryEntriesBuffer('bench_real'));
+      }));
+      if (n === 10000) metrics.interopObjectsVsBufferRatio = objects.perOpMs / buffer.perOpMs;
+      if (n === 100000) metrics.queryBuffer100kMs = buffer.perOpMs;
+    }
+  });
 
   // 3. FPS: idle baseline, then latency-under-load (concurrent reads + big ingest)
-  await registerSource({
-    source_id: 'bench_load',
-    format: 'Json',
-    collection: 'bench_load',
-    natural_key_field: 'id',
-    timestamp_field: null,
-    priority: 1,
-  });
-  onProgress('seeding bench_load with 10k realistic rows...');
-  await ingest('bench_load', realisticRows(10000, 100));
-
-  onProgress('idle rAF baseline (5 s)...');
-  let budgetMs: number;
-  let refreshHz: number;
-  {
-    const mon = startFrameMonitor();
-    await sleep(5000);
-    const deltas = mon.stop();
-    const med = median(deltas);
-    refreshHz = med < 12 ? 120 : 60;
-    budgetMs = 1000 / refreshHz;
-    const s = frameStats(deltas, budgetMs);
-    await push({
-      name: 'idle FPS baseline (5 s)',
-      iterations: s.frames,
-      totalMs: s.durationMs,
-      perOpMs: s.medianDeltaMs,
-      note: `${s.effectiveFps.toFixed(1)} fps effective, detected ${refreshHz} Hz (budget ${budgetMs.toFixed(2)} ms), dropped ${s.dropped}/${s.frames} (>1.5x budget), worst gap ${s.worstGapMs.toFixed(1)} ms`,
+  await phase('under load', async () => {
+    await registerSource({
+      source_id: 'bench_load',
+      format: 'Json',
+      collection: 'bench_load',
+      natural_key_field: 'id',
+      timestamp_field: null,
+      priority: 1,
     });
-  }
+    onProgress('seeding bench_load with 10k realistic rows...');
+    await ingest('bench_load', realisticRows(10000, 100));
 
-  {
+    onProgress('idle rAF baseline (5 s)...');
+    {
+      const mon = startFrameMonitor();
+      await sleep(5000);
+      const deltas = mon.stop();
+      const med = median(deltas);
+      refreshHz = med < 12 ? 120 : 60;
+      budgetMs = 1000 / refreshHz;
+      const s = frameStats(deltas, budgetMs);
+      await push({
+        name: 'idle FPS baseline (5 s)',
+        iterations: s.frames,
+        totalMs: s.durationMs,
+        perOpMs: s.medianDeltaMs,
+        note: `${s.effectiveFps.toFixed(1)} fps effective, detected ${refreshHz} Hz (budget ${budgetMs.toFixed(2)} ms), dropped ${s.dropped}/${s.frames} (>1.5x budget), worst gap ${s.worstGapMs.toFixed(1)} ms`,
+      });
+    }
+
     // keys for the hgetall batch reader
     const keys = (await redis.scan('entry:bench_load:*')).slice(0, 100);
     // Payloads are pre-built (as if they arrived from the network) so the FPS
@@ -161,7 +186,7 @@ export async function runAll(onProgress: (msg: string) => void): Promise<BenchRe
     // Sustain the load for at least 5 s (comparable window to the idle
     // baseline): sequential 10k realistic ingest batches while readers loop.
     const MIN_LOAD_MS = 5000;
-    const loadPhase = async (label: string, readers: Reader[]) => {
+    const loadPhase = async (label: string, readers: Reader[]): Promise<number[]> => {
       let done = false;
       const lat = new Map<string, number[]>(readers.map((r) => [r.name, []]));
       const mon = startFrameMonitor();
@@ -202,18 +227,23 @@ export async function runAll(onProgress: (msg: string) => void): Promise<BenchRe
           `worst gap ${s.worstGapMs.toFixed(1)} ms; ${ingestDurations.length}x 10k ingest under load, median ${median(ingestDurations).toFixed(0)} ms each; ` +
           `read latencies under load: ${readNote} (hgetall op = 100 sequential hgetalls)`,
       });
+      return ingestDurations;
     };
 
     onProgress('under-load: 4 concurrent readers (incl. sync JSI) + 10k ingest batches...');
-    await loadPhase('under-load FPS (4 readers incl. sync JSI + 10k ingests)', [...asyncReaders, ...syncReaders]);
+    const underLoad = await loadPhase('under-load FPS (4 readers incl. sync JSI + 10k ingests)', [
+      ...asyncReaders,
+      ...syncReaders,
+    ]);
+    metrics.syncIngestUnderLoadMs = median(underLoad);
     await sleep(500);
     onProgress('under-load control: async-only readers + 10k ingest batches...');
     await loadPhase('under-load FPS (async readers only + 10k ingests)', asyncReaders);
-  }
+  });
 
   // 4. change-event latency breakdown: t0 = before ingest() call,
   // t1 = ingest promise resolves, t2 = subscribe callback fires.
-  {
+  await phase('event breakdown', async () => {
     await registerSource({
       source_id: 'bench_evt',
       format: 'Json',
@@ -245,6 +275,7 @@ export async function runAll(onProgress: (msg: string) => void): Promise<BenchRe
       await sleep(0);
     }
     unsub();
+    metrics.nativeEventLatencyMs = median(dTotal);
     await push({
       name: 'event breakdown: ingest->promise (t1-t0)',
       iterations: ITERS,
@@ -264,23 +295,9 @@ export async function runAll(onProgress: (msg: string) => void): Promise<BenchRe
       iterations: ITERS,
       totalMs: dTotal.reduce((a, b) => a + b, 0),
       perOpMs: median(dTotal),
-      note: `median ${median(dTotal).toFixed(3)} ms, p95 ${p95(dTotal).toFixed(3)} ms; async call-overhead baseline this run ${asyncOverhead.perOpMs.toFixed(3)} ms/op`,
+      note: `median ${median(dTotal).toFixed(3)} ms, p95 ${p95(dTotal).toFixed(3)} ms; async call-overhead baseline this run ${asyncOverheadMs.toFixed(3)} ms/op`,
     });
-  }
+  });
 
-  return results;
-}
-
-export function toMarkdown(platform: string, results: BenchResult[]): string {
-  const lines = [
-    `### ${platform} — ${new Date().toISOString()}`,
-    '',
-    '| benchmark | iterations | total ms | ms/op |',
-    '|---|---:|---:|---:|',
-    ...results.map((r) => `| ${r.name} | ${r.iterations} | ${r.totalMs.toFixed(1)} | ${r.perOpMs.toFixed(3)} |`),
-    '',
-    ...results.filter((r) => r.note).map((r) => `- **${r.name}**: ${r.note}`),
-    '',
-  ];
-  return lines.join('\n');
+  return { results, metrics, score: score(metrics) };
 }

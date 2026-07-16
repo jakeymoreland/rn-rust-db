@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { Button, Platform, ScrollView, Text, View } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { executeRaw } from '@rn-experiments/reconcile-engine';
-import { runAll, toMarkdown, type BenchResult } from '../bench/phases';
+import { runAll, type RunOutput } from '../bench/phases';
+import { renderScorecard, toMarkdown } from '../bench/markdown';
 
 if (__DEV__) {
   // Expose the harness so benchmarks can be driven over the Hermes inspector.
@@ -11,7 +12,7 @@ if (__DEV__) {
 
 export function ExperimentsScreen() {
   const [progress, setProgress] = useState<string[]>([]);
-  const [results, setResults] = useState<BenchResult[]>([]);
+  const [output, setOutput] = useState<RunOutput | null>(null);
   const [running, setRunning] = useState(false);
 
   return (
@@ -22,18 +23,22 @@ export function ExperimentsScreen() {
         onPress={async () => {
           setRunning(true);
           setProgress([]);
+          setOutput(null);
           try {
-            setResults(await runAll((m) => setProgress((p) => [...p, m])));
+            setOutput(await runAll((m) => setProgress((p) => [...p, m])));
           } finally {
             setRunning(false);
           }
         }}
       />
-      {results.length > 0 && (
+      {output && (
         <Button
           title="Copy as markdown"
-          onPress={() => void Clipboard.setStringAsync(toMarkdown(Platform.OS, results))}
+          onPress={() => void Clipboard.setStringAsync(toMarkdown(Platform.OS, output))}
         />
+      )}
+      {output && (
+        <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderScorecard(output.score)}</Text>
       )}
       {progress.map((m, i) => (
         <Text key={i} style={{ fontFamily: 'monospace', fontSize: 12 }}>
