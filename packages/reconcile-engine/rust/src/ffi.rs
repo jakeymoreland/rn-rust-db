@@ -32,6 +32,18 @@ fn to_c_string(s: String) -> *mut c_char {
     CString::new(s).unwrap_or_else(|_| CString::new("{\"ok\":false,\"code\":2,\"message\":\"interior nul\"}").unwrap()).into_raw()
 }
 
+/// Replaces any interior NUL byte with the Unicode replacement character so the
+/// result is always safe to hand to `CString::new`. Caller-supplied strings
+/// (e.g. a collection name echoed back into an event channel) are not
+/// guaranteed to be free of NULs, and `CString::new` fails on them.
+fn sanitize_for_cstring(s: &str) -> String {
+    if s.contains('\0') {
+        s.replace('\0', "\u{FFFD}")
+    } else {
+        s.to_string()
+    }
+}
+
 unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
     if p.is_null() {
         return None;
@@ -136,8 +148,19 @@ pub extern "C" fn engine_set_event_callback(
         Some(cb) => {
             let holder = CallbackHolder { ctx: ctx as usize, cb };
             engine.pubsub.set_sink(Box::new(move |channel, payload| {
-                let ch = CString::new(channel).unwrap();
-                let pl = CString::new(payload).unwrap();
+                // Caller-supplied data (e.g. a collection name) may contain interior
+                // NUL bytes. CString::new would fail on those; unwrapping inside this
+                // callback would panic across an extern "C" boundary and abort the
+                // process. Sanitize first, and if construction still somehow fails,
+                // skip this callback invocation rather than panic.
+                let sanitized_channel = sanitize_for_cstring(channel);
+                let sanitized_payload = sanitize_for_cstring(payload);
+                let (Ok(ch), Ok(pl)) = (
+                    CString::new(sanitized_channel),
+                    CString::new(sanitized_payload),
+                ) else {
+                    return;
+                };
                 (holder.cb)(holder.ctx as *mut c_void, ch.as_ptr(), pl.as_ptr());
             }));
         }
@@ -226,6 +249,75 @@ mod tests {
             engine_free_string(r);
         }
         assert_eq!(FIRED.load(Ordering::SeqCst), 1);
+        engine_close(h);
+    }
+
+    /// Regression test for a caller-supplied collection name containing an
+    /// interior NUL byte. The event sink builds its channel string as
+    /// "changes:{collection}" and used to hand that straight to
+    /// `CString::new(..).unwrap()`; a NUL anywhere in there made `CString::new`
+    /// return `Err`, and `.unwrap()` panicked inside an `extern "C"` callback,
+    /// which aborts the whole process. This drives that exact path end to end
+    /// through `engine_execute` and asserts the process survives and every
+    /// call still returns a well-formed ok envelope.
+    #[test]
+    fn event_callback_survives_interior_nul_in_collection() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static FIRED: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn cb(
+            _ctx: *mut std::ffi::c_void,
+            ch: *const std::os::raw::c_char,
+            payload: *const std::os::raw::c_char,
+        ) {
+            // If the sink had panicked/aborted we would never get here. Also
+            // verify the pointers we did get are valid, readable C strings
+            // (i.e. properly sanitized, not raw truncated garbage).
+            assert!(!ch.is_null());
+            assert!(!payload.is_null());
+            unsafe {
+                let _ = CStr::from_ptr(ch).to_str().expect("channel must be valid utf8");
+                let _ = CStr::from_ptr(payload).to_str().expect("payload must be valid utf8");
+            }
+            FIRED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let path = CString::new(":memory:").unwrap();
+        let h = engine_open(path.as_ptr());
+        engine_set_event_callback(h, std::ptr::null_mut(), Some(cb));
+
+        // Build requests with serde_json so the interior NUL (\u{0}) is escaped
+        // correctly rather than truncating the string at the first byte.
+        let collection = "peo\u{0}ple";
+        let source_cfg = serde_json::json!({
+            "source_id": "api",
+            "format": "Json",
+            "collection": collection,
+            "natural_key_field": "email",
+            "timestamp_field": null,
+            "priority": 10
+        })
+        .to_string();
+        let register_req = serde_json::json!({"cmd": "registerSource", "args": [source_cfg]}).to_string();
+        let subscribe_req = serde_json::json!({"cmd": "subscribe", "args": ["changes:*"]}).to_string();
+        let ingest_payload = serde_json::json!([{"email": "a@x.com"}]).to_string();
+        let ingest_req =
+            serde_json::json!({"cmd": "ingest", "args": ["api", ingest_payload]}).to_string();
+
+        for req in [register_req, subscribe_req, ingest_req] {
+            let c = CString::new(req).unwrap();
+            let r = engine_execute(h, c.as_ptr());
+            assert!(!r.is_null());
+            let s = unsafe { CStr::from_ptr(r) }.to_str().unwrap().to_string();
+            engine_free_string(r);
+            assert!(s.contains("\"ok\":true"), "expected ok envelope, got: {s}");
+        }
+
+        // The key assertion is that we got this far at all: the process did
+        // not abort. Whether the sanitized "changes:peo<U+FFFD>ple" channel
+        // still matches the "changes:*" subscription is a secondary detail;
+        // if it fired, the callback body above already checked the strings
+        // it received were valid, sanitized C strings.
+        let _ = FIRED.load(Ordering::SeqCst);
         engine_close(h);
     }
 
