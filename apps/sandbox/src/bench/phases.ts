@@ -241,7 +241,57 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
     await loadPhase('under-load FPS (async readers only + 10k ingests)', asyncReaders);
   });
 
-  // 4. change-event latency breakdown: t0 = before ingest() call,
+  // 4. streaming ticks: websocket-style small deltas at ~10 Hz for 10 s with a
+  // live subscriber. Small ticks always rewrite the head rows of the salt-200
+  // batch (hot-row updates), which is a realistic live-feed pattern.
+  await phase('streaming ticks', async () => {
+    await registerSource({
+      source_id: 'bench_stream',
+      format: 'Json',
+      collection: 'bench_stream',
+      natural_key_field: 'id',
+      timestamp_field: null,
+      priority: 1,
+    });
+    onProgress('seeding bench_stream with 10k realistic rows...');
+    await ingest('bench_stream', realisticRows(10000, 200));
+    onProgress('streaming ticks (10 s of 1-20 row deltas @ ~100 ms)...');
+
+    const TICK_WINDOW_MS = 10_000;
+    const tickIngest: number[] = [];
+    const tickEvent: number[] = [];
+    let evtResolve: ((t: number) => void) | null = null;
+    const unsub = await subscribe('changes:bench_stream', () => evtResolve?.(performance.now()));
+    const start = performance.now();
+    let rev = 1;
+    while (performance.now() - start < TICK_WINDOW_MS) {
+      const nRows = 1 + ((rev * 7) % 20);
+      const payload = realisticRows(nRows, 200, rev); // updates existing keys
+      const evtP = new Promise<number>((res) => (evtResolve = res));
+      const t0 = performance.now();
+      await ingest('bench_stream', payload);
+      tickIngest.push(performance.now() - t0);
+      tickEvent.push((await evtP) - t0);
+      rev++;
+      await sleep(Math.max(0, 100 - (performance.now() - t0)));
+    }
+    unsub();
+    metrics.storageTickIngestMs = median(tickIngest);
+    metrics.syncTickEventMedianMs = median(tickEvent);
+    metrics.syncTickEventP95Ms = p95(tickEvent);
+    await push({
+      name: 'streaming ticks (10 s, 1-20 rows/tick)',
+      iterations: tickEvent.length,
+      totalMs: performance.now() - start,
+      perOpMs: median(tickEvent),
+      note:
+        `${tickEvent.length} ticks; ingest median ${median(tickIngest).toFixed(2)} ms; ` +
+        `tick->event median ${median(tickEvent).toFixed(2)} ms, p95 ${p95(tickEvent).toFixed(2)} ms ` +
+        `(hot-row updates over a 10k-row collection)`,
+    });
+  });
+
+  // 5. change-event latency breakdown: t0 = before ingest() call,
   // t1 = ingest promise resolves, t2 = subscribe callback fires.
   await phase('event breakdown', async () => {
     await registerSource({
