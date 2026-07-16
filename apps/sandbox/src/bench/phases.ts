@@ -357,11 +357,24 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
       return;
     }
     try {
-      await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
-
-      // A: live list under fire
-      onProgress('LegendList under fire (8 s: auto-scroll + 10-row ticks + re-render)...');
-      {
+      // A: live list under fire, two data-binding patterns over the same
+      // scroll + tick load. Each tick rewrites the same 10 known rows
+      // (realisticRows(10, 300, rev) regenerates the first 10 salt-300 keys).
+      //
+      // "naive" re-queries and decodes all 10k rows per tick — what an app is
+      // forced into today because change events carry counts, not changed
+      // keys. Informational only.
+      // "patched" fetches just the 10 changed rows and patches them into
+      // existing state — what a well-built app would do if it knew the keys.
+      // This is the scored pattern.
+      const CHANGED_KEYS = Array.from({ length: 10 }, (_, i) => `entry:bench_list:rec_300_${String(i).padStart(7, '0')}`);
+      const underFire = async (
+        label: string,
+        windowMs: number,
+        applyTick: (current: Row[]) => Promise<Row[]>,
+      ): Promise<{ droppedPct: number; updateMedianMs: number }> => {
+        let rowsState = decodeSchemaBuffer(fastPath().queryEntriesSchemaBuffer('bench_list', REALISTIC_FIELDS_CSV));
+        await drv.setRows(rowsState);
         const updateLatencies: number[] = [];
         let evtResolve: (() => void) | null = null;
         const unsub = await subscribe('changes:bench_list', () => evtResolve?.());
@@ -369,30 +382,64 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
         const mon = startFrameMonitor();
         const t0 = performance.now();
         let rev = 1;
-        while (performance.now() - t0 < 8000) {
+        while (performance.now() - t0 < windowMs) {
           const evtP = new Promise<void>((res) => (evtResolve = res));
           const tw = performance.now();
           await ingest('bench_list', realisticRows(10, 300, rev++));
           await evtP;
-          await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
+          rowsState = await applyTick(rowsState);
+          await drv.setRows(rowsState);
           updateLatencies.push(performance.now() - tw);
           await sleep(Math.max(0, 150 - (performance.now() - tw)));
         }
         const s = frameStats(mon.stop(), budgetMs);
         drv.stopScroll();
         unsub();
-        metrics.syncListDroppedFramePct = (s.dropped / Math.max(1, s.frames)) * 100;
-        metrics.syncListUpdateLatencyMs = median(updateLatencies);
+        const droppedPct = (s.dropped / Math.max(1, s.frames)) * 100;
+        const updateMedianMs = median(updateLatencies);
         await push({
-          name: 'LegendList under fire (scroll + ticks + re-render)',
+          name: label,
           iterations: s.frames,
           totalMs: s.durationMs,
           perOpMs: s.medianDeltaMs,
           note:
             `${s.effectiveFps.toFixed(1)} fps effective vs ${refreshHz} Hz target, dropped ${s.dropped}/${s.frames} ` +
             `(>1.5x budget ${budgetMs.toFixed(2)} ms), worst gap ${s.worstGapMs.toFixed(1)} ms; ` +
-            `${updateLatencies.length} update waves, ingest->row-committed median ${median(updateLatencies).toFixed(1)} ms`,
+            `${updateLatencies.length} update waves, ingest->row-committed median ${updateMedianMs.toFixed(1)} ms`,
         });
+        return { droppedPct, updateMedianMs };
+      };
+
+      onProgress('LegendList under fire, naive full re-query (6 s, informational)...');
+      await underFire('LegendList under fire: naive full re-query per tick (not scored)', 6000, async () =>
+        decodeSchemaBuffer(fastPath().queryEntriesSchemaBuffer('bench_list', REALISTIC_FIELDS_CSV)),
+      );
+
+      await sleep(500);
+
+      onProgress('LegendList under fire, patched updates (8 s, scored)...');
+      {
+        // Ticks rewrite existing keys in place, so the key->index map can be
+        // built once from the first state and reused for every wave.
+        let index: Map<string, number> | null = null;
+        const patched = await underFire(
+          'LegendList under fire: patched updates (10 changed rows)',
+          8000,
+          async (current) => {
+            index ??= new Map(current.map((r, i) => [r.key, i] as const));
+            const changed = await Promise.all(
+              CHANGED_KEYS.map(async (k) => ({ key: k, fields: await redis.hgetall(k) })),
+            );
+            const next = [...current];
+            for (const row of changed) {
+              const i = index.get(row.key);
+              if (i !== undefined) next[i] = row;
+            }
+            return next;
+          },
+        );
+        metrics.syncListDroppedFramePct = patched.droppedPct;
+        metrics.syncListUpdateLatencyMs = patched.updateMedianMs;
       }
 
       await sleep(500);

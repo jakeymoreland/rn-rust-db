@@ -103,12 +103,17 @@ per-check points.
 - **Cold-start hydrate**: `close()` then `open()`, time from open until 10k
   rows are returned via the ArrayBuffer path. Replaces the hand-run
   `console.time` note in BENCHMARKS.md.
-- **FlatList A — live list under fire**: real `FlatList` of 10k realistic
-  records mounted in the Experiments screen during the phase, bound via
-  `subscribe()` → re-query → `setState`. Programmatic auto-scroll
-  (`scrollToOffset` loop) while streaming ticks rewrite visible rows. Measures
-  scroll FPS/dropped frames and ingest→row-committed latency (commit observed
-  via `useEffect` after the data-bearing state lands).
+- **List scenario A — live list under fire**: real virtualized list
+  (LegendList) of 10k realistic records on its own route during the phase.
+  Programmatic auto-scroll while streaming ticks rewrite rows. Runs two
+  data-binding patterns: naive (`subscribe()` → full re-query → `setState`,
+  informational) and patched (fetch only the changed rows and patch state —
+  scored, since it reflects a well-built app). Measures scroll FPS/dropped
+  frames and ingest→row-committed latency (commit observed via `useEffect`
+  after the data-bearing state lands). Amended 2026-07-16: originally a
+  single full-re-query scenario nested in the Experiments screen; split and
+  re-routed after device trials showed the naive pattern saturating the JS
+  thread (80% dropped frames on a 120 Hz device).
 - **FlatList B — boundary shootout**: same list; rows rebound from each read
   path (JSON string / JSI objects / ArrayBuffer) in turn; measures query +
   re-render commit time per strategy.

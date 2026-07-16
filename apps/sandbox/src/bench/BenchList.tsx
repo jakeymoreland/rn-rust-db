@@ -1,12 +1,45 @@
-import { useEffect, useRef, useState } from 'react';
-import { Text, View } from 'react-native';
+import { memo, useEffect, useRef, useState } from 'react';
+import { StyleSheet, Text, View } from 'react-native';
 import { LegendList, type LegendListRef } from '@legendapp/list/react-native';
 import type { Row } from './decode';
 import { registerListDriver } from './listBridge';
 
 const SCROLL_STEP_PX = 16;
 const SCROLL_STEP_MS = 32;
-const ESTIMATED_ITEM_SIZE = 48;
+// Rows are a fixed 44 px so Legend List's size estimate is exact — no
+// post-layout correction work while scrolling.
+const ROW_HEIGHT = 44;
+// Render ~one extra screen ahead of the scroll direction; the auto-scroll
+// moves at 500 px/s, so the default draw distance under-buffers.
+const DRAW_DISTANCE = 500;
+
+const styles = StyleSheet.create({
+  row: {
+    height: ROW_HEIGHT,
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#eee',
+    overflow: 'hidden',
+  },
+  rowTitle: { fontWeight: 'bold', fontSize: 12 },
+  rowMeta: { fontSize: 11 },
+});
+
+// Memoized so a patched setRows() (new array, mostly the same row object
+// references) re-renders only the rows whose reference actually changed.
+const BenchRow = memo(function BenchRow({ item }: { item: Row }) {
+  return (
+    <View style={styles.row}>
+      <Text style={styles.rowTitle} numberOfLines={1}>
+        {item.fields.first_name} {item.fields.last_name} — {item.fields.company}
+      </Text>
+      <Text style={styles.rowMeta} numberOfLines={1}>
+        ${item.fields.balance} · {item.fields.status} · {item.fields.updated_at}
+      </Text>
+    </View>
+  );
+});
 
 export function BenchList() {
   const [rows, setRows] = useState<Row[]>([]);
@@ -69,25 +102,10 @@ export function BenchList() {
         ref={listRef}
         data={rows}
         keyExtractor={(r: Row) => r.key}
-        estimatedItemSize={ESTIMATED_ITEM_SIZE}
+        estimatedItemSize={ROW_HEIGHT}
+        drawDistance={DRAW_DISTANCE}
         recycleItems
-        renderItem={({ item }: { item: Row }) => (
-          <View
-            style={{
-              paddingVertical: 6,
-              paddingHorizontal: 10,
-              borderBottomWidth: 1,
-              borderBottomColor: '#eee',
-            }}
-          >
-            <Text style={{ fontWeight: 'bold', fontSize: 12 }}>
-              {item.fields.first_name} {item.fields.last_name} — {item.fields.company}
-            </Text>
-            <Text style={{ fontSize: 11 }}>
-              ${item.fields.balance} · {item.fields.status} · {item.fields.updated_at}
-            </Text>
-          </View>
-        )}
+        renderItem={({ item }: { item: Row }) => <BenchRow item={item} />}
       />
     </View>
   );

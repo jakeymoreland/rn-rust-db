@@ -51,6 +51,16 @@ capped at 100 rows; it is informational only and never scored (the engine has
 no full-row JSON query command, so that path is what a first-pass app would
 write against the redis-style API).
 
+The "under fire" scenario runs twice: a naive window that re-queries and
+decodes all 10k rows per tick (informational), and a patched window that
+fetches only the ~10 changed rows and patches them into existing state — the
+scored pattern (`syncListDroppedFramePct` / `syncListUpdateLatencyMs`). The
+benchmark can only do the patched pattern because it knows which keys it just
+wrote: **change events carry a BatchSummary (counts) but not the changed
+keys**, so a real subscriber is forced into the naive full re-query. Adding
+changed keys (or a changed-keys query) to the engine's change events is the
+single highest-leverage engine API improvement this suite has surfaced.
+
 ## Results
 
 ### iOS (iPhone 17 simulator, iOS 26.3, dev build) — 2026-07-16T10:03:48.421Z
