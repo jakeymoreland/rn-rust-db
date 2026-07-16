@@ -1,0 +1,12 @@
+node_modules/
+target/
+*.log
+.DS_Store
+ios/Pods/
+android/.gradle/
+android/app/build/
+build/
+dist/
+*.xcframework
+jniLibs/
+.superpowers/

@@ -1,0 +1,5 @@
+{
+  "name": "rn-experiments",
+  "private": true,
+  "workspaces": ["packages/*", "apps/*"]
+}
