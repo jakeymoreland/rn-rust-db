@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "main": "index.ts",
   "dependencies": {
+    "@legendapp/list": "^3.3.2",
     "@rn-experiments/reconcile-engine": "0.1.0",
     "expo": "~57.0.6",
     "expo-clipboard": "~57.0.1",

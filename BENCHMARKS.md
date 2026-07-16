@@ -39,14 +39,14 @@ measurable this run.
 | Write Throughput | 20 | bulk ingest <15/50/200/1000 µs/row @10k; tick ingest median <5/16/50/150 ms; cold-start hydrate <50/200/1000/5000 ms; JS-thread max gap @100k <17/50/200/1000 ms |
 | Query Throughput | 20 | ArrayBuffer path @100k rows: <20→20, <50→15, <100→10, <250→5, ≥250→0 |
 | JS Interop | 10 | JSI-objects vs ArrayBuffer per-op ratio @10k <2/5/10/20×; best list query+commit @10k <50/150/400/1000 ms |
-| Sync Engine | 25 | tick→event median <5/16/50/150 ms and p95 <16/50/150/500 ms; 10k ingest under load <150/400/1500/5000 ms; FlatList-under-fire dropped frames <1/5/15/30 % and ingest→row-committed <50/150/400/1000 ms |
+| Sync Engine | 25 | tick→event median <5/16/50/150 ms and p95 <16/50/150/500 ms; 10k ingest under load <150/400/1500/5000 ms; LegendList-under-fire dropped frames <1/5/15/30 % and ingest→row-committed <50/150/400/1000 ms |
 | Reliability | 10 | pass/fail: interrupted transaction (3), corrupted payload recovery (2), retry idempotency (3), reopen integrity (2) |
 
 Within a band, points interpolate log-linearly between edges. Multi-metric
 categories average their measured metrics equally. Reliability's crash check
 is an in-process proxy (close mid-ingest + reopen), not a process kill.
 
-The FlatList "boundary shootout" also reports a `scan+hgetall` naive baseline
+The LegendList "boundary shootout" also reports a `scan+hgetall` naive baseline
 capped at 100 rows; it is informational only and never scored (the engine has
 no full-row JSON query command, so that path is what a first-pass app would
 write against the redis-style API).

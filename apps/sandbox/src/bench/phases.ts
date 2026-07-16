@@ -27,7 +27,7 @@ import { REALISTIC_SIZES, realisticRows, toyRows } from './data';
 import { type BenchMetrics, score } from './score';
 import type { RunOutput } from './markdown';
 import { decodeEntriesBuffer, type Row } from './decode';
-import { waitForListDriver } from './listBridge';
+import { setListVisible, waitForListDriver } from './listBridge';
 
 export type { BenchResult };
 export type { RunOutput };
@@ -85,15 +85,21 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
       perOpMs: ingestMs,
       note: `~${bytesPerRecord} B/record JSON, max JS-thread gap ${maxGap.toFixed(0)} ms`,
     });
-    await push(time('toy query 10000 rows: JSON string', 10, async () => {
-      JSON.parse(await executeRaw(JSON.stringify({ cmd: 'scan', args: ['entry:bench:*'] })));
-    }));
-    await push(time('toy query 10000 rows: JSI objects', 10, () => {
-      fastPath().queryEntriesObjects('bench');
-    }));
-    await push(time('toy query 10000 rows: ArrayBuffer', 10, () => {
-      new Uint8Array(fastPath().queryEntriesBuffer('bench'));
-    }));
+    await push(
+      time('toy query 10000 rows: JSON string', 10, async () => {
+        JSON.parse(await executeRaw(JSON.stringify({ cmd: 'scan', args: ['entry:bench:*'] })));
+      }),
+    );
+    await push(
+      time('toy query 10000 rows: JSI objects', 10, () => {
+        fastPath().queryEntriesObjects('bench');
+      }),
+    );
+    await push(
+      time('toy query 10000 rows: ArrayBuffer', 10, () => {
+        new Uint8Array(fastPath().queryEntriesBuffer('bench'));
+      }),
+    );
   });
 
   // 2b. realistic shape: marshaling + ingest at each size
@@ -110,7 +116,9 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
       onProgress(`building ${n} realistic rows...`);
       const payload = realisticRows(n);
       const bytesPerRecord = Math.round(payload.length / n);
-      onProgress(`ingesting ${n} realistic rows (~${bytesPerRecord} B/record, ${(payload.length / 1e6).toFixed(1)} MB payload)...`);
+      onProgress(
+        `ingesting ${n} realistic rows (~${bytesPerRecord} B/record, ${(payload.length / 1e6).toFixed(1)} MB payload)...`,
+      );
       const { ingestMs, maxGap } = await ingestWithGapMonitor('bench_real', payload);
       await push({
         name: `realistic ingest ${n} rows`,
@@ -123,15 +131,21 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
       if (n === 100000) metrics.storageMaxGapMs = maxGap;
 
       const iters = n >= 100000 ? 3 : n >= 10000 ? 5 : 10;
-      await push(time(`realistic query ${n} rows: JSON string`, iters, async () => {
-        JSON.parse(await executeRaw(JSON.stringify({ cmd: 'scan', args: ['entry:bench_real:*'] })));
-      }));
-      const objects = await push(time(`realistic query ${n} rows: JSI objects`, iters, () => {
-        fastPath().queryEntriesObjects('bench_real');
-      }));
-      const buffer = await push(time(`realistic query ${n} rows: ArrayBuffer`, iters, () => {
-        new Uint8Array(fastPath().queryEntriesBuffer('bench_real'));
-      }));
+      await push(
+        time(`realistic query ${n} rows: JSON string`, iters, async () => {
+          JSON.parse(await executeRaw(JSON.stringify({ cmd: 'scan', args: ['entry:bench_real:*'] })));
+        }),
+      );
+      const objects = await push(
+        time(`realistic query ${n} rows: JSI objects`, iters, () => {
+          fastPath().queryEntriesObjects('bench_real');
+        }),
+      );
+      const buffer = await push(
+        time(`realistic query ${n} rows: ArrayBuffer`, iters, () => {
+          new Uint8Array(fastPath().queryEntriesBuffer('bench_real'));
+        }),
+      );
       if (n === 10000) metrics.interopObjectsVsBufferRatio = objects.perOpMs / buffer.perOpMs;
       if (n === 100000) metrics.queryBuffer100kMs = buffer.perOpMs;
     }
@@ -193,8 +207,14 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
       },
     ];
     const syncReaders: Reader[] = [
-      { name: 'objects', op: () => void fastPath().queryEntriesObjects('bench_load') },
-      { name: 'buffer', op: () => void new Uint8Array(fastPath().queryEntriesBuffer('bench_load')) },
+      {
+        name: 'objects',
+        op: () => void fastPath().queryEntriesObjects('bench_load'),
+      },
+      {
+        name: 'buffer',
+        op: () => void new Uint8Array(fastPath().queryEntriesBuffer('bench_load')),
+      },
     ];
 
     // Sustain the load for at least 5 s (comparable window to the idle
@@ -305,10 +325,12 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
     });
   });
 
-  // 5. FlatList scenarios: a real list bound to the engine. A = live list
-  // under fire (auto-scroll + tick ingests + subscribe-driven re-render);
-  // B = boundary shootout (same list, rows fed from each read path).
-  await phase('FlatList scenarios', async () => {
+  // 5. Legend List scenarios: a real virtualized list bound to the engine,
+  // shown on its own route while these phases run (a virtualized list must
+  // not be nested in the Experiments ScrollView). A = live list under fire
+  // (auto-scroll + tick ingests + subscribe-driven re-render); B = boundary
+  // shootout (same list, rows fed from each read path).
+  await phase('list scenarios', async () => {
     await registerSource({
       source_id: 'bench_list',
       format: 'Json',
@@ -320,101 +342,111 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
     onProgress('seeding bench_list with 10k realistic rows...');
     await ingest('bench_list', realisticRows(10000, 300));
 
+    setListVisible(true);
     const drv = await waitForListDriver(3000);
     if (!drv) {
-      onProgress('list driver unavailable — skipping FlatList phases');
+      setListVisible(false);
+      onProgress('list driver unavailable — skipping list phases');
       return;
     }
-    await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
+    try {
+      await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
 
-    // A: live list under fire
-    onProgress('FlatList under fire (8 s: auto-scroll + 10-row ticks + re-render)...');
-    {
-      const updateLatencies: number[] = [];
-      let evtResolve: (() => void) | null = null;
-      const unsub = await subscribe('changes:bench_list', () => evtResolve?.());
-      drv.startScroll();
-      const mon = startFrameMonitor();
-      const t0 = performance.now();
-      let rev = 1;
-      while (performance.now() - t0 < 8000) {
-        const evtP = new Promise<void>((res) => (evtResolve = res));
-        const tw = performance.now();
-        await ingest('bench_list', realisticRows(10, 300, rev++));
-        await evtP;
-        await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
-        updateLatencies.push(performance.now() - tw);
-        await sleep(Math.max(0, 150 - (performance.now() - tw)));
-      }
-      const s = frameStats(mon.stop(), budgetMs);
-      drv.stopScroll();
-      unsub();
-      metrics.syncListDroppedFramePct = (s.dropped / Math.max(1, s.frames)) * 100;
-      metrics.syncListUpdateLatencyMs = median(updateLatencies);
-      await push({
-        name: 'FlatList under fire (scroll + ticks + re-render)',
-        iterations: s.frames,
-        totalMs: s.durationMs,
-        perOpMs: s.medianDeltaMs,
-        note:
-          `${s.effectiveFps.toFixed(1)} fps effective vs ${refreshHz} Hz target, dropped ${s.dropped}/${s.frames} ` +
-          `(>1.5x budget ${budgetMs.toFixed(2)} ms), worst gap ${s.worstGapMs.toFixed(1)} ms; ` +
-          `${updateLatencies.length} update waves, ingest->row-committed median ${median(updateLatencies).toFixed(1)} ms`,
-      });
-    }
-
-    await sleep(500);
-
-    // B: boundary shootout — which read path should back a real list.
-    // scan+hgetall is the naive async-JSON path a first-pass app would write;
-    // it is capped at 100 rows (a visible page) and excluded from scoring.
-    onProgress('FlatList boundary shootout (buffer+decode vs JSI objects vs scan+hgetall)...');
-    {
-      const strategies: Array<{ name: string; scored: boolean; fetch: () => Promise<Row[]> | Row[] }> = [
-        {
-          name: 'buffer+decode (10k rows)',
-          scored: true,
-          fetch: () => decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')),
-        },
-        {
-          name: 'jsi-objects (10k rows)',
-          scored: true,
-          fetch: () => fastPath().queryEntriesObjects('bench_list'),
-        },
-        {
-          name: 'scan+hgetall (first 100 rows, naive baseline)',
-          scored: false,
-          fetch: async () => {
-            const keys = (await redis.scan('entry:bench_list:*')).slice(0, 100);
-            const rows = [];
-            for (const k of keys) rows.push({ key: k, fields: await redis.hgetall(k) });
-            return rows;
-          },
-        },
-      ];
-      const medians: number[] = [];
-      for (const strat of strategies) {
-        const times: number[] = [];
-        for (let i = 0; i < 3; i++) {
-          await drv.setRows([]);
-          const t0 = performance.now();
-          const rows = await strat.fetch();
-          await drv.setRows(rows);
-          times.push(performance.now() - t0);
+      // A: live list under fire
+      onProgress('LegendList under fire (8 s: auto-scroll + 10-row ticks + re-render)...');
+      {
+        const updateLatencies: number[] = [];
+        let evtResolve: (() => void) | null = null;
+        const unsub = await subscribe('changes:bench_list', () => evtResolve?.());
+        drv.startScroll();
+        const mon = startFrameMonitor();
+        const t0 = performance.now();
+        let rev = 1;
+        while (performance.now() - t0 < 8000) {
+          const evtP = new Promise<void>((res) => (evtResolve = res));
+          const tw = performance.now();
+          await ingest('bench_list', realisticRows(10, 300, rev++));
+          await evtP;
+          await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
+          updateLatencies.push(performance.now() - tw);
+          await sleep(Math.max(0, 150 - (performance.now() - tw)));
         }
-        const med = median(times);
-        if (strat.scored) medians.push(med);
+        const s = frameStats(mon.stop(), budgetMs);
+        drv.stopScroll();
+        unsub();
+        metrics.syncListDroppedFramePct = (s.dropped / Math.max(1, s.frames)) * 100;
+        metrics.syncListUpdateLatencyMs = median(updateLatencies);
         await push({
-          name: `list shootout: ${strat.name}`,
-          iterations: 3,
-          totalMs: times.reduce((a, b) => a + b, 0),
-          perOpMs: med,
-          note: `query + FlatList commit, median of 3${strat.scored ? '' : ' (not scored)'}`,
+          name: 'LegendList under fire (scroll + ticks + re-render)',
+          iterations: s.frames,
+          totalMs: s.durationMs,
+          perOpMs: s.medianDeltaMs,
+          note:
+            `${s.effectiveFps.toFixed(1)} fps effective vs ${refreshHz} Hz target, dropped ${s.dropped}/${s.frames} ` +
+            `(>1.5x budget ${budgetMs.toFixed(2)} ms), worst gap ${s.worstGapMs.toFixed(1)} ms; ` +
+            `${updateLatencies.length} update waves, ingest->row-committed median ${median(updateLatencies).toFixed(1)} ms`,
         });
       }
-      metrics.interopListCommitMs = Math.min(...medians);
-      // restore the full list for subsequent phases
-      await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
+
+      await sleep(500);
+
+      // B: boundary shootout — which read path should back a real list.
+      // scan+hgetall is the naive async-JSON path a first-pass app would write;
+      // it is capped at 100 rows (a visible page) and excluded from scoring.
+      onProgress('LegendList boundary shootout (buffer+decode vs JSI objects vs scan+hgetall)...');
+      {
+        const strategies: Array<{
+          name: string;
+          scored: boolean;
+          fetch: () => Promise<Row[]> | Row[];
+        }> = [
+          {
+            name: 'buffer+decode (10k rows)',
+            scored: true,
+            fetch: () => decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')),
+          },
+          {
+            name: 'jsi-objects (10k rows)',
+            scored: true,
+            fetch: () => fastPath().queryEntriesObjects('bench_list'),
+          },
+          {
+            name: 'scan+hgetall (first 100 rows, naive baseline)',
+            scored: false,
+            fetch: async () => {
+              const keys = (await redis.scan('entry:bench_list:*')).slice(0, 100);
+              const rows = [];
+              for (const k of keys) rows.push({ key: k, fields: await redis.hgetall(k) });
+              return rows;
+            },
+          },
+        ];
+        const medians: number[] = [];
+        for (const strat of strategies) {
+          const times: number[] = [];
+          for (let i = 0; i < 3; i++) {
+            await drv.setRows([]);
+            const t0 = performance.now();
+            const rows = await strat.fetch();
+            await drv.setRows(rows);
+            times.push(performance.now() - t0);
+          }
+          const med = median(times);
+          if (strat.scored) medians.push(med);
+          await push({
+            name: `list shootout: ${strat.name}`,
+            iterations: 3,
+            totalMs: times.reduce((a, b) => a + b, 0),
+            perOpMs: med,
+            note: `query + LegendList commit, median of 3${strat.scored ? '' : ' (not scored)'}`,
+          });
+        }
+        metrics.interopListCommitMs = Math.min(...medians);
+        // restore the full list for subsequent phases
+        await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
+      }
+    } finally {
+      setListVisible(false);
     }
   });
 
@@ -464,9 +496,10 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
     for (let i = 0; i < ITERS + 5; i++) {
       const evtP = new Promise<number>((res) => (onEvt = res));
       const t0 = performance.now();
-      const t1P = ingest('bench_evt', JSON.stringify([{ id: `evt_${i}`, seq: String(i), v: String(Math.random()) }])).then(
-        () => performance.now(),
-      );
+      const t1P = ingest(
+        'bench_evt',
+        JSON.stringify([{ id: `evt_${i}`, seq: String(i), v: String(Math.random()) }]),
+      ).then(() => performance.now());
       const [t1, t2] = await Promise.all([t1P, evtP]);
       if (i >= 5) {
         // first 5 are warmup
@@ -514,7 +547,11 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
     };
     await registerSource(relSource);
     const relRows = () => decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_rel'));
-    const check = async (name: string, metric: keyof BenchMetrics, fn: () => Promise<{ pass: boolean; detail: string }>) => {
+    const check = async (
+      name: string,
+      metric: keyof BenchMetrics,
+      fn: () => Promise<{ pass: boolean; detail: string }>,
+    ) => {
       const t0 = performance.now();
       let pass = false;
       let detail = '';

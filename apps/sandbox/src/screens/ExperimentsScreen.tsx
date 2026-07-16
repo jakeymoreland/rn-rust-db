@@ -1,20 +1,43 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button, Platform, ScrollView, Text, View } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { executeRaw } from '@rn-experiments/reconcile-engine';
 import { runAll, type RunOutput } from '../bench/phases';
-import { CATEGORY_LABELS, categoryWorstMetrics, renderScorecard, toMarkdown, type CategoryKey } from '../bench/markdown';
+import {
+  CATEGORY_LABELS,
+  categoryWorstMetrics,
+  renderScorecard,
+  toMarkdown,
+  type CategoryKey,
+} from '../bench/markdown';
 import { BenchList } from '../bench/BenchList';
+import { registerListVisibility } from '../bench/listBridge';
 
 if (__DEV__) {
   // Expose the harness so benchmarks can be driven over the Hermes inspector.
-  (globalThis as Record<string, unknown>).__t16 = { runAll, toMarkdown, executeRaw };
+  (globalThis as Record<string, unknown>).__t16 = {
+    runAll,
+    toMarkdown,
+    executeRaw,
+  };
 }
 
 export function ExperimentsScreen() {
   const [progress, setProgress] = useState<string[]>([]);
   const [output, setOutput] = useState<RunOutput | null>(null);
   const [running, setRunning] = useState(false);
+  const [listVisible, setListVisible] = useState(false);
+
+  useEffect(() => {
+    registerListVisibility(setListVisible);
+    return () => registerListVisibility(null);
+  }, []);
+
+  // The FlatList phases swap the whole screen to the list route: a
+  // VirtualizedList must not be nested inside this ScrollView.
+  if (listVisible) {
+    return <BenchList />;
+  }
 
   return (
     <ScrollView style={{ padding: 16 }}>
@@ -38,7 +61,6 @@ export function ExperimentsScreen() {
           onPress={() => void Clipboard.setStringAsync(toMarkdown(Platform.OS, output))}
         />
       )}
-      {running && <BenchList />}
       {output && (
         <>
           <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderScorecard(output.score)}</Text>

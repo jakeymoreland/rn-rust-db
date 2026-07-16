@@ -1267,6 +1267,13 @@
     "@jridgewell/resolve-uri" "^3.1.0"
     "@jridgewell/sourcemap-codec" "^1.4.14"
 
+"@legendapp/list@^3.3.2":
+  version "3.3.2"
+  resolved "https://registry.yarnpkg.com/@legendapp/list/-/list-3.3.2.tgz#ee3329255a143e6cb64de712a6a52960f85cac9e"
+  integrity sha512-wAw961e9PjWECXne68IVIWCUgPGrJGJySojEUFuVNICSqXKqzYSN7tA4r7SI3KVquto30Xb7PE+ZgdRZjwsOOQ==
+  dependencies:
+    use-sync-external-store "^1.5.0"
+
 "@react-native/assets-registry@0.86.0":
   version "0.86.0"
   resolved "https://registry.npmjs.org/@react-native/assets-registry/-/assets-registry-0.86.0.tgz"
@@ -4586,6 +4593,11 @@ update-browserslist-db@^1.2.3:
   dependencies:
     escalade "^3.2.0"
     picocolors "^1.1.1"
+
+use-sync-external-store@^1.5.0:
+  version "1.6.0"
+  resolved "https://registry.yarnpkg.com/use-sync-external-store/-/use-sync-external-store-1.6.0.tgz#b174bfa65cb2b526732d9f2ac0a408027876f32d"
+  integrity sha512-Pp6GSwGP/NrPIrxVFAIkOQeyw8lFenOHijQWkUTrDvrF4ALqylP2C/KCkeS9dpUM3KvYRQhna5vt7IL95+ZQ9w==
 
 utils-merge@1.0.1:
   version "1.0.1"

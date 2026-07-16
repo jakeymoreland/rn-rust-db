@@ -1,18 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
-import { FlatList, Text, View } from 'react-native';
+import { Text, View } from 'react-native';
+import { LegendList, type LegendListRef } from '@legendapp/list/react-native';
 import type { Row } from './decode';
 import { registerListDriver } from './listBridge';
 
-const LIST_HEIGHT = 300;
 const SCROLL_STEP_PX = 16;
 const SCROLL_STEP_MS = 32;
+const ESTIMATED_ITEM_SIZE = 48;
 
 export function BenchList() {
   const [rows, setRows] = useState<Row[]>([]);
   const [version, setVersion] = useState(0);
-  const listRef = useRef<FlatList<Row>>(null);
+  const listRef = useRef<LegendListRef>(null);
   const commitResolvers = useRef<Array<() => void>>([]);
-  const contentHeight = useRef(0);
   const offset = useRef(0);
   const scrollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -34,9 +34,12 @@ export function BenchList() {
       startScroll: () => {
         if (scrollTimer.current) return;
         scrollTimer.current = setInterval(() => {
-          offset.current += SCROLL_STEP_PX;
-          if (offset.current > Math.max(0, contentHeight.current - LIST_HEIGHT)) offset.current = 0;
-          listRef.current?.scrollToOffset({ offset: offset.current, animated: false });
+          const list = listRef.current;
+          if (!list) return;
+          const state = list.getState();
+          const maxOffset = Math.max(0, (state?.contentLength ?? 0) - (state?.scrollLength ?? 0));
+          offset.current = offset.current + SCROLL_STEP_PX > maxOffset ? 0 : offset.current + SCROLL_STEP_PX;
+          list.scrollToOffset({ offset: offset.current, animated: false });
         }, SCROLL_STEP_MS);
       },
       stopScroll: () => {
@@ -51,14 +54,32 @@ export function BenchList() {
   }, []);
 
   return (
-    <View style={{ height: LIST_HEIGHT, borderWidth: 1, borderColor: '#ccc' }}>
-      <FlatList
+    <View style={{ flex: 1 }}>
+      <Text
+        style={{
+          fontFamily: 'monospace',
+          fontSize: 12,
+          padding: 8,
+          backgroundColor: '#eee',
+        }}
+      >
+        benchmark list — running…
+      </Text>
+      <LegendList
         ref={listRef}
         data={rows}
-        keyExtractor={(r) => r.key}
-        onContentSizeChange={(_, h) => (contentHeight.current = h)}
-        renderItem={({ item }) => (
-          <View style={{ paddingVertical: 6, paddingHorizontal: 10, borderBottomWidth: 1, borderBottomColor: '#eee' }}>
+        keyExtractor={(r: Row) => r.key}
+        estimatedItemSize={ESTIMATED_ITEM_SIZE}
+        recycleItems
+        renderItem={({ item }: { item: Row }) => (
+          <View
+            style={{
+              paddingVertical: 6,
+              paddingHorizontal: 10,
+              borderBottomWidth: 1,
+              borderBottomColor: '#eee',
+            }}
+          >
             <Text style={{ fontWeight: 'bold', fontSize: 12 }}>
               {item.fields.first_name} {item.fields.last_name} — {item.fields.company}
             </Text>
