@@ -45,6 +45,8 @@ target 'sandbox' do
 
   config = use_native_modules!(config_command)
 
+  pod 'ReconcileEngine', :path => '../../../packages/reconcile-engine'
+
   use_frameworks! :linkage => podfile_properties['ios.useFrameworks'].to_sym if podfile_properties['ios.useFrameworks']
   use_frameworks! :linkage => ENV['USE_FRAMEWORKS'].to_sym if ENV['USE_FRAMEWORKS']
 
@@ -63,5 +65,22 @@ target 'sandbox' do
       :mac_catalyst_enabled => false,
       :ccache_enabled => ccache_enabled?(podfile_properties),
     )
+
+    # The ReactCodegen 'Generate Specs' script phase declares the whole app
+    # directory (${PODS_ROOT}/../..) as an input. That directory contains the
+    # output of the app target's '[Expo] Configure project' script phase
+    # (Pods/Target Support Files/Pods-sandbox/ExpoModulesProvider.swift), so
+    # Xcode infers Generate Specs -> sandbox, closing a dependency cycle:
+    # EXConstants -> ExpoModulesCore -> ReactCodegen -> sandbox -> EXConstants.
+    # Clear the input paths to break the false edge; codegen still runs during
+    # `pod install`, and the phase re-runs whenever its logfile output is
+    # missing.
+    installer.pods_project.targets.each do |target|
+      next unless target.name == 'ReactCodegen'
+      target.build_phases.each do |phase|
+        next unless phase.respond_to?(:name) && phase.name.to_s.include?('Generate Specs')
+        phase.input_paths = []
+      end
+    end
   end
 end
