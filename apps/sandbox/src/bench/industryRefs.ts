@@ -81,6 +81,7 @@ export const INDUSTRY_REFS: IndustryRef[] = [
     refLoMs: 0.5,
     refHiMs: 1.5,
     unit: 'ms total',
+    caveat: 'reference transfers a pre-built buffer; ours includes the 10k-row SQLite query',
   },
   {
     key: 'dlq100',

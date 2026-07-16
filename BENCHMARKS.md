@@ -123,6 +123,31 @@ Ingest JS-thread stalls (max gap of a 16 ms timer): 1k → 38 ms, 10k → 56 ms,
 Cold start (`openEngine`, fresh DB, schema created): 15.7 ms. Re-open of an existing
 DB with 100k entries: 44.9 ms.
 
+## Industry-comparison findings (2026-07-17, iPhone 16 Pro dev build)
+
+After the optimization arc (WAL synchronous=NORMAL, cached prepared
+statements, write-behind kv cache, schema/windowed/lazy buffer paths,
+zero-copy jsi::MutableBuffer handoff, bulk-prefetch reconcile):
+
+1. **Write-behind kv works**: set 4.6 µs / get 2.9 µs, memory-first with
+   ~100 ms flush cadence. The remaining gap to a pure hashmap (~2 µs) is the
+   JSON command envelope, not storage — visible because the "no-op" ping row
+   (7 µs) is now *slower* than set: `get missing` is a permanent cache miss
+   that probes SQLite, while set never leaves RAM.
+2. **Zero-copy + plain-format lazy view**: 10k-rows-to-a-visible-page went
+   53.3 → 13.7 ms. The remainder is the SQLite read itself plus the Hermes
+   index walk (no JIT: interpreter-dispatched DataView reads dominate JS-side
+   binary work — prefer fewer, larger reads and native-side offsets).
+3. **Negative result — bulk-prefetch reconcile didn't move bulk ingest**
+   (~46 ms/1k rows). Cached per-row SELECT probes were only a few ms per
+   thousand; the true floor is per-touched-row serde parse + re-serialize of
+   the fields and field_meta JSON blobs (~2 KB/row). Breaking the 12–25 ms
+   bare-INSERT band would need normalized/binary field-meta storage or a
+   per-row content-hash short-circuit — a schema redesign, not a tuning knob.
+4. **Where the engine genuinely beats the reference**: DLQ writes (~0.07 ms
+   vs 5–8 ms band), bridge overhead, and single-row insert lands in-band while
+   doing a full parse+normalize+reconcile.
+
 ## Observations
 
 1. **Call overhead is negligible and sync beats async everywhere.** A no-op
