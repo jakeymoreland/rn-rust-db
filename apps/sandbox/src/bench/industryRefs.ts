@@ -93,6 +93,15 @@ export const INDUSTRY_REFS: IndustryRef[] = [
     caveat: 'reference range is WatermelonDB/rxdb-lokijs..pouchdb/aws in a browser; ours is native with full reconcile',
   },
   {
+    key: 'rnStorageLoad10k',
+    component: 'vs RN storage libs',
+    operation: 'load 10k records to usable (STED paper suite)',
+    refLoMs: 18,
+    refHiMs: 68,
+    unit: 'ms total',
+    caveat: 'reference (AsyncStorage 18 / Realm 46 / SQLite 68, iOS sim) loads to memory; ours indexes a queryable lazy view on-device',
+  },
+  {
     key: 'dlq100',
     component: 'Dead-letter queue',
     operation: 'dead-letter 100 bad payloads',

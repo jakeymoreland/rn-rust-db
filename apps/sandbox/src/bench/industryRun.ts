@@ -124,6 +124,8 @@ export async function runIndustry(onProgress: (msg: string) => void): Promise<In
       for (let i = 0; i < Math.min(20, lazy.length); i++) lazy.row(i);
     });
     done('marshalLazy', median(lazyWaves));
+    // same measurement graded against the STED RN-storage data-load table
+    done('rnStorageLoad10k', median(lazyWaves));
   }
 
   onProgress('dead-letter 100 bad payloads (3 waves)...');
