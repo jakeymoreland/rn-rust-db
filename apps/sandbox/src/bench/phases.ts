@@ -14,6 +14,8 @@ import {
 import { REALISTIC_SIZES, realisticRows, toyRows } from './data';
 import { type BenchMetrics, score } from './score';
 import type { RunOutput } from './markdown';
+import { decodeEntriesBuffer, type Row } from './decode';
+import { waitForListDriver } from './listBridge';
 
 export type { BenchResult };
 export type { RunOutput };
@@ -291,7 +293,120 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
     });
   });
 
-  // 5. change-event latency breakdown: t0 = before ingest() call,
+  // 5. FlatList scenarios: a real list bound to the engine. A = live list
+  // under fire (auto-scroll + tick ingests + subscribe-driven re-render);
+  // B = boundary shootout (same list, rows fed from each read path).
+  await phase('FlatList scenarios', async () => {
+    await registerSource({
+      source_id: 'bench_list',
+      format: 'Json',
+      collection: 'bench_list',
+      natural_key_field: 'id',
+      timestamp_field: null,
+      priority: 1,
+    });
+    onProgress('seeding bench_list with 10k realistic rows...');
+    await ingest('bench_list', realisticRows(10000, 300));
+
+    const drv = await waitForListDriver(3000);
+    if (!drv) {
+      onProgress('list driver unavailable — skipping FlatList phases');
+      return;
+    }
+    await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
+
+    // A: live list under fire
+    onProgress('FlatList under fire (8 s: auto-scroll + 10-row ticks + re-render)...');
+    {
+      const updateLatencies: number[] = [];
+      let evtResolve: (() => void) | null = null;
+      const unsub = await subscribe('changes:bench_list', () => evtResolve?.());
+      drv.startScroll();
+      const mon = startFrameMonitor();
+      const t0 = performance.now();
+      let rev = 1;
+      while (performance.now() - t0 < 8000) {
+        const evtP = new Promise<void>((res) => (evtResolve = res));
+        const tw = performance.now();
+        await ingest('bench_list', realisticRows(10, 300, rev++));
+        await evtP;
+        await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
+        updateLatencies.push(performance.now() - tw);
+        await sleep(Math.max(0, 150 - (performance.now() - tw)));
+      }
+      const s = frameStats(mon.stop(), budgetMs);
+      drv.stopScroll();
+      unsub();
+      metrics.syncListDroppedFramePct = (s.dropped / Math.max(1, s.frames)) * 100;
+      metrics.syncListUpdateLatencyMs = median(updateLatencies);
+      await push({
+        name: 'FlatList under fire (scroll + ticks + re-render)',
+        iterations: s.frames,
+        totalMs: s.durationMs,
+        perOpMs: s.medianDeltaMs,
+        note:
+          `${s.effectiveFps.toFixed(1)} fps effective vs ${refreshHz} Hz target, dropped ${s.dropped}/${s.frames} ` +
+          `(>1.5x budget ${budgetMs.toFixed(2)} ms), worst gap ${s.worstGapMs.toFixed(1)} ms; ` +
+          `${updateLatencies.length} update waves, ingest->row-committed median ${median(updateLatencies).toFixed(1)} ms`,
+      });
+    }
+
+    await sleep(500);
+
+    // B: boundary shootout — which read path should back a real list.
+    // scan+hgetall is the naive async-JSON path a first-pass app would write;
+    // it is capped at 100 rows (a visible page) and excluded from scoring.
+    onProgress('FlatList boundary shootout (buffer+decode vs JSI objects vs scan+hgetall)...');
+    {
+      const strategies: Array<{ name: string; scored: boolean; fetch: () => Promise<Row[]> | Row[] }> = [
+        {
+          name: 'buffer+decode (10k rows)',
+          scored: true,
+          fetch: () => decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')),
+        },
+        {
+          name: 'jsi-objects (10k rows)',
+          scored: true,
+          fetch: () => fastPath().queryEntriesObjects('bench_list'),
+        },
+        {
+          name: 'scan+hgetall (first 100 rows, naive baseline)',
+          scored: false,
+          fetch: async () => {
+            const keys = (await redis.scan('entry:bench_list:*')).slice(0, 100);
+            const rows = [];
+            for (const k of keys) rows.push({ key: k, fields: await redis.hgetall(k) });
+            return rows;
+          },
+        },
+      ];
+      const medians: number[] = [];
+      for (const strat of strategies) {
+        const times: number[] = [];
+        for (let i = 0; i < 3; i++) {
+          await drv.setRows([]);
+          const t0 = performance.now();
+          const rows = await strat.fetch();
+          await drv.setRows(rows);
+          times.push(performance.now() - t0);
+        }
+        const med = median(times);
+        if (strat.scored) medians.push(med);
+        await push({
+          name: `list shootout: ${strat.name}`,
+          iterations: 3,
+          totalMs: times.reduce((a, b) => a + b, 0),
+          perOpMs: med,
+          note: `query + FlatList commit, median of 3${strat.scored ? '' : ' (not scored)'}`,
+        });
+      }
+      metrics.interopListCommitMs = Math.min(...medians);
+      // restore the full list for subsequent phases
+      await drv.setRows(decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')));
+    }
+  });
+
+  // 6. change-event latency breakdown: t0 = before ingest() call,
   // t1 = ingest promise resolves, t2 = subscribe callback fires.
   await phase('event breakdown', async () => {
     await registerSource({

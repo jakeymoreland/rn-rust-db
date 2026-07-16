@@ -4,6 +4,7 @@ import * as Clipboard from 'expo-clipboard';
 import { executeRaw } from '@rn-experiments/reconcile-engine';
 import { runAll, type RunOutput } from '../bench/phases';
 import { renderScorecard, toMarkdown } from '../bench/markdown';
+import { BenchList } from '../bench/BenchList';
 
 if (__DEV__) {
   // Expose the harness so benchmarks can be driven over the Hermes inspector.
@@ -37,6 +38,7 @@ export function ExperimentsScreen() {
           onPress={() => void Clipboard.setStringAsync(toMarkdown(Platform.OS, output))}
         />
       )}
+      {running && <BenchList />}
       {output && (
         <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderScorecard(output.score)}</Text>
       )}
