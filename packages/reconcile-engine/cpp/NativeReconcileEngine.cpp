@@ -1,0 +1,201 @@
+#include "NativeReconcileEngine.h"
+
+#include <cstring>
+#include <stdexcept>
+#include <vector>
+
+namespace facebook::react {
+
+namespace {
+std::string takeRustString(char* s) {
+  if (s == nullptr) {
+    return "{\"ok\":false,\"code\":2,\"message\":\"null response from engine\"}";
+  }
+  std::string out(s);
+  engine_free_string(s);
+  return out;
+}
+} // namespace
+
+NativeReconcileEngine::NativeReconcileEngine(std::shared_ptr<CallInvoker> jsInvoker)
+    : NativeReconcileEngineCxxSpec(std::move(jsInvoker)),
+      worker_([this] { workerLoop(); }) {}
+
+NativeReconcileEngine::~NativeReconcileEngine() {
+  {
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    stopping_ = true;
+  }
+  queueCv_.notify_all();
+  if (worker_.joinable()) {
+    worker_.join();
+  }
+  std::lock_guard<std::mutex> lock(engineMutex_);
+  if (engine_ != nullptr) {
+    engine_close(engine_);
+    engine_ = nullptr;
+  }
+}
+
+void NativeReconcileEngine::workerLoop() {
+  for (;;) {
+    std::function<void()> task;
+    {
+      std::unique_lock<std::mutex> lock(queueMutex_);
+      queueCv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+      if (stopping_ && queue_.empty()) {
+        return;
+      }
+      task = std::move(queue_.front());
+      queue_.pop();
+    }
+    task();
+  }
+}
+
+void NativeReconcileEngine::post(std::function<void()> task) {
+  {
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    queue_.push(std::move(task));
+  }
+  queueCv_.notify_one();
+}
+
+void NativeReconcileEngine::eventTrampoline(void* ctx, const char* channel, const char* payload) {
+  auto* self = static_cast<NativeReconcileEngine*>(ctx);
+  std::string ch(channel != nullptr ? channel : "");
+  std::string pl(payload != nullptr ? payload : "");
+  self->jsInvoker_->invokeAsync([self, ch, pl]() {
+    self->emitOnChange({ch, pl});
+  });
+}
+
+void NativeReconcileEngine::open(jsi::Runtime& rt, std::string path) {
+  std::lock_guard<std::mutex> lock(engineMutex_);
+  if (engine_ != nullptr) {
+    return; // already open — idempotent for the sandbox
+  }
+  engine_ = engine_open(path.c_str());
+  if (engine_ == nullptr) {
+    std::string err = takeRustString(engine_last_error());
+    throw jsi::JSError(rt, "engine_open failed: " + err);
+  }
+  engine_set_event_callback(engine_, this, &NativeReconcileEngine::eventTrampoline);
+}
+
+void NativeReconcileEngine::close(jsi::Runtime& rt) {
+  std::lock_guard<std::mutex> lock(engineMutex_);
+  if (engine_ != nullptr) {
+    engine_close(engine_);
+    engine_ = nullptr;
+  }
+}
+
+AsyncPromise<std::string> NativeReconcileEngine::execute(jsi::Runtime& rt, std::string requestJson) {
+  auto promise = AsyncPromise<std::string>(rt, jsInvoker_);
+  post([this, promise, requestJson = std::move(requestJson)]() mutable {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    if (engine_ == nullptr) {
+      promise.reject("engine not open");
+      return;
+    }
+    char* resp = engine_execute(engine_, requestJson.c_str());
+    promise.resolve(takeRustString(resp));
+  });
+  return promise;
+}
+
+std::string NativeReconcileEngine::executeSync(jsi::Runtime& rt, std::string requestJson) {
+  std::lock_guard<std::mutex> lock(engineMutex_);
+  if (engine_ == nullptr) {
+    throw jsi::JSError(rt, "engine not open");
+  }
+  return takeRustString(engine_execute(engine_, requestJson.c_str()));
+}
+
+bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
+  auto queryBuffer = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "queryEntriesBuffer"),
+      1,
+      [this](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        if (count < 1 || !args[0].isString()) {
+          throw jsi::JSError(rt, "queryEntriesBuffer(collection: string)");
+        }
+        std::string collection = args[0].asString(rt).utf8(rt);
+        size_t len = 0;
+        unsigned char* data = nullptr;
+        {
+          std::lock_guard<std::mutex> lock(engineMutex_);
+          if (engine_ == nullptr) {
+            throw jsi::JSError(rt, "engine not open");
+          }
+          data = engine_query_entries_bin(engine_, collection.c_str(), &len);
+        }
+        if (data == nullptr) {
+          throw jsi::JSError(rt, "queryEntriesBuffer failed: " + takeRustString(engine_last_error()));
+        }
+        jsi::Function ctor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
+        jsi::Object abObj = ctor.callAsConstructor(rt, static_cast<int>(len)).getObject(rt);
+        jsi::ArrayBuffer ab = abObj.getArrayBuffer(rt);
+        std::memcpy(ab.data(rt), data, len);
+        engine_free_bytes(data, len);
+        return abObj;
+      });
+
+  auto queryObjects = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "queryEntriesObjects"),
+      1,
+      [this](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        if (count < 1 || !args[0].isString()) {
+          throw jsi::JSError(rt, "queryEntriesObjects(collection: string)");
+        }
+        std::string collection = args[0].asString(rt).utf8(rt);
+        size_t len = 0;
+        unsigned char* data = nullptr;
+        {
+          std::lock_guard<std::mutex> lock(engineMutex_);
+          if (engine_ == nullptr) {
+            throw jsi::JSError(rt, "engine not open");
+          }
+          data = engine_query_entries_bin(engine_, collection.c_str(), &len);
+        }
+        if (data == nullptr) {
+          throw jsi::JSError(rt, "queryEntriesObjects failed: " + takeRustString(engine_last_error()));
+        }
+        // Decode: LE [u32 count]([u32 klen][key][u32 jlen][json])*
+        auto readU32 = [&](size_t off) -> uint32_t {
+          uint32_t v;
+          std::memcpy(&v, data + off, 4);
+          return v;
+        };
+        size_t off = 0;
+        uint32_t rows = readU32(off);
+        off += 4;
+        jsi::Array out(rt, rows);
+        jsi::Function jsonParse = rt.global()
+            .getPropertyAsObject(rt, "JSON")
+            .getPropertyAsFunction(rt, "parse");
+        for (uint32_t i = 0; i < rows; i++) {
+          uint32_t klen = readU32(off); off += 4;
+          std::string key(reinterpret_cast<char*>(data + off), klen); off += klen;
+          uint32_t jlen = readU32(off); off += 4;
+          std::string json(reinterpret_cast<char*>(data + off), jlen); off += jlen;
+          jsi::Object row(rt);
+          row.setProperty(rt, "key", jsi::String::createFromUtf8(rt, key));
+          row.setProperty(rt, "fields", jsonParse.call(rt, jsi::String::createFromUtf8(rt, json)));
+          out.setValueAtIndex(rt, i, row);
+        }
+        engine_free_bytes(data, len);
+        return out;
+      });
+
+  jsi::Object ns(rt);
+  ns.setProperty(rt, "queryEntriesBuffer", queryBuffer);
+  ns.setProperty(rt, "queryEntriesObjects", queryObjects);
+  rt.global().setProperty(rt, "__reconcileEngine", ns);
+  return true;
+}
+
+} // namespace facebook::react
