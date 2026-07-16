@@ -3,3 +3,4 @@ pub mod store;
 pub mod commands;
 pub mod glob;
 pub mod normalize;
+pub mod reconcile;

@@ -99,6 +99,27 @@ pub fn hget(store: &Store, key: &str, field: &str, now_ms: i64) -> Result<Option
 }
 
 pub fn hgetall(store: &Store, key: &str, now_ms: i64) -> Result<BTreeMap<String, String>, EngineError> {
+    if let Some(rest) = key.strip_prefix("entry:") {
+        if let Some((collection, natural_key)) = rest.split_once(':') {
+            let row: Option<(String, i64)> = store
+                .conn
+                .query_row(
+                    "SELECT fields, updated_at FROM entries WHERE collection = ?1 AND natural_key = ?2",
+                    params![collection, natural_key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            return Ok(match row {
+                None => BTreeMap::new(),
+                Some((fields_json, updated_at)) => {
+                    let mut m: BTreeMap<String, String> = serde_json::from_str(&fields_json)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    m.insert("_updated_at".into(), updated_at.to_string());
+                    m
+                }
+            });
+        }
+    }
     if purge_if_expired(store, key, now_ms)? {
         return Ok(BTreeMap::new());
     }
@@ -123,9 +144,18 @@ pub fn scan(store: &Store, pattern: &str, now_ms: i64) -> Result<Vec<String>, En
     for row in rows {
         keys.push(row?);
     }
+    let mut stmt2 = store
+        .conn
+        .prepare("SELECT collection, natural_key FROM entries")?;
+    let rows2 = stmt2.query_map([], |r| {
+        Ok(format!("entry:{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows2 {
+        keys.push(row?);
+    }
     let mut out = Vec::new();
     for k in keys {
-        if glob_match(pattern, &k) && !purge_if_expired(store, &k, now_ms)? {
+        if glob_match(pattern, &k) && (k.starts_with("entry:") || !purge_if_expired(store, &k, now_ms)?) {
             out.push(k);
         }
     }
