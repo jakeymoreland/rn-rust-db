@@ -50,6 +50,14 @@ impl Store {
         if path != ":memory:" {
             let _mode: String =
                 conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+            // WAL + NORMAL is the standard mobile setting: commits skip the
+            // per-transaction fsync (the WAL is synced at checkpoints), which
+            // is durable against app crashes; only power loss can drop the
+            // most recent commits, never corrupt the DB.
+            conn.execute_batch(
+                "PRAGMA synchronous = NORMAL;
+                 PRAGMA temp_store = MEMORY;",
+            )?;
         }
         conn.execute_batch(SCHEMA_V1)?;
         Ok(Store { conn })

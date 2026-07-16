@@ -21,11 +21,8 @@ fn check_writable(key: &str) -> Result<(), EngineError> {
 fn purge_if_expired(store: &Store, key: &str, now_ms: i64) -> Result<bool, EngineError> {
     let expires: Option<i64> = store
         .conn
-        .query_row(
-            "SELECT expires_at FROM key_ttl WHERE key = ?1",
-            params![key],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT expires_at FROM key_ttl WHERE key = ?1")?
+        .query_row(params![key], |r| r.get(0))
         .ok();
     if let Some(at) = expires {
         if now_ms >= at {
@@ -44,19 +41,25 @@ pub fn get(store: &Store, key: &str, now_ms: i64) -> Result<Option<String>, Engi
     }
     Ok(store
         .conn
-        .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| r.get(0))
+        .prepare_cached("SELECT value FROM kv WHERE key = ?1")?
+        .query_row(params![key], |r| r.get(0))
         .ok())
 }
 
 pub fn set(store: &Store, key: &str, value: &str) -> Result<(), EngineError> {
     check_writable(key)?;
-    store.conn.execute(
-        "INSERT INTO kv(key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )?;
+    store
+        .conn
+        .prepare_cached(
+            "INSERT INTO kv(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )?
+        .execute(params![key, value])?;
     // Redis SET semantics: overwriting a key clears any existing TTL.
-    store.conn.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
+    store
+        .conn
+        .prepare_cached("DELETE FROM key_ttl WHERE key = ?1")?
+        .execute(params![key])?;
     Ok(())
 }
 
@@ -90,11 +93,8 @@ pub fn hget(store: &Store, key: &str, field: &str, now_ms: i64) -> Result<Option
     }
     Ok(store
         .conn
-        .query_row(
-            "SELECT value FROM hash WHERE key = ?1 AND field = ?2",
-            params![key, field],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT value FROM hash WHERE key = ?1 AND field = ?2")?
+        .query_row(params![key, field], |r| r.get(0))
         .ok())
 }
 
@@ -103,11 +103,10 @@ pub fn hgetall(store: &Store, key: &str, now_ms: i64) -> Result<BTreeMap<String,
         if let Some((collection, natural_key)) = rest.split_once(':') {
             let row: Option<(String, i64)> = store
                 .conn
-                .query_row(
+                .prepare_cached(
                     "SELECT fields, updated_at FROM entries WHERE collection = ?1 AND natural_key = ?2",
-                    params![collection, natural_key],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+                )?
+                .query_row(params![collection, natural_key], |r| Ok((r.get(0)?, r.get(1)?)))
                 .ok();
             return Ok(match row {
                 None => BTreeMap::new(),
@@ -125,7 +124,7 @@ pub fn hgetall(store: &Store, key: &str, now_ms: i64) -> Result<BTreeMap<String,
     }
     let mut stmt = store
         .conn
-        .prepare("SELECT field, value FROM hash WHERE key = ?1")?;
+        .prepare_cached("SELECT field, value FROM hash WHERE key = ?1")?;
     let rows = stmt.query_map(params![key], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     let mut out = BTreeMap::new();
     for row in rows {

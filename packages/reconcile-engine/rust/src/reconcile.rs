@@ -37,13 +37,26 @@ pub fn reconcile(
     };
     let mut changed_collections: Vec<String> = vec![];
 
+    // Prepared once per batch (and cached on the connection across batches);
+    // re-preparing these inside the per-record loop dominated bulk-ingest time.
+    {
+    let mut sel_stmt = tx.prepare_cached(
+        "SELECT fields, field_meta, updated_at FROM entries WHERE collection = ?1 AND natural_key = ?2",
+    )?;
+    let mut ins_stmt = tx.prepare_cached(
+        "INSERT INTO entries(collection, natural_key, fields, field_meta, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut upd_stmt = tx.prepare_cached(
+        "UPDATE entries SET fields = ?3, field_meta = ?4, updated_at = ?5
+         WHERE collection = ?1 AND natural_key = ?2",
+    )?;
+
     for rec in outcome.records {
-        let existing: Option<(String, String, i64)> = tx
-            .query_row(
-                "SELECT fields, field_meta, updated_at FROM entries WHERE collection = ?1 AND natural_key = ?2",
-                params![rec.collection, rec.natural_key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+        let existing: Option<(String, String, i64)> = sel_stmt
+            .query_row(params![rec.collection, rec.natural_key], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .ok();
 
         match existing {
@@ -62,17 +75,13 @@ pub fn reconcile(
                         )
                     })
                     .collect();
-                tx.execute(
-                    "INSERT INTO entries(collection, natural_key, fields, field_meta, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        rec.collection,
-                        rec.natural_key,
-                        serde_json::to_string(&rec.fields).unwrap(),
-                        serde_json::to_string(&meta).unwrap(),
-                        rec.updated_at
-                    ],
-                )?;
+                ins_stmt.execute(params![
+                    rec.collection,
+                    rec.natural_key,
+                    serde_json::to_string(&rec.fields).unwrap(),
+                    serde_json::to_string(&meta).unwrap(),
+                    rec.updated_at
+                ])?;
                 summary.inserted += 1;
                 changed_collections.push(rec.collection.clone());
             }
@@ -117,17 +126,13 @@ pub fn reconcile(
                     // Row-level updated_at must never move backward: a batch that only adds
                     // an older/new field to an already-newer row must not regress the row stamp.
                     let new_updated_at = existing_updated_at.max(rec.updated_at);
-                    tx.execute(
-                        "UPDATE entries SET fields = ?3, field_meta = ?4, updated_at = ?5
-                         WHERE collection = ?1 AND natural_key = ?2",
-                        params![
-                            rec.collection,
-                            rec.natural_key,
-                            serde_json::to_string(&fields).unwrap(),
-                            serde_json::to_string(&meta).unwrap(),
-                            new_updated_at
-                        ],
-                    )?;
+                    upd_stmt.execute(params![
+                        rec.collection,
+                        rec.natural_key,
+                        serde_json::to_string(&fields).unwrap(),
+                        serde_json::to_string(&meta).unwrap(),
+                        new_updated_at
+                    ])?;
                     if dirty {
                         summary.updated += 1;
                         changed_collections.push(rec.collection.clone());
@@ -142,6 +147,8 @@ pub fn reconcile(
             }
         }
     }
+
+    } // statements drop here so tx can commit
 
     for (fragment, error) in outcome.rejects {
         tx.execute(
