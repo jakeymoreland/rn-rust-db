@@ -13,6 +13,7 @@
 | Database | Rust owns SQLite via rusqlite (WAL mode); JS talks only to the engine API |
 | Sandbox app | Expo + expo-dev-client |
 | Domain | Generic "entries" (id, source, natural key, typed fields, timestamps); device-data specifics intentionally out of scope |
+| Public JS API | Redis-esque command surface (see below); reconcile remains the engine's core job |
 
 ## Ecosystem context
 
@@ -39,20 +40,31 @@ rn/
 - Sandbox mocks three sources: fake REST API (JSON), CSV file import, timer-driven "device" source.
 - Reconciler: per-field merge policy (source priority + last-writer-wins), dedupe on natural key, one SQLite transaction per batch.
 
+## Public API: Redis-esque commands
+
+The engine's JS surface is a familiar Redis-style command set rather than a bespoke ORM. Records are hashes; collections are keyspaces; change events are pub/sub.
+
+- **Keyspace layout:** `entry:{collection}:{id}` (record hash), `idx:{collection}` (sorted id set), `meta:{source}` (cursor/etag hash).
+- **Reads:** `get`, `hget`, `hgetall`, `scan(pattern)`, `mget`.
+- **Writes:** `set`, `hset`, `del` — for JS-side/local data. Reconciled data is written only by `ingest`; direct writes to `entry:*` keys owned by the reconciler are rejected.
+- **Pub/sub:** `subscribe(channel)` / `psubscribe(pattern)`; the reconciler publishes to `changes:{collection}` after each commit batch. This IS the change-event system.
+- **TTL:** `expire`/`ttl` on cache keys (e.g. memoized derived values, raw payload caches). Reconciled entries are durable and never expire.
+- **Ingest (the non-Redis part):** `ingest(sourceId, payload)` / `ingestFile(sourceId, path)` — the reconcile pipeline, async, returns a batch summary.
+
 ## Data flow
 
 `JS fetch/file-pick → engine.ingest(sourceId, payload) → parse+reconcile+commit on Rust thread → change event (uniffi callback → JS emitter) → hooks re-query → UI`
 
 - Network stays in JS (auth/retries live there in the real app); JS passes raw strings/bytes.
 - Files are passed by path; Rust reads and parses off the JS thread.
-- Async engine calls surface as JS promises. Change events carry affected collection names.
+- Async engine calls surface as JS promises. Change events are pub/sub messages on `changes:{collection}` channels.
 - Queries run two ways for comparison: uniffi typed records vs C++ JSI ArrayBuffer fast-path.
 
 ## Caching
 
 1. **Source cursors (Rust):** `sync_meta` table with per-source etags/cursors/timestamps; ingest is incremental and idempotent (content-hash dedupe).
 2. **Engine:** no result cache initially — SQLite/WAL is the cache; add a Rust LRU only if measurements justify it.
-3. **JS:** hooks re-fetch only when a change event names their collection (event-driven invalidation).
+3. **JS:** hooks re-fetch only when a pub/sub message arrives on their collection's channel (event-driven invalidation). TTL keys handle expiring derived/cache values in the engine itself.
 
 ## Assessment matrix (primary deliverable)
 
