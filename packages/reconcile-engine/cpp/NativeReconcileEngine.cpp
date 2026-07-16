@@ -175,6 +175,40 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         return abObj;
       });
 
+  auto querySchemaBuffer = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "queryEntriesSchemaBuffer"),
+      2,
+      [weak](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        auto strong = weak.lock();
+        if (!strong) {
+          throw jsi::JSError(rt, "reconcile engine module destroyed");
+        }
+        if (count < 2 || !args[0].isString() || !args[1].isString()) {
+          throw jsi::JSError(rt, "queryEntriesSchemaBuffer(collection: string, fieldsCsv: string)");
+        }
+        std::string collection = args[0].asString(rt).utf8(rt);
+        std::string fieldsCsv = args[1].asString(rt).utf8(rt);
+        size_t len = 0;
+        unsigned char* data = nullptr;
+        {
+          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          if (strong->engine_ == nullptr) {
+            throw jsi::JSError(rt, "engine not open");
+          }
+          data = engine_query_entries_schema_bin(strong->engine_, collection.c_str(), fieldsCsv.c_str(), &len);
+        }
+        if (data == nullptr) {
+          throw jsi::JSError(rt, "queryEntriesSchemaBuffer failed: " + takeRustString(engine_last_error()));
+        }
+        RustBufferGuard guard{data, len};
+        jsi::Function ctor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
+        jsi::Object abObj = ctor.callAsConstructor(rt, static_cast<int>(len)).getObject(rt);
+        jsi::ArrayBuffer ab = abObj.getArrayBuffer(rt);
+        std::memcpy(ab.data(rt), data, len);
+        return abObj;
+      });
+
   auto queryObjects = jsi::Function::createFromHostFunction(
       rt,
       jsi::PropNameID::forAscii(rt, "queryEntriesObjects"),
@@ -245,6 +279,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
 
   jsi::Object ns(rt);
   ns.setProperty(rt, "queryEntriesBuffer", queryBuffer);
+  ns.setProperty(rt, "queryEntriesSchemaBuffer", querySchemaBuffer);
   ns.setProperty(rt, "queryEntriesObjects", queryObjects);
   rt.global().setProperty(rt, "__reconcileEngine", ns);
   return true;

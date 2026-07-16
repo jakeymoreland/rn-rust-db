@@ -2,6 +2,7 @@ import { ingest } from '@rn-experiments/reconcile-engine';
 
 export type FastPath = {
   queryEntriesBuffer(collection: string): ArrayBuffer;
+  queryEntriesSchemaBuffer(collection: string, fieldsCsv: string): ArrayBuffer;
   queryEntriesObjects(collection: string): Array<{ key: string; fields: Record<string, string> }>;
 };
 

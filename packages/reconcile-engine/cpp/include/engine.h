@@ -28,6 +28,14 @@ char* engine_execute(engine_handle_t engine, const char* request_json);
 unsigned char* engine_query_entries_bin(engine_handle_t engine, const char* collection, size_t* out_len);
 
 /*
+ * Schema-packed binary rows: LE [u32 nFields]([u32 len][name])* [u32 count]
+ * then per row [u32 klen][key] and one [u32 vlen][value] per field in table
+ * order (vlen = 0xFFFFFFFF marks a missing/null field). fields_csv is a
+ * comma-separated field list. Free with engine_free_bytes.
+ */
+unsigned char* engine_query_entries_schema_bin(engine_handle_t engine, const char* collection, const char* fields_csv, size_t* out_len);
+
+/*
  * Registers cb to be invoked once per matching pubsub event. cb fires
  * SYNCHRONOUSLY, on whatever thread triggered the event, while the engine's
  * internal mutex is held for that call. The mutex is NOT reentrant: calling

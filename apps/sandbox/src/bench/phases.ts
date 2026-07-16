@@ -23,10 +23,10 @@ import {
   startFrameMonitor,
   time,
 } from './harness';
-import { REALISTIC_SIZES, realisticRows, toyRows } from './data';
+import { REALISTIC_FIELDS_CSV, REALISTIC_SIZES, realisticRows, toyRows } from './data';
 import { type BenchMetrics, score } from './score';
 import type { RunOutput } from './markdown';
-import { decodeEntriesBuffer, type Row } from './decode';
+import { decodeEntriesBuffer, decodeSchemaBuffer, type Row } from './decode';
 import { setListVisible, waitForListDriver } from './listBridge';
 
 export type { BenchResult };
@@ -144,6 +144,13 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
       const buffer = await push(
         time(`realistic query ${n} rows: ArrayBuffer`, iters, () => {
           new Uint8Array(fastPath().queryEntriesBuffer('bench_real'));
+        }),
+      );
+      // schema path decodes all the way to JS objects (the JSON.parse-free
+      // alternative to the JSI-objects path), so it is measured end-to-end.
+      await push(
+        time(`realistic query ${n} rows: schema buffer -> objects`, iters, () => {
+          decodeSchemaBuffer(fastPath().queryEntriesSchemaBuffer('bench_real', REALISTIC_FIELDS_CSV));
         }),
       );
       if (n === 10000) metrics.interopObjectsVsBufferRatio = objects.perOpMs / buffer.perOpMs;
@@ -393,7 +400,7 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
       // B: boundary shootout — which read path should back a real list.
       // scan+hgetall is the naive async-JSON path a first-pass app would write;
       // it is capped at 100 rows (a visible page) and excluded from scoring.
-      onProgress('LegendList boundary shootout (buffer+decode vs JSI objects vs scan+hgetall)...');
+      onProgress('LegendList boundary shootout (buffer+decode vs schema-buffer vs JSI objects vs scan+hgetall)...');
       {
         const strategies: Array<{
           name: string;
@@ -404,6 +411,11 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
             name: 'buffer+decode (10k rows)',
             scored: true,
             fetch: () => decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')),
+          },
+          {
+            name: 'schema-buffer+decode (10k rows)',
+            scored: true,
+            fetch: () => decodeSchemaBuffer(fastPath().queryEntriesSchemaBuffer('bench_list', REALISTIC_FIELDS_CSV)),
           },
           {
             name: 'jsi-objects (10k rows)',

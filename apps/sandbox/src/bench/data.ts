@@ -72,3 +72,13 @@ export function realisticRows(n: number, salt = 0, rev = 0): string {
 // If 100k realistic rows (~75 MB JSON) proves too slow / OOMs on the Android
 // emulator, drop this to [1000, 10000, 50000] and note it in BENCHMARKS.md.
 export const REALISTIC_SIZES = [1000, 10000, 100000];
+
+// Field list for the schema-packed query path, matching realisticRows.
+export const REALISTIC_FIELDS = [
+  'id', 'uuid', 'first_name', 'last_name', 'email', 'phone',
+  'address_line1', 'address_city', 'address_state', 'address_postcode',
+  'billing_city', 'billing_postcode', 'company', 'job_title', 'status',
+  'is_active', 'email_verified', 'balance', 'lifetime_value', 'currency',
+  'created_at', 'updated_at', 'notes',
+] as const;
+export const REALISTIC_FIELDS_CSV = REALISTIC_FIELDS.join(',');

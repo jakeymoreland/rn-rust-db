@@ -134,6 +134,54 @@ pub extern "C" fn engine_query_entries_bin(
 }
 
 #[no_mangle]
+pub extern "C" fn engine_query_entries_schema_bin(
+    handle: *mut c_void,
+    collection: *const c_char,
+    fields_csv: *const c_char,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if handle.is_null() || out_len.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ffi = unsafe { &*(handle as *mut EngineFfi) };
+    let Some(collection) = (unsafe { cstr(collection) }) else {
+        return std::ptr::null_mut();
+    };
+    let Some(fields_csv) = (unsafe { cstr(fields_csv) }) else {
+        return std::ptr::null_mut();
+    };
+    let fields: Vec<&str> = fields_csv.split(',').map(str::trim).filter(|f| !f.is_empty()).collect();
+    if fields.is_empty() {
+        set_last_error(4, "no fields given");
+        return std::ptr::null_mut();
+    }
+    let engine = ffi.inner.lock().unwrap();
+    let mut rows: Vec<(String, String)> = vec![];
+    let result = (|| -> Result<(), rusqlite::Error> {
+        let mut stmt = engine
+            .store
+            .conn
+            .prepare("SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key")?;
+        let iter = stmt.query_map(params![collection], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in iter {
+            rows.push(row?);
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        set_last_error(2, &e.to_string());
+        return std::ptr::null_mut();
+    }
+    let buf = crate::binenc::encode_entries_schema(&rows, &fields);
+    let len = buf.len();
+    let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
+    unsafe { *out_len = len };
+    ptr
+}
+
+#[no_mangle]
 pub extern "C" fn engine_set_event_callback(
     handle: *mut c_void,
     ctx: *mut c_void,
@@ -340,6 +388,36 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts(p, len) }.to_vec();
         engine_free_bytes(p, len);
         assert_eq!(&bytes[0..4], &1u32.to_le_bytes());
+        engine_close(h);
+    }
+
+    #[test]
+    fn query_entries_schema_bin_roundtrip() {
+        let path = CString::new(":memory:").unwrap();
+        let h = engine_open(path.as_ptr());
+        for req in [
+            r#"{"cmd":"registerSource","args":["{\"source_id\":\"api\",\"format\":\"Json\",\"collection\":\"people\",\"natural_key_field\":\"email\",\"timestamp_field\":null,\"priority\":10}"]}"#,
+            r#"{"cmd":"ingest","args":["api","[{\"email\":\"a@x.com\",\"name\":\"Ann\"}]"]}"#,
+        ] {
+            let c = CString::new(req).unwrap();
+            let r = engine_execute(h, c.as_ptr());
+            engine_free_string(r);
+        }
+        let col = CString::new("people").unwrap();
+        let fields = CString::new("name,missing_field").unwrap();
+        let mut len: usize = 0;
+        let p = engine_query_entries_schema_bin(h, col.as_ptr(), fields.as_ptr(), &mut len);
+        assert!(!p.is_null());
+        let bytes = unsafe { std::slice::from_raw_parts(p, len) }.to_vec();
+        engine_free_bytes(p, len);
+        // field table: 2 fields, first is "name"
+        assert_eq!(&bytes[0..4], &2u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &4u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], b"name");
+        // empty fields csv errors
+        let empty = CString::new("").unwrap();
+        let p2 = engine_query_entries_schema_bin(h, col.as_ptr(), empty.as_ptr(), &mut len);
+        assert!(p2.is_null());
         engine_close(h);
     }
 }

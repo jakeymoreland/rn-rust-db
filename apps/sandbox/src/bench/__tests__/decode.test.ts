@@ -39,3 +39,65 @@ it('throws on truncated buffer', () => {
   const buf = encode([{ key: 'k', fields: {} }]).slice(0, 6);
   expect(() => decodeEntriesBuffer(buf)).toThrow();
 });
+
+describe('decodeSchemaBuffer', () => {
+  const MISSING = 0xffffffff;
+
+  function encodeSchema(fields: string[], rows: Array<{ key: string; values: Array<string | null> }>): ArrayBuffer {
+    const te = new TextEncoder();
+    const chunks: Array<Uint8Array | number> = []; // number = u32
+    chunks.push(fields.length);
+    for (const f of fields) {
+      const b = te.encode(f);
+      chunks.push(b.length, b);
+    }
+    chunks.push(rows.length);
+    for (const r of rows) {
+      const k = te.encode(r.key);
+      chunks.push(k.length, k);
+      for (const v of r.values) {
+        if (v === null) chunks.push(MISSING);
+        else {
+          const b = te.encode(v);
+          chunks.push(b.length, b);
+        }
+      }
+    }
+    const len = chunks.reduce<number>((s, c) => s + (typeof c === 'number' ? 4 : c.length), 0);
+    const buf = new ArrayBuffer(len);
+    const dv = new DataView(buf);
+    const u8 = new Uint8Array(buf);
+    let off = 0;
+    for (const c of chunks) {
+      if (typeof c === 'number') {
+        dv.setUint32(off, c, true);
+        off += 4;
+      } else {
+        u8.set(c, off);
+        off += c.length;
+      }
+    }
+    return buf;
+  }
+
+  it('round-trips schema rows into keyed objects', () => {
+    const { decodeSchemaBuffer } = require('../decode');
+    const buf = encodeSchema(
+      ['name', 'city'],
+      [
+        { key: 'entry:c:1', values: ['Ann', 'Sydney'] },
+        { key: 'entry:c:2', values: ['Bób', null] },
+      ],
+    );
+    expect(decodeSchemaBuffer(buf)).toEqual([
+      { key: 'entry:c:1', fields: { name: 'Ann', city: 'Sydney' } },
+      { key: 'entry:c:2', fields: { name: 'Bób' } },
+    ]);
+  });
+
+  it('throws on truncated schema buffer', () => {
+    const { decodeSchemaBuffer } = require('../decode');
+    const buf = encodeSchema(['a'], [{ key: 'k', values: ['v'] }]).slice(0, 10);
+    expect(() => decodeSchemaBuffer(buf)).toThrow();
+  });
+});
