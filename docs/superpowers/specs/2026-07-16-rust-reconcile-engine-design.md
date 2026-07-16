@@ -9,7 +9,7 @@
 | Decision | Choice |
 |---|---|
 | Native core | Rust, exposed as a Turbo Module |
-| Bridge | uniffi-bindgen-react-native (generated Turbo Module), plus one hand-rolled C++ JSI ArrayBuffer fast-path as a marshaling benchmark |
+| Bridge | Fully hand-rolled: C++ Turbo Module (JSI) over a Rust C ABI via cbindgen. No bridging-framework dependencies ("raw" — decided 2026-07-16, supersedes the earlier uniffi hybrid). Only non-stdlib native dep is rusqlite with bundled SQLite. |
 | Database | Rust owns SQLite via rusqlite (WAL mode); JS talks only to the engine API |
 | Sandbox app | Expo + expo-dev-client |
 | Domain | Generic "entries" (id, source, natural key, typed fields, timestamps); device-data specifics intentionally out of scope |
@@ -17,7 +17,7 @@
 
 ## Ecosystem context
 
-No existing OSS library does multi-source normalize-and-merge into a local store. PowerSync and Turso embedded replicas solve single-backend sync; op-sqlite / nitro-sqlite / expo-sqlite are JS-owns-DB designs. uniffi-bindgen-react-native (v0.31.x, actively maintained, WASM output emerging) generates the full Turbo Module — C++ JSI glue, TS types, build wiring — from `#[uniffi::export]` Rust. Their patterns (WAL, change streams, write queues) inform the engine; none are dependencies.
+No existing OSS library does multi-source normalize-and-merge into a local store. PowerSync and Turso embedded replicas solve single-backend sync; op-sqlite / nitro-sqlite / expo-sqlite are JS-owns-DB designs. uniffi-bindgen-react-native (v0.31.x) can generate Turbo Modules from Rust, but we deliberately hand-roll the bridge — the raw JSI/codegen machinery is the thing being assessed, and zero bridging deps is part of the OSS pitch. Its generated glue remains a useful reference. Patterns from PowerSync/Turso (WAL, change streams, write queues) inform the engine; none are dependencies.
 
 ## Architecture
 
@@ -30,9 +30,9 @@ rn/
 │   │       ├── normalize.rs       # parsers → canonical records
 │   │       ├── reconcile.rs       # merge policies, conflict resolution
 │   │       ├── store.rs           # rusqlite (WAL), migrations
-│   │       └── api.rs             # #[uniffi::export] surface
-│   ├── cpp/fastpath/              # hand-rolled JSI ArrayBuffer query path
-│   └── src/                       # generated TS bindings + thin public API
+│   │       └── ffi.rs             # extern "C" ABI surface (cbindgen → header)
+│   ├── cpp/                       # hand-rolled C++ Turbo Module + JSI (incl. ArrayBuffer fast path)
+│   └── src/                       # TS Turbo Module spec (codegen) + thin public API
 └── apps/sandbox/                  # Expo + dev-client app
 ```
 
@@ -53,12 +53,12 @@ The engine's JS surface is a familiar Redis-style command set rather than a besp
 
 ## Data flow
 
-`JS fetch/file-pick → engine.ingest(sourceId, payload) → parse+reconcile+commit on Rust thread → change event (uniffi callback → JS emitter) → hooks re-query → UI`
+`JS fetch/file-pick → engine.ingest(sourceId, payload) → parse+reconcile+commit on Rust thread → change event (C callback → JSI call invoker → JS emitter) → hooks re-query → UI`
 
 - Network stays in JS (auth/retries live there in the real app); JS passes raw strings/bytes.
 - Files are passed by path; Rust reads and parses off the JS thread.
 - Async engine calls surface as JS promises. Change events are pub/sub messages on `changes:{collection}` channels.
-- Queries run two ways for comparison: uniffi typed records vs C++ JSI ArrayBuffer fast-path.
+- Queries run three ways for comparison: typed JSI objects vs JSON string vs ArrayBuffer fast-path — all hand-rolled, benchmarked against each other.
 
 ## Caching
 
@@ -71,7 +71,7 @@ The engine's JS surface is a familiar Redis-style command set rather than a besp
 An Experiments screen in the sandbox runs these and records results to `BENCHMARKS.md`:
 
 1. Call overhead — sync vs async JS→Rust round-trip
-2. Marshaling — uniffi records vs JSON string vs ArrayBuffer at 1k/10k/100k rows
+2. Marshaling — typed JSI objects vs JSON string vs ArrayBuffer at 1k/10k/100k rows (all three paths hand-rolled)
 3. Ingest under load — UI frame rate during 100k-row CSV parse/reconcile
 4. Change-event latency — commit → hook update
 5. Cold start — engine init + migrations
@@ -79,7 +79,7 @@ An Experiments screen in the sandbox runs these and records results to `BENCHMAR
 
 ## Error handling
 
-- uniffi error enum (`ParseError`, `StorageError`, `SourceError`) → typed JS exceptions.
+- Rust error enum (`ParseError`, `StorageError`, `SourceError`) crosses the C ABI as (code, message) pairs and is re-thrown as typed JS errors in the C++ layer.
 - Bad records within a batch are quarantined to a `dead_letter` table; the batch still commits.
 
 ## Testing
