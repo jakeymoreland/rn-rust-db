@@ -10,3 +10,5 @@ dist/
 *.xcframework
 jniLibs/
 .superpowers/
+packages/reconcile-engine/ios-rust/
+packages/reconcile-engine/android-rust/
