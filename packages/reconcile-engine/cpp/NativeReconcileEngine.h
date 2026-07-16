@@ -14,6 +14,18 @@
 
 namespace facebook::react {
 
+// Concrete instantiation of the codegen'd event payload struct
+// (`onChange: EventEmitter<ChangeEvent>` in the TS spec), plus the Bridging
+// specialization codegen expects the implementer to provide. The generated
+// emitOnChange is a template over the payload type, so callers must pass a
+// concrete struct — a braced initializer list does not deduce.
+using ReconcileChangeEvent =
+    NativeReconcileEngineChangeEvent<std::string, std::string>;
+
+template <>
+struct Bridging<ReconcileChangeEvent>
+    : NativeReconcileEngineChangeEventBridging<ReconcileChangeEvent> {};
+
 class NativeReconcileEngine
     : public NativeReconcileEngineCxxSpec<NativeReconcileEngine>,
       public std::enable_shared_from_this<NativeReconcileEngine> {

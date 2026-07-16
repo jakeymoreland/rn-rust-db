@@ -92,7 +92,7 @@ void NativeReconcileEngine::eventTrampoline(void* ctx, const char* channel, cons
   auto weak = self->weak_from_this();
   self->jsInvoker_->invokeAsync([weak, ch, pl]() {
     if (auto strong = weak.lock()) {
-      strong->emitOnChange({ch, pl});
+      strong->emitOnChange(ReconcileChangeEvent{ch, pl});
     }
   });
 }
