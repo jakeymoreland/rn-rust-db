@@ -25,6 +25,6 @@ describe('renderIndustry', () => {
     expect(out).toContain('JSI bridge');
     expect(out).toContain('✓ within');
     expect(out).toContain('✗ slower');
-    expect(out).toContain('pure in-process hashmap');
+    expect(out).toContain('memory-first with SQLite write-behind');
   });
 });
