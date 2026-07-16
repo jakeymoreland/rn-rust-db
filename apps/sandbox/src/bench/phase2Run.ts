@@ -37,11 +37,11 @@ export async function runPhase2(onProgress: (msg: string) => void): Promise<Phas
   const results: Phase2Result[] = [];
   const fp = fastPath();
 
-  const measure = async (name: string, fn: () => Promise<{ maxGap?: number; note?: string }>) => {
+  const measure = async (name: string, fn: () => Promise<{ maxGap?: number; note?: string; totalMsOverride?: number }>) => {
     const a0 = allocatedBytes();
     const t0 = performance.now();
-    const { maxGap, note } = await fn();
-    const totalMs = performance.now() - t0;
+    const { maxGap, note, totalMsOverride } = await fn();
+    const totalMs = totalMsOverride ?? performance.now() - t0;
     const a1 = allocatedBytes();
     const r: Phase2Result = {
       name,
@@ -63,13 +63,14 @@ export async function runPhase2(onProgress: (msg: string) => void): Promise<Phas
     priority: 1,
   });
 
-  // 1. bulk insert scaling — payloads pre-built, gap-monitored
+  // 1. bulk insert scaling — BOTH payloads pre-built outside the timed block
   for (const [i, n] of [100, 1000, 5000].entries()) {
-    onProgress(`building ${n}-row payload...`);
-    const payload = realisticRows(n, 950 + i);
+    onProgress(`building ${n}-row payloads...`);
+    const insertPayload = realisticRows(n, 950 + i);
+    const updatePayload = realisticRows(n, 950 + i, 1);
     await measure(`bulk ingest ${n} rows`, async () => {
-      const { ingestMs, maxGap } = await ingestWithGapMonitor('phase2', payload);
-      const summary = await ingest('phase2', realisticRows(n, 950 + i, 1)); // update wave, for timings
+      const { ingestMs, maxGap } = await ingestWithGapMonitor('phase2', insertPayload);
+      const summary = await ingest('phase2', updatePayload);
       return {
         maxGap,
         note: `insert ${ingestMs.toFixed(1)} ms; update wave: ${fmtTimings(summary.timings)}`,
@@ -94,14 +95,23 @@ export async function runPhase2(onProgress: (msg: string) => void): Promise<Phas
   for (const hw of [64, 256, 512, 1024]) {
     kvCmd('kvConfig', [String(hw), '1']);
     await measure(`2048 sets @ high-water ${hw}`, async () => {
+      // chunks timed individually and summed: the yields between them exist
+      // for the timer monitor, and setTimeout(0) waits must not count as work
       let maxChunk = 0;
+      let workMs = 0;
       for (let c = 0; c < 2048 / 128; c++) {
         const t0 = performance.now();
         for (let i = 0; i < 128; i++) fp.kvSet(`p2:hw${hw}:${c * 128 + i}`, 'v');
-        maxChunk = Math.max(maxChunk, performance.now() - t0);
+        const dt = performance.now() - t0;
+        workMs += dt;
+        maxChunk = Math.max(maxChunk, dt);
         await sleep(0);
       }
-      return { maxGap: maxChunk, note: `worst 128-set chunk ${maxChunk.toFixed(2)} ms (includes ~${Math.ceil(128 / hw) > 1 ? 'multiple flushes' : 'at most one flush'})` };
+      return {
+        maxGap: maxChunk,
+        totalMsOverride: workMs,
+        note: `worst 128-set chunk ${maxChunk.toFixed(2)} ms (flush spike); ${((workMs / 2048) * 1000).toFixed(2)} µs/op`,
+      };
     });
   }
 
@@ -118,13 +128,18 @@ export async function runPhase2(onProgress: (msg: string) => void): Promise<Phas
   }
   kvCmd('kvConfig', ['256', '1']); // restore defaults
 
-  // 4. ~1MB ingest with the native timing breakdown
-  onProgress('building 1 MB payload...');
-  const mb = realisticRows(1300, 960, Math.floor(performance.now()) % 100000);
+  // 4. ~1MB ingest with the native timing breakdown — payloads pre-built
+  onProgress('building 1 MB payloads...');
+  const base = Math.floor(performance.now()) % 100000;
+  const mbInsert = realisticRows(1300, 960, base);
+  const mbUpdate = realisticRows(1300, 960, base + 1);
   await measure('~1 MB ingest (with breakdown)', async () => {
-    const { maxGap } = await ingestWithGapMonitor('phase2', mb);
-    const summary = await ingest('phase2', realisticRows(1300, 960, (Math.floor(performance.now()) % 100000) + 1));
-    return { maxGap, note: fmtTimings(summary.timings) };
+    const { ingestMs, maxGap } = await ingestWithGapMonitor('phase2', mbInsert);
+    const summary = await ingest('phase2', mbUpdate);
+    return {
+      maxGap,
+      note: `first ingest ${ingestMs.toFixed(1)} ms; update wave: ${fmtTimings(summary.timings)}; JS gap = boundary string conversion`,
+    };
   });
 
   return results;
