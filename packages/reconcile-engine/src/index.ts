@@ -9,6 +9,14 @@ export type SourceConfig = {
   priority: number;
 };
 
+export type IngestTimings = {
+  parse_ms: number;
+  prefetch_ms: number;
+  merge_ms: number;
+  write_ms: number;
+  commit_ms: number;
+};
+
 export type BatchSummary = {
   inserted: number;
   updated: number;
@@ -16,6 +24,7 @@ export type BatchSummary = {
   dead_lettered: number;
   collections: string[];
   skipped?: boolean;
+  timings?: IngestTimings;
 };
 
 export class EngineError extends Error {

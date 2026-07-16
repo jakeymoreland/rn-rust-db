@@ -5,6 +5,15 @@ use rusqlite::params;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 
+#[derive(Debug, Serialize, PartialEq, Clone, Copy)]
+pub struct IngestTimings {
+    pub parse_ms: f64,
+    pub prefetch_ms: f64,
+    pub merge_ms: f64,
+    pub write_ms: f64,
+    pub commit_ms: f64,
+}
+
 #[derive(Debug, Serialize, PartialEq)]
 pub struct BatchSummary {
     pub inserted: u32,
@@ -12,6 +21,8 @@ pub struct BatchSummary {
     pub unchanged: u32,
     pub dead_lettered: u32,
     pub collections: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<IngestTimings>,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone)]
@@ -267,7 +278,10 @@ pub fn reconcile(
         unchanged: 0,
         dead_lettered: 0,
         collections: vec![],
+        timings: None,
     };
+    let mut timings = IngestTimings { parse_ms: 0.0, prefetch_ms: 0.0, merge_ms: 0.0, write_ms: 0.0, commit_ms: 0.0 };
+    let t_prefetch = std::time::Instant::now();
     let mut changed_collections: Vec<String> = vec![];
 
     // Bulk-prefetch existing rows for the whole batch: one chunked
@@ -311,6 +325,9 @@ pub fn reconcile(
         }
     }
 
+    timings.prefetch_ms = t_prefetch.elapsed().as_secs_f64() * 1000.0;
+    let t_merge = std::time::Instant::now();
+
     // Group records by key (first-occurrence order, duplicates folded
     // sequentially inside their group), then merge groups in RAM — in
     // parallel for large batches, since each group owns its key exclusively
@@ -347,6 +364,9 @@ pub fn reconcile(
             .map(|g| merge_group(cfg, existing_map.get(&g.0).cloned(), g))
             .collect()
     };
+
+    timings.merge_ms = t_merge.elapsed().as_secs_f64() * 1000.0;
+    let t_write = std::time::Instant::now();
 
     // Sequential write pass: one prepared INSERT or UPDATE per group that
     // actually changed (a group merged N times still writes once).
@@ -397,7 +417,11 @@ pub fn reconcile(
         params![cfg.source_id, now_ms],
     )?;
 
+    timings.write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
+    let t_commit = std::time::Instant::now();
     tx.commit()?;
+    timings.commit_ms = t_commit.elapsed().as_secs_f64() * 1000.0;
+    summary.timings = Some(timings);
     changed_collections.sort();
     changed_collections.dedup();
     summary.collections = changed_collections;

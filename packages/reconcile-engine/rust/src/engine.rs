@@ -17,6 +17,12 @@ pub struct KvCache {
     /// expires_at for keys this session knows have TTLs (mirrors key_ttl).
     pub ttl: HashMap<String, i64>,
     pub pending: Vec<(String, String)>,
+    /// key -> slot in pending, for last-write-wins coalescing.
+    pub pending_index: HashMap<String, usize>,
+    /// pending size that triggers a synchronous flush (benchmark-tunable).
+    pub high_water: usize,
+    /// coalesce repeated sets of one key into a single pending slot.
+    pub coalesce: bool,
 }
 
 pub struct Engine {
@@ -34,7 +40,14 @@ impl Engine {
             sources: HashMap::new(),
             pubsub: PubSub::new(),
             clock,
-            kv: KvCache { map: HashMap::new(), ttl: HashMap::new(), pending: Vec::new() },
+            kv: KvCache {
+                map: HashMap::new(),
+                ttl: HashMap::new(),
+                pending: Vec::new(),
+                pending_index: HashMap::new(),
+                high_water: 256,
+                coalesce: true,
+            },
         })
     }
 
@@ -46,6 +59,7 @@ impl Engine {
             return Ok(());
         }
         let pending = std::mem::take(&mut self.kv.pending);
+        self.kv.pending_index.clear();
         let result = (|| -> Result<(), EngineError> {
             let tx = self.store.conn.transaction()?;
             {
@@ -67,6 +81,10 @@ impl Engine {
             let mut restored = pending;
             restored.extend(std::mem::take(&mut self.kv.pending));
             self.kv.pending = restored;
+            self.kv.pending_index.clear();
+            for (i, (k, _)) in self.kv.pending.iter().enumerate() {
+                self.kv.pending_index.insert(k.clone(), i);
+            }
         }
         result
     }
@@ -106,13 +124,20 @@ impl Engine {
                     unchanged: 0,
                     dead_lettered: 0,
                     collections: vec![],
+                    timings: None,
                 },
                 true,
             ));
         }
 
+        let t_parse = std::time::Instant::now();
         let outcome = normalize(&cfg, payload, now)?;
-        let summary = reconcile(&mut self.store, &cfg, outcome, now)?;
+        let parse_ms = t_parse.elapsed().as_secs_f64() * 1000.0;
+        let mut summary = reconcile(&mut self.store, &cfg, outcome, now)?;
+        if let Some(t) = summary.timings.as_mut() {
+            t.parse_ms = parse_ms;
+        }
+        let summary = summary;
         self.store.conn.execute(
             "UPDATE sync_meta SET content_hash = ?2 WHERE source = ?1",
             params![source_id, content_hash],

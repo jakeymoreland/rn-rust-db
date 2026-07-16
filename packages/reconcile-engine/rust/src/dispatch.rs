@@ -66,6 +66,22 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
             Ok(json!("OK"))
         }
         "ttl" => Ok(json!(commands::ttl(engine, arg(&args, 0)?, now)?)),
+        "kvFlush" => {
+            let pending = engine.kv.pending.len();
+            engine.flush_kv()?;
+            Ok(json!(pending))
+        }
+        "kvConfig" => {
+            // [high_water, coalesce("0"|"1")] — benchmark knob; flushes first
+            // so a config change never reorders already-queued writes.
+            engine.flush_kv()?;
+            let hw: usize = arg(&args, 0)?
+                .parse()
+                .map_err(|_| EngineError::Command("high_water must be an integer".into()))?;
+            engine.kv.high_water = hw.max(1);
+            engine.kv.coalesce = arg(&args, 1)? == "1";
+            Ok(json!("OK"))
+        }
         "subscribe" => Ok(json!(engine.pubsub.subscribe(arg(&args, 0)?))),
         "unsubscribe" => {
             let id: u64 = arg(&args, 0)?
@@ -115,6 +131,50 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(resp).unwrap();
         assert_eq!(v["ok"], true, "expected ok response, got {resp}");
         v["value"].clone()
+    }
+
+    #[test]
+    fn coalescing_and_config_via_dispatch() {
+        let mut e = eng();
+        // coalesce on (default): 300 sets over 30 keys pend as 30 slots
+        for i in 0..300 {
+            ok_value(&execute(&mut e, &format!(r#"{{"cmd":"set","args":["ck{}","v{i}"]}}"#, i % 30)));
+        }
+        assert_eq!(e.kv.pending.len(), 30);
+        let flushed = ok_value(&execute(&mut e, r#"{"cmd":"kvFlush","args":[]}"#));
+        assert_eq!(flushed, 30);
+        // last write wins
+        assert_eq!(ok_value(&execute(&mut e, r#"{"cmd":"get","args":["ck0"]}"#)), "v270");
+        // coalesce off: every set pends
+        ok_value(&execute(&mut e, r#"{"cmd":"kvConfig","args":["100000","0"]}"#));
+        for i in 0..300 {
+            ok_value(&execute(&mut e, &format!(r#"{{"cmd":"set","args":["ck{}","w{i}"]}}"#, i % 30)));
+        }
+        assert_eq!(e.kv.pending.len(), 300);
+        let flushed = ok_value(&execute(&mut e, r#"{"cmd":"kvFlush","args":[]}"#));
+        assert_eq!(flushed, 300);
+        assert_eq!(ok_value(&execute(&mut e, r#"{"cmd":"get","args":["ck0"]}"#)), "w270");
+        // low high-water auto-flushes
+        ok_value(&execute(&mut e, r#"{"cmd":"kvConfig","args":["4","1"]}"#));
+        for i in 0..10 {
+            ok_value(&execute(&mut e, &format!(r#"{{"cmd":"set","args":["hw{i}","x"]}}"#)));
+        }
+        assert!(e.kv.pending.len() < 4, "auto-flush at high_water=4 did not fire");
+    }
+
+    #[test]
+    fn ingest_reports_timing_breakdown() {
+        let mut e = eng();
+        ok_value(&execute(&mut e, r#"{"cmd":"registerSource","args":["{\"source_id\":\"api\",\"format\":\"Json\",\"collection\":\"people\",\"natural_key_field\":\"email\",\"timestamp_field\":null,\"priority\":10}"]}"#));
+        let payload = r#"[{"email":"t@x.com","name":"T"}]"#;
+        let v = ok_value(&execute(&mut e, &format!(
+            r#"{{"cmd":"ingest","args":["api",{}]}}"#,
+            serde_json::to_string(payload).unwrap()
+        )));
+        let t = &v["timings"];
+        assert!(t["parse_ms"].is_number(), "missing timings: {v}");
+        assert!(t["merge_ms"].is_number());
+        assert!(t["commit_ms"].is_number());
     }
 
     #[test]

@@ -5,9 +5,6 @@ use crate::store::Store;
 use rusqlite::params;
 use std::collections::BTreeMap;
 
-/// How many pending write-behind sets accumulate before a synchronous flush.
-const KV_FLUSH_HIGH_WATER: usize = 256;
-
 pub const RESERVED_PREFIXES: [&str; 4] = ["entry:", "idx:", "meta:", "changes:"];
 
 fn check_writable(key: &str) -> Result<(), EngineError> {
@@ -85,8 +82,17 @@ pub fn set(engine: &mut Engine, key: &str, value: &str) -> Result<(), EngineErro
     // Redis SET semantics: overwriting a key clears any existing TTL. The
     // matching key_ttl row is cleared when this pending write flushes.
     engine.kv.ttl.remove(key);
-    engine.kv.pending.push((key.to_string(), value.to_string()));
-    if engine.kv.pending.len() >= KV_FLUSH_HIGH_WATER {
+    if engine.kv.coalesce {
+        if let Some(&slot) = engine.kv.pending_index.get(key) {
+            engine.kv.pending[slot].1 = value.to_string();
+        } else {
+            engine.kv.pending_index.insert(key.to_string(), engine.kv.pending.len());
+            engine.kv.pending.push((key.to_string(), value.to_string()));
+        }
+    } else {
+        engine.kv.pending.push((key.to_string(), value.to_string()));
+    }
+    if engine.kv.pending.len() >= engine.kv.high_water {
         engine.flush_kv()?;
     }
     Ok(())
