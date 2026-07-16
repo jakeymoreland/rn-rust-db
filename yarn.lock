@@ -2296,6 +2296,11 @@ expo-asset@~57.0.5:
     "@expo/image-utils" "^0.11.3"
     expo-constants "~57.0.5"
 
+expo-clipboard@~57.0.1:
+  version "57.0.1"
+  resolved "https://registry.yarnpkg.com/expo-clipboard/-/expo-clipboard-57.0.1.tgz#d0550de548d313793d2240250081e9e453dbaf71"
+  integrity sha512-HWICri4+1ao7S6QEfcorxVumXDiDnx1guGGewjZgGJWLGxFYs0RgH8ujBs+lkTzBkMmlwADaWSlaesR+nDJt5Q==
+
 expo-constants@~57.0.5:
   version "57.0.5"
   resolved "https://registry.npmjs.org/expo-constants/-/expo-constants-57.0.5.tgz"

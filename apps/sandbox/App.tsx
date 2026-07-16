@@ -6,6 +6,7 @@ import { installFastPath, openEngine, registerSource } from '@rn-experiments/rec
 import { SOURCES } from './src/fixtures';
 import { SourcesScreen } from './src/screens/SourcesScreen';
 import { EntriesScreen } from './src/screens/EntriesScreen';
+import { ExperimentsScreen } from './src/screens/ExperimentsScreen';
 
 type Tab = 'sources' | 'entries' | 'experiments';
 
@@ -18,7 +19,11 @@ export default function App() {
     (async () => {
       try {
         const dir = Paths.document.uri.replace(/^file:\/\//, '');
+        const t0 = performance.now();
         await openEngine(`${dir}/engine.sqlite`);
+        const coldStartMs = performance.now() - t0;
+        console.log(`[bench] openEngine cold start: ${coldStartMs.toFixed(1)} ms`);
+        if (__DEV__) (globalThis as Record<string, unknown>).__coldStartMs = coldStartMs;
         for (const source of SOURCES) {
           await registerSource(source);
         }
@@ -54,11 +59,7 @@ export default function App() {
       <View style={styles.content}>
         {tab === 'sources' && <SourcesScreen />}
         {tab === 'entries' && <EntriesScreen />}
-        {tab === 'experiments' && (
-          <View style={styles.container}>
-            <Text>Experiments (coming in Task 16)</Text>
-          </View>
-        )}
+        {tab === 'experiments' && <ExperimentsScreen />}
       </View>
       <View style={styles.tabBar}>
         <Button title="Sources" onPress={() => setTab('sources')} />
