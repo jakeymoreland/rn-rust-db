@@ -4,14 +4,17 @@ import { LegendList, type LegendListRef } from '@legendapp/list/react-native';
 import type { Row } from './decode';
 import { registerListDriver } from './listBridge';
 
-const SCROLL_STEP_PX = 16;
-const SCROLL_STEP_MS = 32;
+// Constant scroll velocity, applied per animation frame (time-scaled so the
+// speed is the same at 60 and 120 Hz). rAF keeps scroll commands aligned with
+// the frame boundary instead of firing from a timer mid-render, which
+// provoked Legend List's internal setState-during-render warning.
+const SCROLL_PX_PER_MS = 0.5; // 500 px/s
 // Rows are a fixed 44 px so Legend List's size estimate is exact — no
 // post-layout correction work while scrolling.
 const ROW_HEIGHT = 44;
-// Render ~one extra screen ahead of the scroll direction; the auto-scroll
-// moves at 500 px/s, so the default draw distance under-buffers.
-const DRAW_DISTANCE = 500;
+// Legend List default; a larger buffer exhausted the container pool at this
+// scroll speed and forced on-demand container creation mid-scroll.
+const DRAW_DISTANCE = 250;
 
 const styles = StyleSheet.create({
   row: {
@@ -47,7 +50,7 @@ export function BenchList() {
   const listRef = useRef<LegendListRef>(null);
   const commitResolvers = useRef<Array<() => void>>([]);
   const offset = useRef(0);
-  const scrollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const scrollRaf = useRef<number | null>(null);
 
   // Resolves every pending setRows() promise after the commit that carried it.
   useEffect(() => {
@@ -65,23 +68,29 @@ export function BenchList() {
           setVersion((v) => v + 1);
         }),
       startScroll: () => {
-        if (scrollTimer.current) return;
-        scrollTimer.current = setInterval(() => {
+        if (scrollRaf.current !== null) return;
+        let last = performance.now();
+        const step = (now: number) => {
+          scrollRaf.current = requestAnimationFrame(step);
+          const dt = Math.min(100, now - last); // clamp across stalls
+          last = now;
           const list = listRef.current;
           if (!list) return;
           const state = list.getState();
           const maxOffset = Math.max(0, (state?.contentLength ?? 0) - (state?.scrollLength ?? 0));
-          offset.current = offset.current + SCROLL_STEP_PX > maxOffset ? 0 : offset.current + SCROLL_STEP_PX;
+          const next = offset.current + SCROLL_PX_PER_MS * dt;
+          offset.current = next > maxOffset ? 0 : next;
           list.scrollToOffset({ offset: offset.current, animated: false });
-        }, SCROLL_STEP_MS);
+        };
+        scrollRaf.current = requestAnimationFrame(step);
       },
       stopScroll: () => {
-        if (scrollTimer.current) clearInterval(scrollTimer.current);
-        scrollTimer.current = null;
+        if (scrollRaf.current !== null) cancelAnimationFrame(scrollRaf.current);
+        scrollRaf.current = null;
       },
     });
     return () => {
-      if (scrollTimer.current) clearInterval(scrollTimer.current);
+      if (scrollRaf.current !== null) cancelAnimationFrame(scrollRaf.current);
       registerListDriver(null);
     };
   }, []);
