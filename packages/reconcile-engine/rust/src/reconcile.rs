@@ -3,7 +3,7 @@ use crate::normalize::{NormalizeOutcome, SourceConfig};
 use crate::store::Store;
 use rusqlite::params;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct BatchSummary {
@@ -37,12 +37,43 @@ pub fn reconcile(
     };
     let mut changed_collections: Vec<String> = vec![];
 
+    // Bulk-prefetch existing rows for the whole batch: one chunked
+    // SELECT ... IN (...) per collection instead of one B-tree probe per
+    // record. The map is written back after every merge so a batch containing
+    // the same key twice still sees its own earlier writes.
+    let mut existing_map: HashMap<(String, String), (String, String, i64)> = HashMap::new();
+    {
+        let mut by_collection: HashMap<&str, Vec<&str>> = HashMap::new();
+        for rec in &outcome.records {
+            by_collection
+                .entry(rec.collection.as_str())
+                .or_default()
+                .push(rec.natural_key.as_str());
+        }
+        for (collection, keys) in by_collection {
+            for chunk in keys.chunks(900) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT natural_key, fields, field_meta, updated_at FROM entries
+                     WHERE collection = ? AND natural_key IN ({placeholders})"
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let mut rows = stmt.query(rusqlite::params_from_iter(
+                    std::iter::once(collection).chain(chunk.iter().copied()),
+                ))?;
+                while let Some(row) = rows.next()? {
+                    existing_map.insert(
+                        (collection.to_string(), row.get::<_, String>(0)?),
+                        (row.get(1)?, row.get(2)?, row.get(3)?),
+                    );
+                }
+            }
+        }
+    }
+
     // Prepared once per batch (and cached on the connection across batches);
     // re-preparing these inside the per-record loop dominated bulk-ingest time.
     {
-    let mut sel_stmt = tx.prepare_cached(
-        "SELECT fields, field_meta, updated_at FROM entries WHERE collection = ?1 AND natural_key = ?2",
-    )?;
     let mut ins_stmt = tx.prepare_cached(
         "INSERT INTO entries(collection, natural_key, fields, field_meta, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -53,11 +84,8 @@ pub fn reconcile(
     )?;
 
     for rec in outcome.records {
-        let existing: Option<(String, String, i64)> = sel_stmt
-            .query_row(params![rec.collection, rec.natural_key], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .ok();
+        let map_key = (rec.collection.clone(), rec.natural_key.clone());
+        let existing: Option<(String, String, i64)> = existing_map.get(&map_key).cloned();
 
         match existing {
             None => {
@@ -75,13 +103,16 @@ pub fn reconcile(
                         )
                     })
                     .collect();
+                let fields_json = serde_json::to_string(&rec.fields).unwrap();
+                let meta_json = serde_json::to_string(&meta).unwrap();
                 ins_stmt.execute(params![
                     rec.collection,
                     rec.natural_key,
-                    serde_json::to_string(&rec.fields).unwrap(),
-                    serde_json::to_string(&meta).unwrap(),
+                    fields_json,
+                    meta_json,
                     rec.updated_at
                 ])?;
+                existing_map.insert(map_key, (fields_json, meta_json, rec.updated_at));
                 summary.inserted += 1;
                 changed_collections.push(rec.collection.clone());
             }
@@ -126,13 +157,16 @@ pub fn reconcile(
                     // Row-level updated_at must never move backward: a batch that only adds
                     // an older/new field to an already-newer row must not regress the row stamp.
                     let new_updated_at = existing_updated_at.max(rec.updated_at);
+                    let fields_json = serde_json::to_string(&fields).unwrap();
+                    let meta_json = serde_json::to_string(&meta).unwrap();
                     upd_stmt.execute(params![
                         rec.collection,
                         rec.natural_key,
-                        serde_json::to_string(&fields).unwrap(),
-                        serde_json::to_string(&meta).unwrap(),
+                        fields_json,
+                        meta_json,
                         new_updated_at
                     ])?;
+                    existing_map.insert(map_key, (fields_json, meta_json, new_updated_at));
                     if dirty {
                         summary.updated += 1;
                         changed_collections.push(rec.collection.clone());
@@ -204,6 +238,34 @@ mod tests {
 
     fn outcome(records: Vec<CanonicalRecord>) -> NormalizeOutcome {
         NormalizeOutcome { records, rejects: vec![] }
+    }
+
+    #[test]
+    fn same_key_twice_in_one_batch_sees_earlier_merge() {
+        let mut st = Store::open(":memory:").unwrap();
+        // first record inserts; second (same key, newer ts, different field
+        // value) must merge against the FIRST record's state, not the empty DB
+        let s = reconcile(
+            &mut st,
+            &cfg("api", 10),
+            outcome(vec![
+                rec("api", "a@x.com", "name", "Ann", 100),
+                rec("api", "a@x.com", "name", "Annie", 200),
+            ]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(s.inserted, 1);
+        assert_eq!(s.updated, 1);
+        let fields: String = st
+            .conn
+            .query_row(
+                "SELECT fields FROM entries WHERE collection='people' AND natural_key='a@x.com'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fields.contains("Annie"), "second record's merge lost: {fields}");
     }
 
     #[test]

@@ -1,8 +1,8 @@
 import { executeRawSync, ingest, registerSource } from '@rn-experiments/reconcile-engine';
 
 import { fastPath, median, sleep } from './harness';
-import { REALISTIC_FIELDS_CSV, realisticRows } from './data';
-import { createLazyRows } from './decode';
+import { realisticRows } from './data';
+import { createLazyEntryRows } from './decode';
 import { INDUSTRY_REFS, type IndustryResult } from './industryRefs';
 
 const ref = (key: string) => {
@@ -111,7 +111,7 @@ export async function runIndustry(onProgress: (msg: string) => void): Promise<In
 
     onProgress('flat buffer + lazy view over 10k rows (5 reads)...');
     const lazyWaves = await timed(5, () => {
-      const lazy = createLazyRows(fastPath().queryEntriesSchemaBuffer('industry_10k', REALISTIC_FIELDS_CSV));
+      const lazy = createLazyEntryRows(fastPath().queryEntriesBuffer('industry_10k'));
       for (let i = 0; i < Math.min(20, lazy.length); i++) lazy.row(i);
     });
     done('marshalLazy', median(lazyWaves));

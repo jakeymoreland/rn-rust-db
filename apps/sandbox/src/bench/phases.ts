@@ -28,7 +28,7 @@ import {
 import { REALISTIC_FIELDS_CSV, REALISTIC_SIZES, realisticRows, realisticRowsChunked, toyRows } from './data';
 import { type BenchMetrics, score } from './score';
 import type { RunOutput } from './markdown';
-import { createLazyRows, decodeEntriesBuffer, decodeSchemaBuffer, type Row } from './decode';
+import { createLazyEntryRows, decodeEntriesBuffer, decodeSchemaBuffer, type Row } from './decode';
 import { setListVisible, waitForListDriver } from './listBridge';
 
 export type { BenchResult };
@@ -189,11 +189,11 @@ export async function runAll(onProgress: (msg: string) => void, opts: RunOptions
           );
         }),
       );
-      // full transfer but lazy materialization: index all rows, decode only a
-      // visible page — the flat-buffer + DataView-on-demand pattern
+      // full transfer but lazy materialization: index all rows (2 u32 reads
+      // per row over the plain format), decode only a visible page
       await push(
-        time(`realistic query ${n} rows: schema buffer -> lazy view + 20 rows`, iters, () => {
-          const lazy = createLazyRows(fastPath().queryEntriesSchemaBuffer('bench_real', REALISTIC_FIELDS_CSV));
+        time(`realistic query ${n} rows: entries buffer -> lazy view + 20 rows`, iters, () => {
+          const lazy = createLazyEntryRows(fastPath().queryEntriesBuffer('bench_real'));
           for (let i = 0; i < Math.min(20, lazy.length); i++) lazy.row(i);
         }),
       );

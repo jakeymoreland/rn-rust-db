@@ -132,3 +132,50 @@ describe('createLazyRows', () => {
     expect(() => lazy.row(3)).toThrow();
   });
 });
+
+describe('createLazyEntryRows', () => {
+  function encodeEntries(rows: Array<{ key: string; fields: Record<string, string> }>): ArrayBuffer {
+    const te = new TextEncoder();
+    const parts = rows.map((r) => ({ k: te.encode(r.key), j: te.encode(JSON.stringify(r.fields)) }));
+    const len = 4 + parts.reduce((s, p) => s + 8 + p.k.length + p.j.length, 0);
+    const buf = new ArrayBuffer(len);
+    const dv = new DataView(buf);
+    const u8 = new Uint8Array(buf);
+    let off = 0;
+    dv.setUint32(off, rows.length, true);
+    off += 4;
+    for (const p of parts) {
+      dv.setUint32(off, p.k.length, true);
+      off += 4;
+      u8.set(p.k, off);
+      off += p.k.length;
+      dv.setUint32(off, p.j.length, true);
+      off += 4;
+      u8.set(p.j, off);
+      off += p.j.length;
+    }
+    return buf;
+  }
+
+  const rows: Array<{ key: string; fields: Record<string, string> }> = [
+    { key: 'entry:c:1', fields: { name: 'Ann', city: 'Sydney' } },
+    { key: 'entry:c:2', fields: { name: 'Bób', notes: 'ünïcödé' } },
+  ];
+
+  it('materializes plain-format rows on demand, matching the eager decoder', () => {
+    const { createLazyEntryRows, decodeEntriesBuffer } = require('../decode');
+    const buf = encodeEntries(rows);
+    const lazy = createLazyEntryRows(buf);
+    expect(lazy.length).toBe(2);
+    expect(lazy.row(1)).toEqual(decodeEntriesBuffer(buf)[1]);
+    expect(lazy.row(0)).toEqual(decodeEntriesBuffer(buf)[0]);
+    expect(lazy.row(0)).toBe(lazy.row(0)); // memoized
+  });
+
+  it('throws on truncated buffer and bad index', () => {
+    const { createLazyEntryRows } = require('../decode');
+    expect(() => createLazyEntryRows(encodeEntries(rows).slice(0, 9))).toThrow();
+    const lazy = createLazyEntryRows(encodeEntries(rows));
+    expect(() => lazy.row(2)).toThrow();
+  });
+});

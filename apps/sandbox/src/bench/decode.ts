@@ -27,6 +27,47 @@ export function decodeEntriesBuffer(buf: ArrayBuffer): Row[] {
   return out;
 }
 
+// Lazy view over the PLAIN entries wire format (count, then klen/key/jlen/json
+// per row). The index walk is 2 u32 reads per row — ~12x fewer interpreter
+// dispatches than walking the schema format in Hermes — and materialization is
+// a single-row JSON.parse. This is the cheapest full-transfer lazy path: the
+// native side ships stored JSON verbatim with no per-row re-encoding.
+export function createLazyEntryRows(buf: ArrayBuffer): LazyRows {
+  const dv = new DataView(buf);
+  const td = new TextDecoder();
+  if (buf.byteLength < 4) throw new Error('corrupt entry buffer');
+  const count = dv.getUint32(0, true);
+  const offsets = new Uint32Array(count);
+  let off = 4;
+  for (let i = 0; i < count; i++) {
+    offsets[i] = off;
+    if (off + 4 > buf.byteLength) throw new Error('corrupt entry buffer');
+    off += 4 + dv.getUint32(off, true); // key
+    if (off + 4 > buf.byteLength) throw new Error('corrupt entry buffer');
+    off += 4 + dv.getUint32(off, true); // fields json
+    if (off > buf.byteLength) throw new Error('corrupt entry buffer');
+  }
+  const memo: Array<Row | undefined> = new Array(count);
+  return {
+    length: count,
+    row(i: number): Row {
+      if (i < 0 || i >= count) throw new Error(`row ${i} out of range (0..${count - 1})`);
+      const cached = memo[i];
+      if (cached) return cached;
+      let p = offsets[i];
+      const klen = dv.getUint32(p, true);
+      p += 4;
+      const key = td.decode(new Uint8Array(buf, p, klen));
+      p += klen;
+      const jlen = dv.getUint32(p, true);
+      p += 4;
+      const rowObj = { key, fields: JSON.parse(td.decode(new Uint8Array(buf, p, jlen))) };
+      memo[i] = rowObj;
+      return rowObj;
+    },
+  };
+}
+
 const SCHEMA_FIELD_MISSING = 0xffffffff;
 
 export type LazyRows = {

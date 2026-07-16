@@ -31,6 +31,27 @@ struct RustBufferGuard {
     }
   }
 };
+
+// Zero-copy handoff: wraps a Rust-allocated buffer as a jsi::MutableBuffer so
+// the JS ArrayBuffer reads Rust's memory directly (no memcpy). The Rust
+// allocation is released when the JS GC collects the ArrayBuffer.
+class RustOwnedBuffer : public facebook::jsi::MutableBuffer {
+ public:
+  RustOwnedBuffer(unsigned char* data, size_t len) : data_(data), len_(len) {}
+  ~RustOwnedBuffer() override {
+    engine_free_bytes(data_, len_);
+  }
+  size_t size() const override {
+    return len_;
+  }
+  uint8_t* data() override {
+    return data_;
+  }
+
+ private:
+  unsigned char* data_;
+  size_t len_;
+};
 } // namespace
 
 NativeReconcileEngine::NativeReconcileEngine(std::shared_ptr<CallInvoker> jsInvoker)
@@ -167,12 +188,8 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         if (data == nullptr) {
           throw jsi::JSError(rt, "queryEntriesBuffer failed: " + takeRustString(engine_last_error()));
         }
-        RustBufferGuard guard{data, len};
-        jsi::Function ctor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-        jsi::Object abObj = ctor.callAsConstructor(rt, static_cast<int>(len)).getObject(rt);
-        jsi::ArrayBuffer ab = abObj.getArrayBuffer(rt);
-        std::memcpy(ab.data(rt), data, len);
-        return abObj;
+        // zero-copy: JS reads the Rust allocation in place; freed on JS GC
+        return jsi::ArrayBuffer(rt, std::make_shared<RustOwnedBuffer>(data, len));
       });
 
   auto querySchemaBuffer = jsi::Function::createFromHostFunction(
@@ -201,12 +218,8 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         if (data == nullptr) {
           throw jsi::JSError(rt, "queryEntriesSchemaBuffer failed: " + takeRustString(engine_last_error()));
         }
-        RustBufferGuard guard{data, len};
-        jsi::Function ctor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-        jsi::Object abObj = ctor.callAsConstructor(rt, static_cast<int>(len)).getObject(rt);
-        jsi::ArrayBuffer ab = abObj.getArrayBuffer(rt);
-        std::memcpy(ab.data(rt), data, len);
-        return abObj;
+        // zero-copy: JS reads the Rust allocation in place; freed on JS GC
+        return jsi::ArrayBuffer(rt, std::make_shared<RustOwnedBuffer>(data, len));
       });
 
   auto querySchemaBufferRange = jsi::Function::createFromHostFunction(
@@ -238,12 +251,8 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         if (data == nullptr) {
           throw jsi::JSError(rt, "queryEntriesSchemaBufferRange failed: " + takeRustString(engine_last_error()));
         }
-        RustBufferGuard guard{data, len};
-        jsi::Function ctor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-        jsi::Object abObj = ctor.callAsConstructor(rt, static_cast<int>(len)).getObject(rt);
-        jsi::ArrayBuffer ab = abObj.getArrayBuffer(rt);
-        std::memcpy(ab.data(rt), data, len);
-        return abObj;
+        // zero-copy: JS reads the Rust allocation in place; freed on JS GC
+        return jsi::ArrayBuffer(rt, std::make_shared<RustOwnedBuffer>(data, len));
       });
 
   auto queryObjects = jsi::Function::createFromHostFunction(
