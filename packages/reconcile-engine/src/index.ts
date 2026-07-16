@@ -79,7 +79,7 @@ export async function subscribe(
 ): Promise<() => void> {
   const id = await call<number>('subscribe', [pattern]);
   const re = globToRegex(pattern);
-  const sub = NativeReconcileEngine.onChange.addListener((e) => {
+  const sub = NativeReconcileEngine.onChange((e) => {
     if (re.test(e.channel)) handler(e.channel, JSON.parse(e.payload));
   });
   return () => {
