@@ -9,6 +9,8 @@ import {
   subscribe,
 } from '@rn-experiments/reconcile-engine';
 
+import { File } from 'expo-file-system';
+
 import { SOURCES } from '../fixtures';
 import { getEnginePath } from '../enginePath';
 
@@ -53,6 +55,22 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
   let asyncOverheadMs = 0;
   let budgetMs = 1000 / 60;
   let refreshHz = 60;
+
+  // 0. fresh DB. Benchmark collections persist across runs (re-ingests are
+  // content-hash idempotent but rows remain), so without a wipe every
+  // "query N rows" benchmark actually queries everything ever ingested —
+  // on a device that has run the 100k step once, even the 1k step then
+  // churns ~75 MB buffers per iteration until iOS jetsams the app.
+  await phase('wipe', async () => {
+    onProgress('wiping engine DB for a fresh run...');
+    closeEngine();
+    for (const suffix of ['', '-wal', '-shm']) {
+      const f = new File(`file://${getEnginePath()}${suffix}`);
+      if (f.exists) f.delete();
+    }
+    await openEngine(getEnginePath());
+    for (const s of SOURCES) await registerSource(s);
+  });
 
   // 1. call overhead
   await phase('call overhead', async () => {

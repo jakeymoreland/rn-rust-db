@@ -14,9 +14,12 @@ Assessment matrix coverage:
 Notes on method for these runs:
 - Both runs were driven through the same `runAll()` used by the "Run benchmarks"
   button (invoked over the Hermes inspector via the dev-gated `globalThis.__t16`).
-- The engine database was wiped before each run so "query N rows" really queries
-  N rows — the `bench` collection persists across app restarts and otherwise
-  accumulates (content-hash makes re-ingests idempotent but rows remain).
+- `runAll()` now wipes the engine DB (deletes the sqlite file + WAL/SHM and
+  reopens) at the start of every run, so "query N rows" really queries N rows.
+  Bench collections otherwise persist across runs (content-hash makes
+  re-ingests idempotent but rows remain) — before the auto-wipe this was a
+  manual step, and skipping it made the 1k query step churn ~75 MB buffers
+  against an accumulated 100k-row collection until iOS jetsammed the app.
 - "JSON string" queries run `scan entry:bench:*` (keys only, one JSON parse);
   "JSI objects" and "ArrayBuffer" return the full rows (key + all fields) via the
   `installFastPath()` host functions. The JSON path carries *less* data per op.
