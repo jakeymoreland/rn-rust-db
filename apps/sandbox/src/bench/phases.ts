@@ -501,5 +501,106 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
     });
   });
 
+  // 8. reliability: correctness under adversity. Pass/fail checks; a throw
+  // inside a check scores 0 for that check without aborting the run.
+  await phase('reliability', async () => {
+    const relSource = {
+      source_id: 'bench_rel',
+      format: 'Json' as const,
+      collection: 'bench_rel',
+      natural_key_field: 'id',
+      timestamp_field: null,
+      priority: 1,
+    };
+    await registerSource(relSource);
+    const relRows = () => decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_rel'));
+    const check = async (name: string, metric: keyof BenchMetrics, fn: () => Promise<{ pass: boolean; detail: string }>) => {
+      const t0 = performance.now();
+      let pass = false;
+      let detail = '';
+      try {
+        ({ pass, detail } = await fn());
+      } catch (e) {
+        detail = `threw: ${e}`;
+      }
+      metrics[metric] = pass ? 1 : 0;
+      await push({
+        name: `reliability: ${name}`,
+        iterations: 1,
+        totalMs: performance.now() - t0,
+        perOpMs: performance.now() - t0,
+        note: `${pass ? 'PASS' : 'FAIL'} — ${detail}`,
+      });
+    };
+
+    onProgress('reliability: interrupted transaction...');
+    await check('interrupted transaction', 'reliabilityInterruptedTxn', async () => {
+      await ingest('bench_rel', realisticRows(1000, 400, 0));
+      const p = ingest('bench_rel', realisticRows(10000, 400, 1));
+      await sleep(5);
+      closeEngine(); // may block until the in-flight batch commits (engine mutex)
+      await p.catch(() => undefined);
+      await openEngine(getEnginePath());
+      await registerSource(relSource);
+      const n = relRows().length;
+      return {
+        pass: n === 1000 || n === 10000,
+        detail: `${n} rows after close-mid-ingest + reopen (must be exactly pre- or post-batch, never partial)`,
+      };
+    });
+
+    onProgress('reliability: corrupted payload recovery...');
+    await check('corrupted payload recovery', 'reliabilityCorruptRecovery', async () => {
+      const rejected = async (payload: string): Promise<boolean> => {
+        try {
+          const summary = await ingest('bench_rel', payload);
+          return (summary.dead_lettered ?? 0) > 0;
+        } catch {
+          return true;
+        }
+      };
+      const badJson = await rejected('this is not json');
+      const badShape = await rejected(JSON.stringify([{ wrong: 'shape', no_id: true }]));
+      const before = relRows().length;
+      await ingest('bench_rel', realisticRows(10, 400, 2)); // engine must still work
+      const after = relRows().length;
+      return {
+        pass: badJson && badShape && after >= before,
+        detail: `malformed JSON ${badJson ? 'rejected' : 'ACCEPTED'}, wrong shape ${badShape ? 'rejected' : 'ACCEPTED'}, normal ingest ${after >= before ? 'still works' : 'BROKEN'}`,
+      };
+    });
+
+    onProgress('reliability: retry idempotency...');
+    await check('retry idempotency', 'reliabilityRetryIdempotent', async () => {
+      const payload = realisticRows(50, 400, 7);
+      await ingest('bench_rel', payload);
+      const second = await ingest('bench_rel', payload);
+      const pass = second.skipped === true || (second.inserted === 0 && second.updated === 0);
+      return {
+        pass,
+        detail: `2nd identical ingest: inserted ${second.inserted}, updated ${second.updated}, unchanged ${second.unchanged}${second.skipped ? ', skipped' : ''}`,
+      };
+    });
+
+    onProgress('reliability: reopen integrity...');
+    await check('reopen integrity', 'reliabilityReopenIntegrity', async () => {
+      const before = relRows();
+      const sample = before[Math.floor(before.length / 2)];
+      closeEngine();
+      await openEngine(getEnginePath());
+      await registerSource(relSource);
+      const after = relRows();
+      const match = after.find((r) => r.key === sample.key);
+      const fieldsEqual = !!match && JSON.stringify(match.fields) === JSON.stringify(sample.fields);
+      return {
+        pass: after.length === before.length && fieldsEqual,
+        detail: `${before.length} rows before, ${after.length} after reopen; sampled row ${fieldsEqual ? 'intact' : 'CHANGED'}`,
+      };
+    });
+
+    // leave the app's fixture sources registered after the close/open cycles
+    for (const s of SOURCES) await registerSource(s);
+  });
+
   return { results, metrics, score: score(metrics) };
 }
