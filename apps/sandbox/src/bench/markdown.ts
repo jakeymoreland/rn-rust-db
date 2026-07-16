@@ -1,4 +1,5 @@
 import type { BenchResult } from './harness';
+import { ANCHORS, BANDED_CATEGORIES, metricFrac } from './score';
 import type { BenchmarkScore, BenchMetrics, CategoryScore } from './score';
 
 export const CATEGORY_LABELS = {
@@ -40,6 +41,23 @@ export function renderScorecard(s: BenchmarkScore): string {
     boxRow('Current Score', `${Math.round(s.overall.earned)}/${s.overall.available}`),
     border('╚', '╝'),
   ].join('\n');
+}
+
+// For each measured banded category, the metric that scored lowest — the one
+// to look at first when a category loses points.
+export function categoryWorstMetrics(metrics: BenchMetrics): Partial<Record<CategoryKey, string>> {
+  const out: Partial<Record<CategoryKey, string>> = {};
+  for (const key of Object.keys(BANDED_CATEGORIES) as Array<keyof typeof BANDED_CATEGORIES>) {
+    const present = (BANDED_CATEGORIES[key].metrics as readonly (keyof typeof ANCHORS)[]).filter(
+      (id) => metrics[id] !== undefined,
+    );
+    if (present.length === 0) continue;
+    const worst = present.reduce((a, b) =>
+      metricFrac(metrics[b]!, ANCHORS[b]) < metricFrac(metrics[a]!, ANCHORS[a]) ? b : a,
+    );
+    out[key] = `${worst} = ${metrics[worst]!.toFixed(2)}`;
+  }
+  return out;
 }
 
 export function toMarkdown(platform: string, out: RunOutput): string {

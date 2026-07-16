@@ -40,3 +40,17 @@ describe('toMarkdown', () => {
     expect(md).toContain('in-process proxy');
   });
 });
+
+describe('categoryWorstMetrics', () => {
+  it('names the lowest-scoring metric per measured category', () => {
+    const { categoryWorstMetrics } = require('../markdown');
+    const worst = categoryWorstMetrics({
+      nativeSyncCallMs: 0.01, // full points
+      nativeAsyncCallMs: 9, // nearly zero points -> worst in native
+      queryBuffer100kMs: 50,
+    });
+    expect(worst.native).toContain('nativeAsyncCallMs');
+    expect(worst.query).toContain('queryBuffer100kMs');
+    expect(worst.sync).toBeUndefined();
+  });
+});

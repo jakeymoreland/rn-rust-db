@@ -3,7 +3,7 @@ import { Button, Platform, ScrollView, Text, View } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { executeRaw } from '@rn-experiments/reconcile-engine';
 import { runAll, type RunOutput } from '../bench/phases';
-import { renderScorecard, toMarkdown } from '../bench/markdown';
+import { CATEGORY_LABELS, categoryWorstMetrics, renderScorecard, toMarkdown, type CategoryKey } from '../bench/markdown';
 import { BenchList } from '../bench/BenchList';
 
 if (__DEV__) {
@@ -40,7 +40,19 @@ export function ExperimentsScreen() {
       )}
       {running && <BenchList />}
       {output && (
-        <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderScorecard(output.score)}</Text>
+        <>
+          <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderScorecard(output.score)}</Text>
+          {Object.entries(categoryWorstMetrics(output.metrics))
+            .filter(([key]) => {
+              const c = output.score[key as CategoryKey];
+              return c.measured && Math.round(c.earned) < c.max;
+            })
+            .map(([key, detail]) => (
+              <Text key={key} style={{ fontFamily: 'monospace', fontSize: 11, color: '#a55' }}>
+                {CATEGORY_LABELS[key as CategoryKey]} lost most on: {detail}
+              </Text>
+            ))}
+        </>
       )}
       {progress.map((m, i) => (
         <Text key={i} style={{ fontFamily: 'monospace', fontSize: 12 }}>

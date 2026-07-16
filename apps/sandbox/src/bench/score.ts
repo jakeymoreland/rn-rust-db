@@ -77,7 +77,7 @@ export function metricFrac(value: number, anchors: readonly Anchor[]): number {
   return 0;
 }
 
-const BANDED_CATEGORIES = {
+export const BANDED_CATEGORIES = {
   native: { max: 15, metrics: ['nativeSyncCallMs', 'nativeAsyncCallMs', 'nativeEventLatencyMs'] },
   storage: {
     max: 20,
