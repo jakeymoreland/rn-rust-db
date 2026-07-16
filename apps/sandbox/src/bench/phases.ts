@@ -1,4 +1,16 @@
-import { executeRaw, executeRawSync, ingest, redis, registerSource, subscribe } from '@rn-experiments/reconcile-engine';
+import {
+  closeEngine,
+  executeRaw,
+  executeRawSync,
+  ingest,
+  openEngine,
+  redis,
+  registerSource,
+  subscribe,
+} from '@rn-experiments/reconcile-engine';
+
+import { SOURCES } from '../fixtures';
+import { getEnginePath } from '../enginePath';
 
 import {
   type BenchResult,
@@ -406,7 +418,32 @@ export async function runAll(onProgress: (msg: string) => void): Promise<RunOutp
     }
   });
 
-  // 6. change-event latency breakdown: t0 = before ingest() call,
+  // 6. cold-start hydrate: how fast is "app relaunched, list screen usable"?
+  // close -> open -> 10k rows queryable via the ArrayBuffer path.
+  await phase('cold-start hydrate', async () => {
+    onProgress('cold-start hydrate (close -> open -> 10k rows queryable)...');
+    const t0 = performance.now();
+    closeEngine();
+    await openEngine(getEnginePath());
+    let rows = 0;
+    do {
+      rows = decodeEntriesBuffer(fastPath().queryEntriesBuffer('bench_list')).length;
+      if (performance.now() - t0 > 15_000) throw new Error(`hydrate stalled: only ${rows} rows after reopen`);
+    } while (rows < 10000);
+    const hydrateMs = performance.now() - t0;
+    metrics.storageHydrateMs = hydrateMs;
+    // restore the app's fixture sources for the other screens
+    for (const s of SOURCES) await registerSource(s);
+    await push({
+      name: 'cold-start hydrate (close->open->10k rows queryable)',
+      iterations: 1,
+      totalMs: hydrateMs,
+      perOpMs: hydrateMs,
+      note: `${rows} rows readable via ArrayBuffer path after reopen`,
+    });
+  });
+
+  // 7. change-event latency breakdown: t0 = before ingest() call,
   // t1 = ingest promise resolves, t2 = subscribe callback fires.
   await phase('event breakdown', async () => {
     await registerSource({

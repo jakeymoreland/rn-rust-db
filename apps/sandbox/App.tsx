@@ -4,6 +4,7 @@ import { Button, StyleSheet, Text, View } from 'react-native';
 import { Paths } from 'expo-file-system';
 import { installFastPath, openEngine, registerSource } from '@rn-experiments/reconcile-engine';
 import { SOURCES } from './src/fixtures';
+import { setEnginePath } from './src/enginePath';
 import { SourcesScreen } from './src/screens/SourcesScreen';
 import { EntriesScreen } from './src/screens/EntriesScreen';
 import { ExperimentsScreen } from './src/screens/ExperimentsScreen';
@@ -19,6 +20,7 @@ export default function App() {
     (async () => {
       try {
         const dir = Paths.document.uri.replace(/^file:\/\//, '');
+        setEnginePath(`${dir}/engine.sqlite`);
         const t0 = performance.now();
         await openEngine(`${dir}/engine.sqlite`);
         const coldStartMs = performance.now() - t0;
