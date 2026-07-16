@@ -83,6 +83,8 @@ export async function runIndustry(onProgress: (msg: string) => void): Promise<In
       await ingest('industry', realisticRows(1, 901, rev++));
     });
     done('sqliteSingle', median(waves));
+    // same measurement graded against the offline-first DB comparison suite
+    done('offlineDbInsert', median(waves));
   }
 
   onProgress('SQLite bulk insert (3 x 1000 rows)...');

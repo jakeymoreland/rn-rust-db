@@ -84,6 +84,15 @@ export const INDUSTRY_REFS: IndustryRef[] = [
     caveat: 'reference transfers a pre-built buffer; ours includes the 10k-row SQLite query',
   },
   {
+    key: 'offlineDbInsert',
+    component: 'vs offline-first DBs',
+    operation: 'insert one message (RxDB comparison suite)',
+    refLoMs: 5,
+    refHiMs: 16,
+    unit: 'ms/op',
+    caveat: 'reference range is WatermelonDB/rxdb-lokijs..pouchdb/aws in a browser; ours is native with full reconcile',
+  },
+  {
     key: 'dlq100',
     component: 'Dead-letter queue',
     operation: 'dead-letter 100 bad payloads',
