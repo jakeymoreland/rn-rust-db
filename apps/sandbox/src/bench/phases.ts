@@ -28,7 +28,7 @@ import {
 import { REALISTIC_FIELDS_CSV, REALISTIC_SIZES, realisticRows, realisticRowsChunked, toyRows } from './data';
 import { type BenchMetrics, score } from './score';
 import type { RunOutput } from './markdown';
-import { decodeEntriesBuffer, decodeSchemaBuffer, type Row } from './decode';
+import { createLazyRows, decodeEntriesBuffer, decodeSchemaBuffer, type Row } from './decode';
 import { setListVisible, waitForListDriver } from './listBridge';
 
 export type { BenchResult };
@@ -187,6 +187,14 @@ export async function runAll(onProgress: (msg: string) => void, opts: RunOptions
           decodeSchemaBuffer(
             fastPath().queryEntriesSchemaBufferRange('bench_real', REALISTIC_FIELDS_CSV, 50, Math.floor(n / 2)),
           );
+        }),
+      );
+      // full transfer but lazy materialization: index all rows, decode only a
+      // visible page — the flat-buffer + DataView-on-demand pattern
+      await push(
+        time(`realistic query ${n} rows: schema buffer -> lazy view + 20 rows`, iters, () => {
+          const lazy = createLazyRows(fastPath().queryEntriesSchemaBuffer('bench_real', REALISTIC_FIELDS_CSV));
+          for (let i = 0; i < Math.min(20, lazy.length); i++) lazy.row(i);
         }),
       );
       if (n === 10000) metrics.interopObjectsVsBufferRatio = objects.perOpMs / buffer.perOpMs;

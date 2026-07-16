@@ -75,6 +75,14 @@ export const INDUSTRY_REFS: IndustryRef[] = [
     unit: 'ms total',
   },
   {
+    key: 'marshalLazy',
+    component: 'JSI marshaling',
+    operation: '10k rows as flat buffer + lazy view (20 materialized)',
+    refLoMs: 0.5,
+    refHiMs: 1.5,
+    unit: 'ms total',
+  },
+  {
     key: 'dlq100',
     component: 'Dead-letter queue',
     operation: 'dead-letter 100 bad payloads',

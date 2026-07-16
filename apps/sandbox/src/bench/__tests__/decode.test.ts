@@ -40,10 +40,9 @@ it('throws on truncated buffer', () => {
   expect(() => decodeEntriesBuffer(buf)).toThrow();
 });
 
-describe('decodeSchemaBuffer', () => {
-  const MISSING = 0xffffffff;
+const MISSING = 0xffffffff;
 
-  function encodeSchema(fields: string[], rows: Array<{ key: string; values: Array<string | null> }>): ArrayBuffer {
+function encodeSchema(fields: string[], rows: Array<{ key: string; values: Array<string | null> }>): ArrayBuffer {
     const te = new TextEncoder();
     const chunks: Array<Uint8Array | number> = []; // number = u32
     chunks.push(fields.length);
@@ -78,8 +77,9 @@ describe('decodeSchemaBuffer', () => {
       }
     }
     return buf;
-  }
+}
 
+describe('decodeSchemaBuffer', () => {
   it('round-trips schema rows into keyed objects', () => {
     const { decodeSchemaBuffer } = require('../decode');
     const buf = encodeSchema(
@@ -99,5 +99,36 @@ describe('decodeSchemaBuffer', () => {
     const { decodeSchemaBuffer } = require('../decode');
     const buf = encodeSchema(['a'], [{ key: 'k', values: ['v'] }]).slice(0, 10);
     expect(() => decodeSchemaBuffer(buf)).toThrow();
+  });
+});
+
+describe('createLazyRows', () => {
+  const rows: Array<{ key: string; values: Array<string | null> }> = [
+    { key: 'entry:c:1', values: ['Ann', 'Sydney'] },
+    { key: 'entry:c:2', values: ['Bób', null] },
+    { key: 'entry:c:3', values: ['Cat', 'Perth'] },
+  ];
+
+  it('materializes rows on demand, matching the eager decoder', () => {
+    const { createLazyRows, decodeSchemaBuffer } = require('../decode');
+    const buf = encodeSchema(['name', 'city'], rows);
+    const lazy = createLazyRows(buf);
+    const eager = decodeSchemaBuffer(buf);
+    expect(lazy.length).toBe(3);
+    expect(lazy.row(1)).toEqual(eager[1]);
+    expect(lazy.row(0)).toEqual(eager[0]);
+    expect(lazy.row(2)).toEqual(eager[2]);
+  });
+
+  it('memoizes materialized rows', () => {
+    const { createLazyRows } = require('../decode');
+    const lazy = createLazyRows(encodeSchema(['name', 'city'], rows));
+    expect(lazy.row(1)).toBe(lazy.row(1)); // same object identity
+  });
+
+  it('throws on out-of-range index', () => {
+    const { createLazyRows } = require('../decode');
+    const lazy = createLazyRows(encodeSchema(['name', 'city'], rows));
+    expect(() => lazy.row(3)).toThrow();
   });
 });
