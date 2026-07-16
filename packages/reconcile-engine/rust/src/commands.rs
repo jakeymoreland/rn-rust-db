@@ -55,6 +55,8 @@ pub fn set(store: &Store, key: &str, value: &str) -> Result<(), EngineError> {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![key, value],
     )?;
+    // Redis SET semantics: overwriting a key clears any existing TTL.
+    store.conn.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
     Ok(())
 }
 
@@ -77,6 +79,8 @@ pub fn hset(store: &Store, key: &str, field: &str, value: &str) -> Result<(), En
          ON CONFLICT(key, field) DO UPDATE SET value = excluded.value",
         params![key, field, value],
     )?;
+    // Redis SET semantics: (re)writing a key clears any existing TTL.
+    store.conn.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
     Ok(())
 }
 
@@ -260,6 +264,26 @@ mod tests {
             del(&st, "idx:people"),
             Err(crate::error::EngineError::Command(_))
         ));
+    }
+
+    #[test]
+    fn reset_after_expiry_survives() {
+        let st = s();
+        set(&st, "a", "1").unwrap();
+        expire(&st, "a", 10, 0).unwrap();
+        // time passes well past expiry, but nothing reads the key in between
+        set(&st, "a", "2").unwrap();
+        assert_eq!(get(&st, "a", 1_000).unwrap(), Some("2".into()));
+    }
+
+    #[test]
+    fn hset_after_expiry_survives() {
+        let st = s();
+        hset(&st, "h", "f", "1").unwrap();
+        expire(&st, "h", 10, 0).unwrap();
+        // time passes well past expiry, but nothing reads the key in between
+        hset(&st, "h", "f", "2").unwrap();
+        assert_eq!(hget(&st, "h", "f", 1_000).unwrap(), Some("2".into()));
     }
 
     #[test]
