@@ -181,6 +181,14 @@ export async function runAll(onProgress: (msg: string) => void, opts: RunOptions
           decodeSchemaBuffer(fastPath().queryEntriesSchemaBuffer('bench_real', REALISTIC_FIELDS_CSV));
         }),
       );
+      // the windowed pattern a paged list would actually use: one visible page
+      await push(
+        time(`realistic query page (50 rows @ mid-collection of ${n}): schema buffer -> objects`, 20, () => {
+          decodeSchemaBuffer(
+            fastPath().queryEntriesSchemaBufferRange('bench_real', REALISTIC_FIELDS_CSV, 50, Math.floor(n / 2)),
+          );
+        }),
+      );
       if (n === 10000) metrics.interopObjectsVsBufferRatio = objects.perOpMs / buffer.perOpMs;
       if (n === 100000) metrics.queryBuffer100kMs = buffer.perOpMs;
     }
@@ -496,6 +504,15 @@ export async function runAll(onProgress: (msg: string) => void, opts: RunOptions
             name: 'jsi-objects (10k rows)',
             scored: true,
             fetch: () => fastPath().queryEntriesObjects('bench_list'),
+          },
+          {
+            // one visible page — the WatermelonDB/Realm-style pattern; not
+            // scored because it answers "how fast is a page", not "which
+            // path can back the full 10k list".
+            name: 'windowed schema-buffer (50-row page)',
+            scored: false,
+            fetch: () =>
+              decodeSchemaBuffer(fastPath().queryEntriesSchemaBufferRange('bench_list', REALISTIC_FIELDS_CSV, 50, 5000)),
           },
           {
             name: 'scan+hgetall (first 100 rows, naive baseline)',

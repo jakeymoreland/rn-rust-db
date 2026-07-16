@@ -134,6 +134,55 @@ pub extern "C" fn engine_query_entries_bin(
 }
 
 #[no_mangle]
+pub extern "C" fn engine_query_entries_schema_bin_range(
+    handle: *mut c_void,
+    collection: *const c_char,
+    fields_csv: *const c_char,
+    limit: i64,
+    offset: i64,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if handle.is_null() || out_len.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ffi = unsafe { &*(handle as *mut EngineFfi) };
+    let Some(collection) = (unsafe { cstr(collection) }) else {
+        return std::ptr::null_mut();
+    };
+    let Some(fields_csv) = (unsafe { cstr(fields_csv) }) else {
+        return std::ptr::null_mut();
+    };
+    let fields: Vec<&str> = fields_csv.split(',').map(str::trim).filter(|f| !f.is_empty()).collect();
+    if fields.is_empty() || limit <= 0 || offset < 0 {
+        set_last_error(4, "bad fields/limit/offset");
+        return std::ptr::null_mut();
+    }
+    let engine = ffi.inner.lock().unwrap();
+    let mut rows: Vec<(String, String)> = vec![];
+    let result = (|| -> Result<(), rusqlite::Error> {
+        let mut stmt = engine.store.conn.prepare_cached(
+            "SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key LIMIT ?2 OFFSET ?3",
+        )?;
+        let iter = stmt.query_map(params![collection, limit, offset], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in iter {
+            rows.push(row?);
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        set_last_error(2, &e.to_string());
+        return std::ptr::null_mut();
+    }
+    let buf = crate::binenc::encode_entries_schema(&rows, &fields);
+    let len = buf.len();
+    let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
+    unsafe { *out_len = len };
+    ptr
+}
+
+#[no_mangle]
 pub extern "C" fn engine_query_entries_schema_bin(
     handle: *mut c_void,
     collection: *const c_char,
@@ -403,6 +452,27 @@ mod tests {
             let r = engine_execute(h, c.as_ptr());
             engine_free_string(r);
         }
+        // range variant: 1 row at offset 0, and empty past the end
+        {
+            let col = CString::new("people").unwrap();
+            let fields = CString::new("name").unwrap();
+            let mut len: usize = 0;
+            let p = engine_query_entries_schema_bin_range(h, col.as_ptr(), fields.as_ptr(), 1, 0, &mut len);
+            assert!(!p.is_null());
+            let bytes = unsafe { std::slice::from_raw_parts(p, len) }.to_vec();
+            engine_free_bytes(p, len);
+            // field table (1 field "name") then row count 1
+            assert_eq!(&bytes[0..4], &1u32.to_le_bytes());
+            assert_eq!(&bytes[12..16], &1u32.to_le_bytes());
+            let p2 = engine_query_entries_schema_bin_range(h, col.as_ptr(), fields.as_ptr(), 10, 50, &mut len);
+            assert!(!p2.is_null());
+            let bytes2 = unsafe { std::slice::from_raw_parts(p2, len) }.to_vec();
+            engine_free_bytes(p2, len);
+            assert_eq!(&bytes2[12..16], &0u32.to_le_bytes()); // no rows past the end
+            let p3 = engine_query_entries_schema_bin_range(h, col.as_ptr(), fields.as_ptr(), 0, 0, &mut len);
+            assert!(p3.is_null()); // limit must be > 0
+        }
+
         let col = CString::new("people").unwrap();
         let fields = CString::new("name,missing_field").unwrap();
         let mut len: usize = 0;

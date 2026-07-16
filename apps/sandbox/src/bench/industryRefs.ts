@@ -55,6 +55,7 @@ export const INDUSTRY_REFS: IndustryRef[] = [
     refLoMs: 0.5,
     refHiMs: 1.5,
     unit: 'ms/op',
+    caveat: 'reference is a bare INSERT; ours parses, normalizes, and reconciles per row',
   },
   {
     key: 'sqliteBulk1k',
@@ -63,6 +64,7 @@ export const INDUSTRY_REFS: IndustryRef[] = [
     refLoMs: 12,
     refHiMs: 25,
     unit: 'ms total',
+    caveat: 'reference is a bare INSERT loop; ours parses, content-hashes, and reconciles per row',
   },
   {
     key: 'marshal10k',

@@ -35,6 +35,9 @@ unsigned char* engine_query_entries_bin(engine_handle_t engine, const char* coll
  */
 unsigned char* engine_query_entries_schema_bin(engine_handle_t engine, const char* collection, const char* fields_csv, size_t* out_len);
 
+/* Windowed variant of engine_query_entries_schema_bin: rows [offset, offset+limit) ordered by natural_key. limit must be > 0, offset >= 0. */
+unsigned char* engine_query_entries_schema_bin_range(engine_handle_t engine, const char* collection, const char* fields_csv, long long limit, long long offset, size_t* out_len);
+
 /*
  * Registers cb to be invoked once per matching pubsub event. cb fires
  * SYNCHRONOUSLY, on whatever thread triggered the event, while the engine's

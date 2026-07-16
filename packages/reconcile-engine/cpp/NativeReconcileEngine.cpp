@@ -209,6 +209,43 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         return abObj;
       });
 
+  auto querySchemaBufferRange = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "queryEntriesSchemaBufferRange"),
+      4,
+      [weak](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        auto strong = weak.lock();
+        if (!strong) {
+          throw jsi::JSError(rt, "reconcile engine module destroyed");
+        }
+        if (count < 4 || !args[0].isString() || !args[1].isString() || !args[2].isNumber() || !args[3].isNumber()) {
+          throw jsi::JSError(rt, "queryEntriesSchemaBufferRange(collection, fieldsCsv, limit, offset)");
+        }
+        std::string collection = args[0].asString(rt).utf8(rt);
+        std::string fieldsCsv = args[1].asString(rt).utf8(rt);
+        auto limit = static_cast<long long>(args[2].asNumber());
+        auto offset = static_cast<long long>(args[3].asNumber());
+        size_t len = 0;
+        unsigned char* data = nullptr;
+        {
+          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          if (strong->engine_ == nullptr) {
+            throw jsi::JSError(rt, "engine not open");
+          }
+          data = engine_query_entries_schema_bin_range(
+              strong->engine_, collection.c_str(), fieldsCsv.c_str(), limit, offset, &len);
+        }
+        if (data == nullptr) {
+          throw jsi::JSError(rt, "queryEntriesSchemaBufferRange failed: " + takeRustString(engine_last_error()));
+        }
+        RustBufferGuard guard{data, len};
+        jsi::Function ctor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
+        jsi::Object abObj = ctor.callAsConstructor(rt, static_cast<int>(len)).getObject(rt);
+        jsi::ArrayBuffer ab = abObj.getArrayBuffer(rt);
+        std::memcpy(ab.data(rt), data, len);
+        return abObj;
+      });
+
   auto queryObjects = jsi::Function::createFromHostFunction(
       rt,
       jsi::PropNameID::forAscii(rt, "queryEntriesObjects"),
@@ -280,6 +317,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
   jsi::Object ns(rt);
   ns.setProperty(rt, "queryEntriesBuffer", queryBuffer);
   ns.setProperty(rt, "queryEntriesSchemaBuffer", querySchemaBuffer);
+  ns.setProperty(rt, "queryEntriesSchemaBufferRange", querySchemaBufferRange);
   ns.setProperty(rt, "queryEntriesObjects", queryObjects);
   rt.global().setProperty(rt, "__reconcileEngine", ns);
   return true;
