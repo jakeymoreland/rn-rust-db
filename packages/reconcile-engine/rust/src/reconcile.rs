@@ -1,5 +1,5 @@
 use crate::error::EngineError;
-use crate::normalize::{NormalizeOutcome, SourceConfig};
+use crate::normalize::{CanonicalRecord, NormalizeOutcome, SourceConfig};
 use crate::store::Store;
 use rusqlite::params;
 use serde::Serialize;
@@ -19,6 +19,239 @@ struct FieldMeta {
     source: String,
     updated_at: i64,
     priority: u32,
+}
+
+#[derive(Clone)]
+struct ExistingRow {
+    fields_json: String,
+    meta_json: String,
+    updated_at: i64,
+    // v2 short-circuit columns; None on rows written before the migration.
+    content_hash: Option<i64>,
+    meta_floor_ts: Option<i64>,
+    meta_floor_pri: Option<i64>,
+}
+
+/// Compact on-disk form of field_meta. In almost every batch, all fields of a
+/// row share identical meta (they arrived together), so store one default
+/// plus per-field exceptions: ~60 B instead of ~1.2 KB of per-field JSON.
+/// Legacy rows (a plain field->meta map) fail this parse and fall back.
+#[derive(Serialize, serde::Deserialize)]
+struct CompactMeta {
+    v: u8,
+    d: FieldMeta,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    o: BTreeMap<String, FieldMeta>,
+}
+
+/// Parses either meta format into the expanded per-field map the merge logic
+/// operates on. Compact expansion covers the union of the row's field names
+/// and any override keys.
+fn parse_meta(
+    meta_json: &str,
+    fields: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, FieldMeta>, EngineError> {
+    if let Ok(c) = serde_json::from_str::<CompactMeta>(meta_json) {
+        let mut out: BTreeMap<String, FieldMeta> = BTreeMap::new();
+        for k in fields.keys() {
+            out.insert(k.clone(), c.d.clone());
+        }
+        for (k, m) in c.o {
+            out.insert(k, m);
+        }
+        return Ok(out);
+    }
+    serde_json::from_str(meta_json).map_err(|e| EngineError::Storage(e.to_string()))
+}
+
+/// Serializes the expanded meta map compactly: the modal (source, ts, pri)
+/// triple becomes the default; everything else is an override.
+fn serialize_meta_compact(meta: &BTreeMap<String, FieldMeta>) -> String {
+    let mut counts: HashMap<(&str, i64, u32), usize> = HashMap::new();
+    for m in meta.values() {
+        *counts.entry((m.source.as_str(), m.updated_at, m.priority)).or_default() += 1;
+    }
+    let Some((&(src, ts, pri), _)) = counts.iter().max_by_key(|(_, n)| **n) else {
+        return "{\"v\":2,\"d\":{\"source\":\"\",\"updated_at\":0,\"priority\":0}}".into();
+    };
+    let d = FieldMeta { source: src.to_string(), updated_at: ts, priority: pri };
+    let o: BTreeMap<String, FieldMeta> = meta
+        .iter()
+        .filter(|(_, m)| m.source != d.source || m.updated_at != d.updated_at || m.priority != d.priority)
+        .map(|(k, m)| (k.clone(), m.clone()))
+        .collect();
+    serde_json::to_string(&CompactMeta { v: 2, d, o }).unwrap()
+}
+
+/// Structural hash of the canonical fields map (BTreeMap order is stable), so
+/// content equality checks need no serialization.
+fn fields_hash(fields: &BTreeMap<String, String>) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (k, v) in fields {
+        k.hash(&mut h);
+        v.hash(&mut h);
+    }
+    h.finish() as i64
+}
+
+/// The weakest field meta: (min updated_at, min priority among fields at that
+/// updated_at). A record that cannot beat the floor cannot advance ANY field.
+fn meta_floor(meta: &BTreeMap<String, FieldMeta>) -> (i64, i64) {
+    let floor_ts = meta.values().map(|m| m.updated_at).min().unwrap_or(i64::MIN);
+    let floor_pri = meta
+        .values()
+        .filter(|m| m.updated_at == floor_ts)
+        .map(|m| m.priority as i64)
+        .min()
+        .unwrap_or(0);
+    (floor_ts, floor_pri)
+}
+
+struct WriteRow {
+    is_insert: bool,
+    fields_json: String,
+    meta_json: String,
+    updated_at: i64,
+    content_hash: i64,
+    floor_ts: i64,
+    floor_pri: i64,
+}
+
+struct GroupOutcome {
+    collection: String,
+    natural_key: String,
+    inserted: u32,
+    updated: u32,
+    unchanged: u32,
+    visibly_changed: bool,
+    write: Option<WriteRow>,
+}
+
+/// Folds all of one key's records into its final row state, entirely in RAM.
+/// The DB row is parsed at most once per group (and not at all when the hash
+/// short-circuit fires on the first record); the final state serializes once.
+fn merge_group(
+    cfg: &SourceConfig,
+    db_row: Option<ExistingRow>,
+    ((collection, natural_key), recs): ((String, String), Vec<CanonicalRecord>),
+) -> Result<GroupOutcome, EngineError> {
+    let was_insert = db_row.is_none();
+    let mut inserted = 0u32;
+    let mut updated = 0u32;
+    let mut unchanged = 0u32;
+    let mut visibly_changed = false;
+    let mut wrote = false;
+    // (fields, meta, row updated_at); None until inserted or parsed from db_row
+    let mut state: Option<(BTreeMap<String, String>, BTreeMap<String, FieldMeta>, i64)> = None;
+
+    for rec in recs {
+        if state.is_none() && db_row.is_none() {
+            let meta: BTreeMap<String, FieldMeta> = rec
+                .fields
+                .keys()
+                .map(|k| {
+                    (
+                        k.clone(),
+                        FieldMeta {
+                            source: rec.source.clone(),
+                            updated_at: rec.updated_at,
+                            priority: cfg.priority,
+                        },
+                    )
+                })
+                .collect();
+            state = Some((rec.fields, meta, rec.updated_at));
+            inserted += 1;
+            visibly_changed = true;
+            wrote = true;
+            continue;
+        }
+        if state.is_none() {
+            let row = db_row.as_ref().unwrap();
+            // Short-circuit (valid only against the pristine DB row):
+            // identical content AND the record cannot beat the meta floor
+            // means no field's value or meta could change — skip the parse.
+            if let (Some(h), Some(floor_ts), Some(floor_pri)) =
+                (row.content_hash, row.meta_floor_ts, row.meta_floor_pri)
+            {
+                let cannot_advance = rec.updated_at < floor_ts
+                    || (rec.updated_at == floor_ts && (cfg.priority as i64) <= floor_pri);
+                if cannot_advance && fields_hash(&rec.fields) == h {
+                    unchanged += 1;
+                    continue;
+                }
+            }
+            let fields: BTreeMap<String, String> = serde_json::from_str(&row.fields_json)
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+            let meta = parse_meta(&row.meta_json, &fields)?;
+            state = Some((fields, meta, row.updated_at));
+        }
+        let (fields, meta, row_ts) = state.as_mut().unwrap();
+        let mut dirty = false;
+        // `advanced` tracks whether any field won on (timestamp, priority) ordering,
+        // even if the winning value happens to equal the current value. Without this,
+        // a same-value win would never persist its newer FieldMeta, and a later,
+        // genuinely older-but-different value could incorrectly win against it.
+        let mut advanced = false;
+        for (k, v) in &rec.fields {
+            let wins = match meta.get(k) {
+                None => true,
+                Some(m) => {
+                    rec.updated_at > m.updated_at
+                        || (rec.updated_at == m.updated_at && cfg.priority > m.priority)
+                }
+            };
+            if wins {
+                advanced = true;
+                if fields.get(k) != Some(v) {
+                    fields.insert(k.clone(), v.clone());
+                    dirty = true;
+                }
+                meta.insert(
+                    k.clone(),
+                    FieldMeta {
+                        source: rec.source.clone(),
+                        updated_at: rec.updated_at,
+                        priority: cfg.priority,
+                    },
+                );
+            }
+        }
+        if advanced {
+            // Row-level updated_at must never move backward: a batch that only adds
+            // an older/new field to an already-newer row must not regress the row stamp.
+            *row_ts = (*row_ts).max(rec.updated_at);
+            wrote = true;
+            if dirty {
+                updated += 1;
+                visibly_changed = true;
+            } else {
+                // Advanced but same value: persisted for correctness (newer FieldMeta),
+                // but nothing visibly changed, so no pub/sub event for this collection.
+                unchanged += 1;
+            }
+        } else {
+            unchanged += 1;
+        }
+    }
+
+    let write = if wrote {
+        let (fields, meta, updated_at) = state.unwrap();
+        let (floor_ts, floor_pri) = meta_floor(&meta);
+        Some(WriteRow {
+            is_insert: was_insert,
+            fields_json: serde_json::to_string(&fields).unwrap(),
+            meta_json: serialize_meta_compact(&meta),
+            updated_at,
+            content_hash: fields_hash(&fields),
+            floor_ts,
+            floor_pri,
+        })
+    } else {
+        None
+    };
+    Ok(GroupOutcome { collection, natural_key, inserted, updated, unchanged, visibly_changed, write })
 }
 
 pub fn reconcile(
@@ -41,7 +274,7 @@ pub fn reconcile(
     // SELECT ... IN (...) per collection instead of one B-tree probe per
     // record. The map is written back after every merge so a batch containing
     // the same key twice still sees its own earlier writes.
-    let mut existing_map: HashMap<(String, String), (String, String, i64)> = HashMap::new();
+    let mut existing_map: HashMap<(String, String), ExistingRow> = HashMap::new();
     {
         let mut by_collection: HashMap<&str, Vec<&str>> = HashMap::new();
         for rec in &outcome.records {
@@ -54,8 +287,8 @@ pub fn reconcile(
             for chunk in keys.chunks(900) {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let sql = format!(
-                    "SELECT natural_key, fields, field_meta, updated_at FROM entries
-                     WHERE collection = ? AND natural_key IN ({placeholders})"
+                    "SELECT natural_key, fields, field_meta, updated_at, content_hash, meta_floor_ts, meta_floor_pri
+                     FROM entries WHERE collection = ? AND natural_key IN ({placeholders})"
                 );
                 let mut stmt = tx.prepare(&sql)?;
                 let mut rows = stmt.query(rusqlite::params_from_iter(
@@ -64,125 +297,85 @@ pub fn reconcile(
                 while let Some(row) = rows.next()? {
                     existing_map.insert(
                         (collection.to_string(), row.get::<_, String>(0)?),
-                        (row.get(1)?, row.get(2)?, row.get(3)?),
+                        ExistingRow {
+                            fields_json: row.get(1)?,
+                            meta_json: row.get(2)?,
+                            updated_at: row.get(3)?,
+                            content_hash: row.get(4)?,
+                            meta_floor_ts: row.get(5)?,
+                            meta_floor_pri: row.get(6)?,
+                        },
                     );
                 }
             }
         }
     }
 
-    // Prepared once per batch (and cached on the connection across batches);
-    // re-preparing these inside the per-record loop dominated bulk-ingest time.
-    {
-    let mut ins_stmt = tx.prepare_cached(
-        "INSERT INTO entries(collection, natural_key, fields, field_meta, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-    )?;
-    let mut upd_stmt = tx.prepare_cached(
-        "UPDATE entries SET fields = ?3, field_meta = ?4, updated_at = ?5
-         WHERE collection = ?1 AND natural_key = ?2",
-    )?;
-
+    // Group records by key (first-occurrence order, duplicates folded
+    // sequentially inside their group), then merge groups in RAM — in
+    // parallel for large batches, since each group owns its key exclusively
+    // and the prefetch map is read-only from here.
+    let mut group_index: HashMap<(String, String), usize> = HashMap::new();
+    let mut groups: Vec<((String, String), Vec<CanonicalRecord>)> = Vec::new();
     for rec in outcome.records {
-        let map_key = (rec.collection.clone(), rec.natural_key.clone());
-        let existing: Option<(String, String, i64)> = existing_map.get(&map_key).cloned();
-
-        match existing {
+        let key = (rec.collection.clone(), rec.natural_key.clone());
+        match group_index.get(&key) {
+            Some(&i) => groups[i].1.push(rec),
             None => {
-                let meta: BTreeMap<String, FieldMeta> = rec
-                    .fields
-                    .keys()
-                    .map(|k| {
-                        (
-                            k.clone(),
-                            FieldMeta {
-                                source: rec.source.clone(),
-                                updated_at: rec.updated_at,
-                                priority: cfg.priority,
-                            },
-                        )
-                    })
-                    .collect();
-                let fields_json = serde_json::to_string(&rec.fields).unwrap();
-                let meta_json = serde_json::to_string(&meta).unwrap();
-                ins_stmt.execute(params![
-                    rec.collection,
-                    rec.natural_key,
-                    fields_json,
-                    meta_json,
-                    rec.updated_at
-                ])?;
-                existing_map.insert(map_key, (fields_json, meta_json, rec.updated_at));
-                summary.inserted += 1;
-                changed_collections.push(rec.collection.clone());
-            }
-            Some((fields_json, meta_json, existing_updated_at)) => {
-                let mut fields: BTreeMap<String, String> =
-                    serde_json::from_str(&fields_json)
-                        .map_err(|e| EngineError::Storage(e.to_string()))?;
-                let mut meta: BTreeMap<String, FieldMeta> =
-                    serde_json::from_str(&meta_json)
-                        .map_err(|e| EngineError::Storage(e.to_string()))?;
-                let mut dirty = false;
-                // `advanced` tracks whether any field won on (timestamp, priority) ordering,
-                // even if the winning value happens to equal the current value. Without this,
-                // a same-value win would never persist its newer FieldMeta, and a later,
-                // genuinely older-but-different value could incorrectly win against it.
-                let mut advanced = false;
-                for (k, v) in &rec.fields {
-                    let wins = match meta.get(k) {
-                        None => true,
-                        Some(m) => {
-                            rec.updated_at > m.updated_at
-                                || (rec.updated_at == m.updated_at && cfg.priority > m.priority)
-                        }
-                    };
-                    if wins {
-                        advanced = true;
-                        if fields.get(k) != Some(v) {
-                            fields.insert(k.clone(), v.clone());
-                            dirty = true;
-                        }
-                        meta.insert(
-                            k.clone(),
-                            FieldMeta {
-                                source: rec.source.clone(),
-                                updated_at: rec.updated_at,
-                                priority: cfg.priority,
-                            },
-                        );
-                    }
-                }
-                if advanced {
-                    // Row-level updated_at must never move backward: a batch that only adds
-                    // an older/new field to an already-newer row must not regress the row stamp.
-                    let new_updated_at = existing_updated_at.max(rec.updated_at);
-                    let fields_json = serde_json::to_string(&fields).unwrap();
-                    let meta_json = serde_json::to_string(&meta).unwrap();
-                    upd_stmt.execute(params![
-                        rec.collection,
-                        rec.natural_key,
-                        fields_json,
-                        meta_json,
-                        new_updated_at
-                    ])?;
-                    existing_map.insert(map_key, (fields_json, meta_json, new_updated_at));
-                    if dirty {
-                        summary.updated += 1;
-                        changed_collections.push(rec.collection.clone());
-                    } else {
-                        // Advanced but same value: persisted for correctness (newer FieldMeta),
-                        // but nothing visibly changed, so no pub/sub event for this collection.
-                        summary.unchanged += 1;
-                    }
-                } else {
-                    summary.unchanged += 1;
-                }
+                group_index.insert(key.clone(), groups.len());
+                groups.push((key, vec![rec]));
             }
         }
     }
 
-    } // statements drop here so tx can commit
+    const PARALLEL_THRESHOLD: usize = 128;
+    let outcomes: Vec<Result<GroupOutcome, EngineError>> = if groups.len() >= PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        groups
+            .into_par_iter()
+            .map(|g| merge_group(cfg, existing_map.get(&g.0).cloned(), g))
+            .collect()
+    } else {
+        groups
+            .into_iter()
+            .map(|g| merge_group(cfg, existing_map.get(&g.0).cloned(), g))
+            .collect()
+    };
+
+    // Sequential write pass: one prepared INSERT or UPDATE per group that
+    // actually changed (a group merged N times still writes once).
+    {
+        let mut ins_stmt = tx.prepare_cached(
+            "INSERT INTO entries(collection, natural_key, fields, field_meta, updated_at, content_hash, meta_floor_ts, meta_floor_pri)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        let mut upd_stmt = tx.prepare_cached(
+            "UPDATE entries SET fields = ?3, field_meta = ?4, updated_at = ?5, content_hash = ?6, meta_floor_ts = ?7, meta_floor_pri = ?8
+             WHERE collection = ?1 AND natural_key = ?2",
+        )?;
+        for oc in outcomes {
+            let oc = oc?;
+            summary.inserted += oc.inserted;
+            summary.updated += oc.updated;
+            summary.unchanged += oc.unchanged;
+            if oc.visibly_changed {
+                changed_collections.push(oc.collection.clone());
+            }
+            if let Some(w) = oc.write {
+                let stmt = if w.is_insert { &mut ins_stmt } else { &mut upd_stmt };
+                stmt.execute(params![
+                    oc.collection,
+                    oc.natural_key,
+                    w.fields_json,
+                    w.meta_json,
+                    w.updated_at,
+                    w.content_hash,
+                    w.floor_ts,
+                    w.floor_pri
+                ])?;
+            }
+        }
+    }
 
     for (fragment, error) in outcome.rejects {
         tx.execute(
@@ -238,6 +431,91 @@ mod tests {
 
     fn outcome(records: Vec<CanonicalRecord>) -> NormalizeOutcome {
         NormalizeOutcome { records, rejects: vec![] }
+    }
+
+    #[test]
+    fn large_batches_take_the_parallel_path() {
+        let mut st = Store::open(":memory:").unwrap();
+        // 300 groups > PARALLEL_THRESHOLD — insert wave, then an update wave
+        let inserts: Vec<CanonicalRecord> =
+            (0..300).map(|i| rec("api", &format!("u{i}@x.com"), "name", "A", 100)).collect();
+        let s = reconcile(&mut st, &cfg("api", 10), outcome(inserts), 0).unwrap();
+        assert_eq!(s.inserted, 300);
+        let updates: Vec<CanonicalRecord> = (0..300)
+            .map(|i| rec("api", &format!("u{i}@x.com"), "name", if i % 2 == 0 { "B" } else { "A" }, 200))
+            .collect();
+        let s = reconcile(&mut st, &cfg("api", 10), outcome(updates), 0).unwrap();
+        assert_eq!(s.updated, 150);
+        assert_eq!(s.unchanged, 150); // same value, newer ts: advanced-not-dirty
+        let n: i64 = st
+            .conn
+            .query_row("SELECT count(*) FROM entries WHERE fields LIKE '%\"B\"%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 150);
+    }
+
+    #[test]
+    fn legacy_meta_rows_still_merge() {
+        let mut st = Store::open(":memory:").unwrap();
+        // simulate a pre-migration row: legacy map-format meta, NULL v2 columns
+        st.conn
+            .execute(
+                "INSERT INTO entries(collection, natural_key, fields, field_meta, updated_at)
+                 VALUES ('people', 'old@x.com',
+                         '{\"email\":\"old@x.com\",\"name\":\"Old\"}',
+                         '{\"email\":{\"source\":\"api\",\"updated_at\":50,\"priority\":10},\"name\":{\"source\":\"api\",\"updated_at\":50,\"priority\":10}}',
+                         50)",
+                [],
+            )
+            .unwrap();
+        // newer value must win over the legacy row (no short-circuit possible:
+        // hash columns are NULL)
+        let s = reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "old@x.com", "name", "New", 100)]), 0).unwrap();
+        assert_eq!(s.updated, 1);
+        let (fields, meta): (String, String) = st
+            .conn
+            .query_row(
+                "SELECT fields, field_meta FROM entries WHERE natural_key='old@x.com'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(fields.contains("New"), "{fields}");
+        // rewritten in compact format with backfilled hash columns
+        assert!(meta.contains("\"v\":2"), "{meta}");
+        let hash: Option<i64> = st
+            .conn
+            .query_row("SELECT content_hash FROM entries WHERE natural_key='old@x.com'", [], |r| r.get(0))
+            .unwrap();
+        assert!(hash.is_some());
+    }
+
+    #[test]
+    fn hash_short_circuit_never_blocks_meta_advance() {
+        let mut st = Store::open(":memory:").unwrap();
+        // source A (pri 10) writes the value at ts 100
+        reconcile(&mut st, &cfg("a", 10), outcome(vec![rec("a", "k@x.com", "name", "Ann", 100)]), 0).unwrap();
+        // identical content, same ts, LOWER priority: short-circuit is sound (cannot advance)
+        let s = reconcile(&mut st, &cfg("low", 5), outcome(vec![rec("low", "k@x.com", "name", "Ann", 100)]), 0).unwrap();
+        assert_eq!(s.unchanged, 1);
+        // identical content, same ts, HIGHER priority: must take the full path
+        // and persist the newer meta (source b, pri 20), even though nothing
+        // visibly changed
+        let s = reconcile(&mut st, &cfg("b", 20), outcome(vec![rec("b", "k@x.com", "name", "Ann", 100)]), 0).unwrap();
+        assert_eq!(s.unchanged, 1);
+        let meta: String = st
+            .conn
+            .query_row("SELECT field_meta FROM entries WHERE natural_key='k@x.com'", [], |r| r.get(0))
+            .unwrap();
+        assert!(meta.contains("\"b\""), "meta advance was skipped: {meta}");
+        // now a same-ts pri-15 DIFFERENT value must lose against pri-20 meta
+        let s = reconcile(&mut st, &cfg("c", 15), outcome(vec![rec("c", "k@x.com", "name", "Evil", 100)]), 0).unwrap();
+        assert_eq!(s.updated, 0);
+        let fields: String = st
+            .conn
+            .query_row("SELECT fields FROM entries WHERE natural_key='k@x.com'", [], |r| r.get(0))
+            .unwrap();
+        assert!(fields.contains("Ann"), "lower-priority value overwrote: {fields}");
     }
 
     #[test]

@@ -17,6 +17,7 @@ export const mockNative = {
   close: jest.fn(),
   execute: jest.fn(),
   executeSync: jest.fn(),
+  ingestDirect: jest.fn(),
   installFastPath: jest.fn(() => true),
   // Matches the real TurboModule's runtime shape: `onChange` is itself a
   // callable subscribe function (`onChange(listener) => { remove() }`),

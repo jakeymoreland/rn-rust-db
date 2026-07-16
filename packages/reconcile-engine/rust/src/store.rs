@@ -44,6 +44,18 @@ CREATE TABLE IF NOT EXISTS dead_letter (
 PRAGMA user_version = 1;
 ";
 
+// v2: per-row content hash + meta floor for the reconcile short-circuit.
+// content_hash is a structural hash of the fields map; meta_floor_ts /
+// meta_floor_pri describe the weakest field meta (min updated_at, and min
+// priority among fields at that updated_at) so "could this record advance any
+// field's meta?" is answerable without parsing field_meta.
+const SCHEMA_V2_MIGRATION: &str = "
+ALTER TABLE entries ADD COLUMN content_hash INTEGER;
+ALTER TABLE entries ADD COLUMN meta_floor_ts INTEGER;
+ALTER TABLE entries ADD COLUMN meta_floor_pri INTEGER;
+PRAGMA user_version = 2;
+";
+
 impl Store {
     pub fn open(path: &str) -> Result<Store, EngineError> {
         let conn = Connection::open(path)?;
@@ -58,8 +70,18 @@ impl Store {
                 "PRAGMA synchronous = NORMAL;
                  PRAGMA temp_store = MEMORY;",
             )?;
+            // Default autocheckpoint (1000 pages = 4 MB) fires mid-benchmark on
+            // multi-MB batches, adding run-to-run variance. Checkpoint less
+            // often; close runs an explicit truncating checkpoint.
+            let _: i64 = conn.query_row("PRAGMA wal_autocheckpoint = 8000", [], |r| r.get(0))?;
         }
-        conn.execute_batch(SCHEMA_V1)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version == 0 {
+            conn.execute_batch(SCHEMA_V1)?;
+        }
+        if version <= 1 {
+            conn.execute_batch(SCHEMA_V2_MIGRATION)?;
+        }
         Ok(Store { conn })
     }
 
@@ -85,7 +107,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 6);
-        assert_eq!(store.user_version().unwrap(), 1);
+        assert_eq!(store.user_version().unwrap(), 2);
+        // v2 columns exist
+        let cols: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('entries')
+                 WHERE name IN ('content_hash','meta_floor_ts','meta_floor_pri')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 3);
     }
 
     #[test]

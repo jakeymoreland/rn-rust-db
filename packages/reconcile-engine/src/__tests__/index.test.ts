@@ -30,11 +30,12 @@ test('error envelope becomes typed Error', async () => {
   await expect(redis.get('a')).rejects.toMatchObject({ code: 4 });
 });
 
-test('ingest parses BatchSummary', async () => {
-  mockNative.execute.mockResolvedValue(
+test('ingest parses BatchSummary via the direct method', async () => {
+  mockNative.ingestDirect.mockResolvedValue(
     okResp({ inserted: 2, updated: 0, unchanged: 0, dead_lettered: 1, collections: ['people'], skipped: false }),
   );
   const s = await ingest('api', '[...]');
+  expect(mockNative.ingestDirect).toHaveBeenCalledWith('api', '[...]');
   expect(s.inserted).toBe(2);
   expect(s.collections).toEqual(['people']);
 });

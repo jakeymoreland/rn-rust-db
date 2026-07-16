@@ -153,6 +153,78 @@ pub extern "C" fn engine_query_entries_bin(
     ptr
 }
 
+/// Ingest without the JSON command envelope: source id and payload cross as
+/// plain strings instead of being escaped into a request envelope and parsed
+/// twice. Response envelope matches engine_execute's ingest exactly.
+#[no_mangle]
+pub extern "C" fn engine_ingest_direct(
+    handle: *mut c_void,
+    source_id: *const c_char,
+    payload: *const c_char,
+) -> *mut c_char {
+    if handle.is_null() {
+        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null engine handle\"}".into());
+    }
+    let ffi = unsafe { &*(handle as *mut EngineFfi) };
+    let (Some(source_id), Some(payload)) = (unsafe { cstr(source_id) }, unsafe { cstr(payload) }) else {
+        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null argument\"}".into());
+    };
+    let mut engine = ffi.inner.lock().unwrap();
+    match engine.ingest(source_id, payload) {
+        Ok((summary, skipped)) => {
+            let mut v = serde_json::to_value(&summary).unwrap();
+            v["skipped"] = serde_json::json!(skipped);
+            to_c_string(serde_json::json!({"ok": true, "value": v}).to_string())
+        }
+        Err(e) => to_c_string(
+            serde_json::json!({"ok": false, "code": e.code(), "message": e.to_string()}).to_string(),
+        ),
+    }
+}
+
+/// Fast-path kv get: returns the value (free with engine_free_string) or NULL
+/// when the key is missing or on error (see engine_last_error).
+#[no_mangle]
+pub extern "C" fn engine_kv_get(handle: *mut c_void, key: *const c_char) -> *mut c_char {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ffi = unsafe { &*(handle as *mut EngineFfi) };
+    let Some(key) = (unsafe { cstr(key) }) else {
+        return std::ptr::null_mut();
+    };
+    let mut engine = ffi.inner.lock().unwrap();
+    let now = engine.now();
+    match crate::commands::get(&mut engine, key, now) {
+        Ok(Some(v)) => to_c_string(v),
+        Ok(None) => std::ptr::null_mut(),
+        Err(e) => {
+            set_last_error(e.code(), &e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Fast-path kv set: returns true on success; on failure sets engine_last_error.
+#[no_mangle]
+pub extern "C" fn engine_kv_set(handle: *mut c_void, key: *const c_char, value: *const c_char) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    let ffi = unsafe { &*(handle as *mut EngineFfi) };
+    let (Some(key), Some(value)) = (unsafe { cstr(key) }, unsafe { cstr(value) }) else {
+        return false;
+    };
+    let mut engine = ffi.inner.lock().unwrap();
+    match crate::commands::set(&mut engine, key, value) {
+        Ok(()) => true,
+        Err(e) => {
+            set_last_error(e.code(), &e.to_string());
+            false
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn engine_query_entries_schema_bin_range(
     handle: *mut c_void,
@@ -312,6 +384,11 @@ pub extern "C" fn engine_close(handle: *mut c_void) {
         }
         if let Ok(mut engine) = ffi.inner.lock() {
             let _ = engine.flush_kv(); // final flush so no pending set is lost
+            // fold the WAL back into the main DB so the next open starts clean
+            let _ = engine
+                .store
+                .conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         }
         drop(ffi);
     }
@@ -466,6 +543,37 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts(p, len) }.to_vec();
         engine_free_bytes(p, len);
         assert_eq!(&bytes[0..4], &1u32.to_le_bytes());
+        engine_close(h);
+    }
+
+    #[test]
+    fn ingest_direct_matches_envelope_semantics() {
+        let path = CString::new(":memory:").unwrap();
+        let h = engine_open(path.as_ptr());
+        let reg = CString::new(
+            r#"{"cmd":"registerSource","args":["{\"source_id\":\"api\",\"format\":\"Json\",\"collection\":\"people\",\"natural_key_field\":\"email\",\"timestamp_field\":null,\"priority\":10}"]}"#,
+        )
+        .unwrap();
+        engine_free_string(engine_execute(h, reg.as_ptr()));
+
+        let src = CString::new("api").unwrap();
+        let payload = CString::new(r#"[{"email":"a@x.com","name":"Ann"}]"#).unwrap();
+        let r = engine_ingest_direct(h, src.as_ptr(), payload.as_ptr());
+        let resp = unsafe { CStr::from_ptr(r) }.to_str().unwrap().to_string();
+        engine_free_string(r);
+        assert!(resp.contains("\"ok\":true"), "{resp}");
+        assert!(resp.contains("\"inserted\":1"), "{resp}");
+        // identical re-ingest hits the payload-hash skip, same as execute path
+        let r2 = engine_ingest_direct(h, src.as_ptr(), payload.as_ptr());
+        let resp2 = unsafe { CStr::from_ptr(r2) }.to_str().unwrap().to_string();
+        engine_free_string(r2);
+        assert!(resp2.contains("\"skipped\":true"), "{resp2}");
+        // unknown source -> error envelope, same shape as dispatch
+        let bad = CString::new("nope").unwrap();
+        let r3 = engine_ingest_direct(h, bad.as_ptr(), payload.as_ptr());
+        let resp3 = unsafe { CStr::from_ptr(r3) }.to_str().unwrap().to_string();
+        engine_free_string(r3);
+        assert!(resp3.contains("\"ok\":false"), "{resp3}");
         engine_close(h);
     }
 

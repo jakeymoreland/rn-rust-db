@@ -28,7 +28,7 @@ export const INDUSTRY_REFS: IndustryRef[] = [
     refLoMs: 0.002,
     refHiMs: 0.003,
     unit: 'ms/op',
-    caveat: 'reference is a pure in-process hashmap; ours persists through SQLite',
+    caveat: 'ours is memory-first with SQLite write-behind, via dedicated JSI host functions',
   },
   {
     key: 'kvRead',
@@ -37,7 +37,7 @@ export const INDUSTRY_REFS: IndustryRef[] = [
     refLoMs: 0.002,
     refHiMs: 0.002,
     unit: 'ms/op',
-    caveat: 'reference is a pure in-process hashmap; ours reads through SQLite',
+    caveat: 'ours reads the in-memory cache (SQLite only on cold miss)',
   },
   {
     key: 'parse1mb',

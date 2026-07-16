@@ -51,16 +51,17 @@ export async function runIndustry(onProgress: (msg: string) => void): Promise<In
     done('jsiRoundtrip', (performance.now() - t0) / 1000);
   }
 
-  onProgress('redis-style set/get (500 sync ops each)...');
+  onProgress('redis-style set/get (500 sync fast-path ops each)...');
   {
+    // dedicated JSI host functions — no JSON command envelope
     const t0 = performance.now();
     for (let i = 0; i < 500; i++) {
-      executeRawSync(JSON.stringify({ cmd: 'set', args: [`industry:kv:${i % 50}`, `v${i}`] }));
+      fastPath().kvSet(`industry:kv:${i % 50}`, `v${i}`);
     }
     done('kvWrite', (performance.now() - t0) / 500);
     const t1 = performance.now();
     for (let i = 0; i < 500; i++) {
-      executeRawSync(JSON.stringify({ cmd: 'get', args: [`industry:kv:${i % 50}`] }));
+      fastPath().kvGet(`industry:kv:${i % 50}`);
     }
     done('kvRead', (performance.now() - t1) / 500);
   }

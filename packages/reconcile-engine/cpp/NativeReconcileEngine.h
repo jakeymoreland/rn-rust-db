@@ -36,6 +36,7 @@ class NativeReconcileEngine
   void open(jsi::Runtime& rt, std::string path);
   void close(jsi::Runtime& rt);
   AsyncPromise<std::string> execute(jsi::Runtime& rt, std::string requestJson);
+  AsyncPromise<std::string> ingestDirect(jsi::Runtime& rt, std::string sourceId, std::string payload);
   // executeSync blocks the calling (JS) thread for the duration of the
   // engine call: it takes engineMutex_ directly on the caller's thread
   // instead of handing the work to the worker thread. If the worker is

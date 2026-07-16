@@ -61,7 +61,9 @@ export function registerSource(cfg: SourceConfig): Promise<void> {
 }
 
 export function ingest(sourceId: string, payload: string): Promise<BatchSummary> {
-  return call<BatchSummary>('ingest', [sourceId, payload]);
+  // Direct method: the payload crosses the boundary as a plain string instead
+  // of being JSON-escaped into a command envelope and parsed twice.
+  return NativeReconcileEngine.ingestDirect(sourceId, payload).then(unwrap<BatchSummary>);
 }
 
 export function ingestFile(sourceId: string, path: string): Promise<BatchSummary> {

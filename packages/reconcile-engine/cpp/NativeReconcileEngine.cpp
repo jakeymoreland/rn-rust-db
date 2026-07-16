@@ -153,6 +153,23 @@ AsyncPromise<std::string> NativeReconcileEngine::execute(jsi::Runtime& rt, std::
   return promise;
 }
 
+AsyncPromise<std::string> NativeReconcileEngine::ingestDirect(
+    jsi::Runtime& rt,
+    std::string sourceId,
+    std::string payload) {
+  auto promise = AsyncPromise<std::string>(rt, jsInvoker_);
+  post([this, promise, sourceId = std::move(sourceId), payload = std::move(payload)]() mutable {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    if (engine_ == nullptr) {
+      promise.reject("engine not open");
+      return;
+    }
+    char* resp = engine_ingest_direct(engine_, sourceId.c_str(), payload.c_str());
+    promise.resolve(takeRustString(resp));
+  });
+  return promise;
+}
+
 std::string NativeReconcileEngine::executeSync(jsi::Runtime& rt, std::string requestJson) {
   std::lock_guard<std::mutex> lock(engineMutex_);
   if (engine_ == nullptr) {
@@ -255,6 +272,61 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         return jsi::ArrayBuffer(rt, std::make_shared<RustOwnedBuffer>(data, len));
       });
 
+  auto kvGet = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "kvGet"),
+      1,
+      [weak](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        auto strong = weak.lock();
+        if (!strong) {
+          throw jsi::JSError(rt, "reconcile engine module destroyed");
+        }
+        if (count < 1 || !args[0].isString()) {
+          throw jsi::JSError(rt, "kvGet(key: string)");
+        }
+        std::string key = args[0].asString(rt).utf8(rt);
+        char* value = nullptr;
+        {
+          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          if (strong->engine_ == nullptr) {
+            throw jsi::JSError(rt, "engine not open");
+          }
+          value = engine_kv_get(strong->engine_, key.c_str());
+        }
+        if (value == nullptr) {
+          return jsi::Value::undefined();
+        }
+        return jsi::String::createFromUtf8(rt, takeRustString(value));
+      });
+
+  auto kvSet = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "kvSet"),
+      2,
+      [weak](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        auto strong = weak.lock();
+        if (!strong) {
+          throw jsi::JSError(rt, "reconcile engine module destroyed");
+        }
+        if (count < 2 || !args[0].isString() || !args[1].isString()) {
+          throw jsi::JSError(rt, "kvSet(key: string, value: string)");
+        }
+        std::string key = args[0].asString(rt).utf8(rt);
+        std::string value = args[1].asString(rt).utf8(rt);
+        bool ok = false;
+        {
+          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          if (strong->engine_ == nullptr) {
+            throw jsi::JSError(rt, "engine not open");
+          }
+          ok = engine_kv_set(strong->engine_, key.c_str(), value.c_str());
+        }
+        if (!ok) {
+          throw jsi::JSError(rt, "kvSet failed: " + takeRustString(engine_last_error()));
+        }
+        return jsi::Value(true);
+      });
+
   auto queryObjects = jsi::Function::createFromHostFunction(
       rt,
       jsi::PropNameID::forAscii(rt, "queryEntriesObjects"),
@@ -328,6 +400,8 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
   ns.setProperty(rt, "queryEntriesSchemaBuffer", querySchemaBuffer);
   ns.setProperty(rt, "queryEntriesSchemaBufferRange", querySchemaBufferRange);
   ns.setProperty(rt, "queryEntriesObjects", queryObjects);
+  ns.setProperty(rt, "kvGet", kvGet);
+  ns.setProperty(rt, "kvSet", kvSet);
   rt.global().setProperty(rt, "__reconcileEngine", ns);
   return true;
 }

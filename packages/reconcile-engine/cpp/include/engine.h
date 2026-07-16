@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -34,6 +35,15 @@ unsigned char* engine_query_entries_bin(engine_handle_t engine, const char* coll
  * comma-separated field list. Free with engine_free_bytes.
  */
 unsigned char* engine_query_entries_schema_bin(engine_handle_t engine, const char* collection, const char* fields_csv, size_t* out_len);
+
+/* Ingest without the JSON command envelope. Returns the same response envelope JSON as engine_execute's ingest. Free with engine_free_string. */
+char* engine_ingest_direct(engine_handle_t engine, const char* source_id, const char* payload);
+
+/* Fast-path kv get: returns the value (free with engine_free_string) or NULL when missing/error. */
+char* engine_kv_get(engine_handle_t engine, const char* key);
+
+/* Fast-path kv set: returns true on success (memory-first write-behind; see engine docs). */
+bool engine_kv_set(engine_handle_t engine, const char* key, const char* value);
 
 /* Windowed variant of engine_query_entries_schema_bin: rows [offset, offset+limit) ordered by natural_key. limit must be > 0, offset >= 0. */
 unsigned char* engine_query_entries_schema_bin_range(engine_handle_t engine, const char* collection, const char* fields_csv, long long limit, long long offset, size_t* out_len);

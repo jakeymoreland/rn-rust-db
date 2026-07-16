@@ -5,6 +5,8 @@ export type FastPath = {
   queryEntriesSchemaBuffer(collection: string, fieldsCsv: string): ArrayBuffer;
   queryEntriesSchemaBufferRange(collection: string, fieldsCsv: string, limit: number, offset: number): ArrayBuffer;
   queryEntriesObjects(collection: string): Array<{ key: string; fields: Record<string, string> }>;
+  kvGet(key: string): string | undefined;
+  kvSet(key: string, value: string): boolean;
 };
 
 export function fastPath(): FastPath {
