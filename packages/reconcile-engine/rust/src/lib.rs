@@ -7,3 +7,5 @@ pub mod reconcile;
 pub mod pubsub;
 pub mod engine;
 pub mod dispatch;
+pub mod ffi;
+pub mod binenc;
