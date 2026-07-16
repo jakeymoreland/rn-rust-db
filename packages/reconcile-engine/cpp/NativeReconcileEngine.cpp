@@ -1,5 +1,6 @@
 #include "NativeReconcileEngine.h"
 
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -54,6 +55,14 @@ void NativeReconcileEngine::workerLoop() {
 }
 
 void NativeReconcileEngine::post(std::function<void()> task) {
+  // Queued tasks below capture raw `this` (see execute()/open()/close()
+  // implementations that route through post()). That is safe: the
+  // destructor sets stopping_, wakes the worker, and join()s it before
+  // engineMutex_/engine_ are torn down, so no queued task can run — and no
+  // new task can start running — after `this` becomes invalid. Unlike
+  // eventTrampoline's deferred jsInvoker_->invokeAsync callback or the
+  // installFastPath host functions stashed on global.__reconcileEngine,
+  // nothing here can outlive the object.
   {
     std::lock_guard<std::mutex> lock(queueMutex_);
     queue_.push(std::move(task));
@@ -65,8 +74,11 @@ void NativeReconcileEngine::eventTrampoline(void* ctx, const char* channel, cons
   auto* self = static_cast<NativeReconcileEngine*>(ctx);
   std::string ch(channel != nullptr ? channel : "");
   std::string pl(payload != nullptr ? payload : "");
-  self->jsInvoker_->invokeAsync([self, ch, pl]() {
-    self->emitOnChange({ch, pl});
+  auto weak = self->weak_from_this();
+  self->jsInvoker_->invokeAsync([weak, ch, pl]() {
+    if (auto strong = weak.lock()) {
+      strong->emitOnChange({ch, pl});
+    }
   });
 }
 
@@ -114,11 +126,16 @@ std::string NativeReconcileEngine::executeSync(jsi::Runtime& rt, std::string req
 }
 
 bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
+  std::weak_ptr<NativeReconcileEngine> weak = weak_from_this();
   auto queryBuffer = jsi::Function::createFromHostFunction(
       rt,
       jsi::PropNameID::forAscii(rt, "queryEntriesBuffer"),
       1,
-      [this](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+      [weak](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        auto strong = weak.lock();
+        if (!strong) {
+          throw jsi::JSError(rt, "reconcile engine module destroyed");
+        }
         if (count < 1 || !args[0].isString()) {
           throw jsi::JSError(rt, "queryEntriesBuffer(collection: string)");
         }
@@ -126,11 +143,11 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         size_t len = 0;
         unsigned char* data = nullptr;
         {
-          std::lock_guard<std::mutex> lock(engineMutex_);
-          if (engine_ == nullptr) {
+          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          if (strong->engine_ == nullptr) {
             throw jsi::JSError(rt, "engine not open");
           }
-          data = engine_query_entries_bin(engine_, collection.c_str(), &len);
+          data = engine_query_entries_bin(strong->engine_, collection.c_str(), &len);
         }
         if (data == nullptr) {
           throw jsi::JSError(rt, "queryEntriesBuffer failed: " + takeRustString(engine_last_error()));
@@ -147,7 +164,11 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
       rt,
       jsi::PropNameID::forAscii(rt, "queryEntriesObjects"),
       1,
-      [this](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+      [weak](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        auto strong = weak.lock();
+        if (!strong) {
+          throw jsi::JSError(rt, "reconcile engine module destroyed");
+        }
         if (count < 1 || !args[0].isString()) {
           throw jsi::JSError(rt, "queryEntriesObjects(collection: string)");
         }
@@ -155,17 +176,20 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         size_t len = 0;
         unsigned char* data = nullptr;
         {
-          std::lock_guard<std::mutex> lock(engineMutex_);
-          if (engine_ == nullptr) {
+          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          if (strong->engine_ == nullptr) {
             throw jsi::JSError(rt, "engine not open");
           }
-          data = engine_query_entries_bin(engine_, collection.c_str(), &len);
+          data = engine_query_entries_bin(strong->engine_, collection.c_str(), &len);
         }
         if (data == nullptr) {
           throw jsi::JSError(rt, "queryEntriesObjects failed: " + takeRustString(engine_last_error()));
         }
         // Decode: LE [u32 count]([u32 klen][key][u32 jlen][json])*
         auto readU32 = [&](size_t off) -> uint32_t {
+          if (off + 4 > len) {
+            throw jsi::JSError(rt, "corrupt entry buffer");
+          }
           uint32_t v;
           std::memcpy(&v, data + off, 4);
           return v;
@@ -179,8 +203,14 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
             .getPropertyAsFunction(rt, "parse");
         for (uint32_t i = 0; i < rows; i++) {
           uint32_t klen = readU32(off); off += 4;
+          if (off + klen > len) {
+            throw jsi::JSError(rt, "corrupt entry buffer");
+          }
           std::string key(reinterpret_cast<char*>(data + off), klen); off += klen;
           uint32_t jlen = readU32(off); off += 4;
+          if (off + jlen > len) {
+            throw jsi::JSError(rt, "corrupt entry buffer");
+          }
           std::string json(reinterpret_cast<char*>(data + off), jlen); off += jlen;
           jsi::Object row(rt);
           row.setProperty(rt, "key", jsi::String::createFromUtf8(rt, key));
