@@ -195,6 +195,26 @@ the timers:
    rows. LTO must stay off (bitcode-in-staticlib breaks Apple's linker; see
    Cargo.toml note).
 
+## Real-app list result (2026-07-17, iPhone 16 Pro dev build)
+
+LegendList backed by one zero-copy buffer with lazy row materialization
+(only visible rows ever become JS objects), rAF scrolling at 500 px/s,
+10-row live updates every 200 ms re-queried through the same path:
+
+- cold hydrate, 10k rows -> painted: **23.8 ms** (median of 5). The RxDB
+  offline-DB suite reports 304–1288 ms for "first full render with many
+  messages" in-browser.
+- idle scroll 5 s: 59.8 fps, 3/300 dropped, worst gap 46 ms.
+- scroll + live ticks 10 s: 59.7 fps, **33/608 dropped (5.4%)**, worst 71 ms.
+- tick -> row painted: **14.5 ms median, p95 15.3 ms** (47 waves) — vs the
+  suite's best-in-class 4–18 ms measured in-browser on small datasets.
+
+The data-binding tier ladder on identical load, all measured on this device:
+naive full re-query/re-render ≈ 80% dropped frames; patched row updates in
+band; lazy zero-copy backing ≈ 5% dropped while scrolling with live data.
+Frame drops were never inherent to data volume — they are a property of the
+binding tier, and the engine makes the top tier cheap.
+
 ## Observations
 
 1. **Call overhead is negligible and sync beats async everywhere.** A no-op
