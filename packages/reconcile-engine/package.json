@@ -1,0 +1,22 @@
+{
+  "name": "@rn-experiments/reconcile-engine",
+  "version": "0.1.0",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "jest"
+  },
+  "peerDependencies": {
+    "react-native": "*"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.4.0"
+  },
+  "codegenConfig": {
+    "name": "ReconcileEngineSpec",
+    "type": "modules",
+    "jsSrcsDir": "src"
+  }
+}
