@@ -63,5 +63,22 @@ target 'sandbox' do
       :mac_catalyst_enabled => false,
       :ccache_enabled => ccache_enabled?(podfile_properties),
     )
+
+    # RN codegen only lists the APP's codegenConfig spec files as inputs to the
+    # ReactCodegen 'Generate Specs' phase; this app has none, so the phase gets
+    # no inputs and Xcode never re-runs it when the LIBRARY's spec changes —
+    # leaving stale codegen (a new spec method compiles but is missing from the
+    # method map at runtime). Point it at the library spec file explicitly.
+    # A narrow file input cannot recreate the old EXConstants dependency cycle
+    # (that needed a directory-tree input covering script outputs).
+    installer.pods_project.targets.each do |target|
+      next unless target.name == 'ReactCodegen'
+      target.build_phases.each do |phase|
+        next unless phase.respond_to?(:name) && phase.name.to_s.include?('Generate Specs')
+        phase.input_paths = [
+          '${PODS_ROOT}/../../../../packages/reconcile-engine/src/NativeReconcileEngine.ts',
+        ]
+      end
+    end
   end
 end
