@@ -174,6 +174,14 @@ fn build_record(
             ))
         }
     };
+    // Audit F11: "_updated_at" is injected metadata on the hgetall read path;
+    // a source field with that name would be silently shadowed.
+    if fields.contains_key("_updated_at") {
+        return Err((
+            fragment.to_string(),
+            "reserved field name '_updated_at'".into(),
+        ));
+    }
     // Audit C1: a configured timestamp field that is present but unparseable
     // dead-letters the record — silently substituting ingest time corrupts
     // last-writer-wins ordering. now_ms only applies when no timestamp field
@@ -501,6 +509,18 @@ mod tests {
         let out = normalize(&csv_cfg(), payload, 0).unwrap();
         assert_eq!(out.rejects.len(), 1);
         assert_eq!(out.rejects[0].0, "a@x.com,\"line1\nline2\",extra");
+    }
+
+    // Audit F11: "_updated_at" is injected metadata on the hgetall read path;
+    // a source field with that name would be silently shadowed, so reject it.
+    #[test]
+    fn reserved_updated_at_field_rejects() {
+        let payload = r#"[{"email":"a@x.com","_updated_at":"999","name":"A"}]"#;
+        let cfg = SourceConfig { timestamp_field: None, ..json_cfg() };
+        let out = normalize(&cfg, payload, 0).unwrap();
+        assert!(out.records.is_empty());
+        assert_eq!(out.rejects.len(), 1);
+        assert!(out.rejects[0].1.contains("reserved field"), "{}", out.rejects[0].1);
     }
 
     // Audit F10: duplicate header names silently let the last column win — if

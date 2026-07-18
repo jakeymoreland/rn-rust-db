@@ -56,6 +56,14 @@ ALTER TABLE entries ADD COLUMN meta_floor_pri INTEGER;
 PRAGMA user_version = 2;
 ";
 
+// v3: exact stored field count guards the content-hash short-circuit (audit
+// F8): a 64-bit hash collision alone can no longer swallow a record that
+// introduces a brand-new field. NULL (pre-v3 rows) disables the skip.
+const SCHEMA_V3_MIGRATION: &str = "
+ALTER TABLE entries ADD COLUMN field_count INTEGER;
+PRAGMA user_version = 3;
+";
+
 impl Store {
     pub fn open(path: &str) -> Result<Store, EngineError> {
         let conn = Connection::open(path)?;
@@ -82,6 +90,9 @@ impl Store {
         if version <= 1 {
             conn.execute_batch(SCHEMA_V2_MIGRATION)?;
         }
+        if version <= 2 {
+            conn.execute_batch(SCHEMA_V3_MIGRATION)?;
+        }
         Ok(Store { conn })
     }
 
@@ -107,18 +118,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 6);
-        assert_eq!(store.user_version().unwrap(), 2);
-        // v2 columns exist
+        assert_eq!(store.user_version().unwrap(), 3);
+        // v2 + v3 columns exist
         let cols: i64 = store
             .conn
             .query_row(
                 "SELECT count(*) FROM pragma_table_info('entries')
-                 WHERE name IN ('content_hash','meta_floor_ts','meta_floor_pri')",
+                 WHERE name IN ('content_hash','meta_floor_ts','meta_floor_pri','field_count')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(cols, 3);
+        assert_eq!(cols, 4);
     }
 
     #[test]

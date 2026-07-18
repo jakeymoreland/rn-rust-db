@@ -37,10 +37,11 @@ struct ExistingRow {
     fields_json: String,
     meta_json: String,
     updated_at: i64,
-    // v2 short-circuit columns; None on rows written before the migration.
+    // v2/v3 short-circuit columns; None on rows written before the migrations.
     content_hash: Option<i64>,
     meta_floor_ts: Option<i64>,
     meta_floor_pri: Option<i64>,
+    field_count: Option<i64>,
 }
 
 /// Compact on-disk form of field_meta. In almost every batch, all fields of a
@@ -127,6 +128,7 @@ struct WriteRow {
     content_hash: i64,
     floor_ts: i64,
     floor_pri: i64,
+    field_count: i64,
 }
 
 struct GroupOutcome {
@@ -183,12 +185,17 @@ fn merge_group(
             // Short-circuit (valid only against the pristine DB row):
             // identical content AND the record cannot beat the meta floor
             // means no field's value or meta could change — skip the parse.
-            if let (Some(h), Some(floor_ts), Some(floor_pri)) =
-                (row.content_hash, row.meta_floor_ts, row.meta_floor_pri)
+            // The exact field count guards against a 64-bit hash collision
+            // swallowing a record that introduces a new field (audit F8).
+            if let (Some(h), Some(floor_ts), Some(floor_pri), Some(fc)) =
+                (row.content_hash, row.meta_floor_ts, row.meta_floor_pri, row.field_count)
             {
                 let cannot_advance = rec.updated_at < floor_ts
                     || (rec.updated_at == floor_ts && (cfg.priority as i64) <= floor_pri);
-                if cannot_advance && fields_hash(&rec.fields) == h {
+                if cannot_advance
+                    && fields_hash(&rec.fields) == h
+                    && fc == rec.fields.len() as i64
+                {
                     unchanged += 1;
                     continue;
                 }
@@ -209,8 +216,13 @@ fn merge_group(
             let wins = match meta.get(k) {
                 None => true,
                 Some(m) => {
+                    // Exact tie from the SAME source is a correction in batch
+                    // order — the incoming record wins (audit S2). Cross-source
+                    // exact ties keep the existing value for stability.
                     rec.updated_at > m.updated_at
-                        || (rec.updated_at == m.updated_at && cfg.priority > m.priority)
+                        || (rec.updated_at == m.updated_at
+                            && (cfg.priority > m.priority
+                                || (cfg.priority == m.priority && m.source == rec.source)))
                 }
             };
             if wins {
@@ -258,6 +270,7 @@ fn merge_group(
             content_hash: fields_hash(&fields),
             floor_ts,
             floor_pri,
+            field_count: fields.len() as i64,
         })
     } else {
         None
@@ -301,7 +314,7 @@ pub fn reconcile(
             for chunk in keys.chunks(900) {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let sql = format!(
-                    "SELECT natural_key, fields, field_meta, updated_at, content_hash, meta_floor_ts, meta_floor_pri
+                    "SELECT natural_key, fields, field_meta, updated_at, content_hash, meta_floor_ts, meta_floor_pri, field_count
                      FROM entries WHERE collection = ? AND natural_key IN ({placeholders})"
                 );
                 let mut stmt = tx.prepare(&sql)?;
@@ -318,6 +331,7 @@ pub fn reconcile(
                             content_hash: row.get(4)?,
                             meta_floor_ts: row.get(5)?,
                             meta_floor_pri: row.get(6)?,
+                            field_count: row.get(7)?,
                         },
                     );
                 }
@@ -372,11 +386,11 @@ pub fn reconcile(
     // actually changed (a group merged N times still writes once).
     {
         let mut ins_stmt = tx.prepare_cached(
-            "INSERT INTO entries(collection, natural_key, fields, field_meta, updated_at, content_hash, meta_floor_ts, meta_floor_pri)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO entries(collection, natural_key, fields, field_meta, updated_at, content_hash, meta_floor_ts, meta_floor_pri, field_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
         let mut upd_stmt = tx.prepare_cached(
-            "UPDATE entries SET fields = ?3, field_meta = ?4, updated_at = ?5, content_hash = ?6, meta_floor_ts = ?7, meta_floor_pri = ?8
+            "UPDATE entries SET fields = ?3, field_meta = ?4, updated_at = ?5, content_hash = ?6, meta_floor_ts = ?7, meta_floor_pri = ?8, field_count = ?9
              WHERE collection = ?1 AND natural_key = ?2",
         )?;
         for oc in outcomes {
@@ -397,7 +411,8 @@ pub fn reconcile(
                     w.updated_at,
                     w.content_hash,
                     w.floor_ts,
-                    w.floor_pri
+                    w.floor_pri,
+                    w.field_count
                 ])?;
             }
         }
@@ -409,6 +424,16 @@ pub fn reconcile(
             params![cfg.source_id, fragment, error, now_ms],
         )?;
         summary.dead_lettered += 1;
+    }
+    // Audit S13: cap the quarantine per source (newest 1000 kept) inside the
+    // same transaction — a persistently-broken source can no longer grow the
+    // DB without bound.
+    if summary.dead_lettered > 0 {
+        tx.execute(
+            "DELETE FROM dead_letter WHERE source = ?1 AND id NOT IN (
+               SELECT id FROM dead_letter WHERE source = ?1 ORDER BY id DESC LIMIT 1000)",
+            params![cfg.source_id],
+        )?;
     }
 
     tx.execute(
@@ -676,6 +701,76 @@ mod tests {
         reconcile(&mut st, &cfg("dev", 1), outcome(vec![rec("dev", "a@x.com", "name", "Changed", 120)]), 0).unwrap();
         let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
         assert_eq!(h["name"], "Ann");
+    }
+
+    // Audit S2: an exact tie (same ts, same priority) from the SAME source is
+    // a correction in batch order — the later record must win. Cross-source
+    // exact ties keep the existing value (stability).
+    #[test]
+    fn exact_tie_same_source_last_writer_wins() {
+        let mut st = Store::open(":memory:").unwrap();
+        let s = reconcile(
+            &mut st,
+            &cfg("api", 10),
+            outcome(vec![
+                rec("api", "a@x.com", "name", "Ann", 100),
+                rec("api", "a@x.com", "name", "Corrected", 100),
+            ]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(s.inserted, 1);
+        let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
+        assert_eq!(h["name"], "Corrected", "same-source tie discarded the correction");
+    }
+
+    #[test]
+    fn exact_tie_cross_source_keeps_existing() {
+        let mut st = Store::open(":memory:").unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        let s = reconcile(&mut st, &cfg("other", 10), outcome(vec![rec("other", "a@x.com", "name", "Intruder", 100)]), 0).unwrap();
+        assert_eq!(s.updated, 0);
+        let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
+        assert_eq!(h["name"], "Ann");
+    }
+
+    // Audit F8: a content-hash collision must not swallow a record that
+    // introduces a brand-new field — the stored field count guards the skip.
+    #[test]
+    fn hash_collision_with_new_field_still_stores_it() {
+        let mut st = Store::open(":memory:").unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        // Build an incoming record with an EXTRA field, then force the stored
+        // content_hash to collide with it (simulating the 2^-64 case).
+        let mut extra = rec("api", "a@x.com", "name", "Ann", 50); // old ts: cannot_advance
+        extra.fields.insert("nickname".into(), "Nan".into());
+        let forged = fields_hash(&extra.fields);
+        st.conn
+            .execute("UPDATE entries SET content_hash = ?1 WHERE natural_key = 'a@x.com'", params![forged])
+            .unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![extra]), 0).unwrap();
+        let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
+        assert_eq!(h["nickname"], "Nan", "colliding hash swallowed the new field");
+    }
+
+    // Audit S13: dead_letter is capped per source; oldest rows pruned in-tx.
+    #[test]
+    fn dead_letter_capped_at_1000_per_source() {
+        let mut st = Store::open(":memory:").unwrap();
+        for wave in 0..2 {
+            let rejects: Vec<(String, String)> =
+                (0..600).map(|i| (format!("frag-{wave}-{i}"), "bad".into())).collect();
+            let out = NormalizeOutcome { records: vec![], rejects };
+            reconcile(&mut st, &cfg("api", 10), out, wave).unwrap();
+        }
+        let n: i64 = st.conn.query_row("SELECT count(*) FROM dead_letter", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1000, "dead_letter must cap at 1000 per source");
+        // newest survive
+        let newest: i64 = st
+            .conn
+            .query_row("SELECT count(*) FROM dead_letter WHERE fragment LIKE 'frag-1-%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(newest, 600);
     }
 
     #[test]
