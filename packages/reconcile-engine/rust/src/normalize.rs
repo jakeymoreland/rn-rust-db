@@ -27,6 +27,7 @@ pub struct CanonicalRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug)]
 pub struct NormalizeOutcome {
     pub records: Vec<CanonicalRecord>,
     pub rejects: Vec<(String, String)>,
@@ -249,17 +250,20 @@ fn normalize_json(
 }
 
 /// Minimal RFC-4180 subset parser: quoted fields, "" escapes, \r\n or \n rows.
-fn parse_csv_rows(payload: &str) -> Vec<Vec<String>> {
-    let mut rows: Vec<Vec<String>> = Vec::new();
+/// Returns each row's parsed fields plus the raw source line (byte-exact,
+/// minus the row terminator) so rejects quarantine faithfully (audit S3).
+fn parse_csv_rows(payload: &str) -> Vec<(Vec<String>, String)> {
+    let mut rows: Vec<(Vec<String>, String)> = Vec::new();
     let mut row: Vec<String> = Vec::new();
     let mut field = String::new();
     let mut in_quotes = false;
-    let mut chars = payload.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut row_start = 0usize;
+    let mut chars = payload.char_indices().peekable();
+    while let Some((idx, c)) = chars.next() {
         if in_quotes {
             match c {
                 '"' => {
-                    if chars.peek() == Some(&'"') {
+                    if chars.peek().map(|&(_, c)| c) == Some('"') {
                         chars.next();
                         field.push('"');
                     } else {
@@ -277,7 +281,14 @@ fn parse_csv_rows(payload: &str) -> Vec<Vec<String>> {
                 '\r' => {}
                 '\n' => {
                     row.push(std::mem::take(&mut field));
-                    rows.push(std::mem::take(&mut row));
+                    let end = if idx > row_start && payload.as_bytes()[idx - 1] == b'\r' {
+                        idx - 1
+                    } else {
+                        idx
+                    };
+                    let raw = payload[row_start..end].to_string();
+                    rows.push((std::mem::take(&mut row), raw));
+                    row_start = idx + 1;
                 }
                 _ => field.push(c),
             }
@@ -285,7 +296,8 @@ fn parse_csv_rows(payload: &str) -> Vec<Vec<String>> {
     }
     if !field.is_empty() || !row.is_empty() {
         row.push(field);
-        rows.push(row);
+        let raw = payload[row_start..].trim_end_matches('\r').to_string();
+        rows.push((row, raw));
     }
     rows
 }
@@ -299,10 +311,19 @@ fn normalize_csv(
     if rows.is_empty() {
         return Err(EngineError::Parse("empty CSV payload".into()));
     }
-    let header = &rows[0];
+    let header = &rows[0].0;
+    // Audit F10: duplicate header names would silently let the last column
+    // win; if that column is the key or timestamp field the wrong data drives
+    // merging, so the whole batch fails loudly instead.
+    let mut seen = std::collections::BTreeSet::new();
+    for h in header {
+        if !seen.insert(h) {
+            return Err(EngineError::Parse(format!("duplicate CSV header '{h}'")));
+        }
+    }
     let mut out = NormalizeOutcome { records: vec![], rejects: vec![] };
-    for row in &rows[1..] {
-        let fragment = row.join(",");
+    for (row, raw) in &rows[1..] {
+        let fragment = raw.clone();
         if row.len() != header.len() {
             out.rejects.push((
                 fragment,
@@ -461,5 +482,33 @@ mod tests {
         let out = normalize(&csv_cfg(), payload, 0).unwrap();
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.rejects.len(), 2);
+    }
+
+    // Audit S3: the quarantined fragment must be the original raw line, not a
+    // dequoted re-join that destroys embedded commas/quotes/newlines.
+    #[test]
+    fn csv_dead_letter_fragment_preserves_raw_line() {
+        let payload = "email,name\na@x.com,\"likes, commas\",extra\nb@x.com,Bob\n";
+        let out = normalize(&csv_cfg(), payload, 0).unwrap();
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.rejects.len(), 1);
+        assert_eq!(out.rejects[0].0, "a@x.com,\"likes, commas\",extra");
+    }
+
+    #[test]
+    fn csv_dead_letter_fragment_preserves_quoted_newline() {
+        let payload = "email,name\na@x.com,\"line1\nline2\",extra\n";
+        let out = normalize(&csv_cfg(), payload, 0).unwrap();
+        assert_eq!(out.rejects.len(), 1);
+        assert_eq!(out.rejects[0].0, "a@x.com,\"line1\nline2\",extra");
+    }
+
+    // Audit F10: duplicate header names silently let the last column win — if
+    // that column is the key or timestamp, the wrong data drives merging.
+    #[test]
+    fn duplicate_csv_headers_fail_the_batch() {
+        let payload = "email,name,name\na@x.com,Ann,Anne\n";
+        let err = normalize(&csv_cfg(), payload, 0).unwrap_err();
+        assert!(err.to_string().contains("duplicate CSV header 'name'"), "{err}");
     }
 }
