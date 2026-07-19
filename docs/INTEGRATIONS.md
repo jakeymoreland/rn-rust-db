@@ -33,7 +33,9 @@ session-adjacent state and scope the data.
 
 **Session storage** — keep tokens in SecureStore (Better Auth's Expo plugin
 does this); mirror non-secret session facts into the engine kv so synchronous
-code can read them at ~1 µs:
+code can read them at ~1 µs (note: `redis.expire`/`ttl` are in **milliseconds**,
+and — matching Redis — `hset` preserves an existing key TTL; only `set` clears
+it):
 
 ```ts
 import { redis } from '@rn-experiments/reconcile-engine';
@@ -123,7 +125,8 @@ device converges to it. For writes, use an outbox so offline works:
    with a newer `updated_at` and wins cleanly.
 4. On permanent rejection (validation, auth), move the op to an app-level
    dead-letter list and surface it — the same philosophy as the engine's
-   ingest DLQ, one level up.
+   ingest DLQ, one level up. The engine's own DLQ is now capped per source
+   (newest 1000 kept) and drainable via the `deadLetterClear` command.
 
 ## 4. Postgres specifics
 
@@ -152,11 +155,12 @@ ORDER BY updated_at, id
 LIMIT $4;
 ```
 
-Serialize timestamps as epoch millis (or ISO-8601) — the engine compares the
-`timestamp_field` numerically/lexically per field, so pick one format and
-keep it stable. For push-style freshness, LISTEN/NOTIFY → WebSocket →
-client runs `pull()` on nudge (measured: 10-row ticks land on screen in
-~14.5 ms median).
+Serialize timestamps as epoch millis or ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ` and
+offset/fractional forms are parsed to epoch ms). A `timestamp_field` that is
+present but unparseable now **dead-letters the record** rather than silently
+falling back to ingest time — so keep the format stable and valid. For
+push-style freshness, LISTEN/NOTIFY → WebSocket → client runs `pull()` on nudge
+(measured: 10-row ticks land on screen in ~14.5 ms median).
 
 ## 5. Cloudflare D1 specifics
 

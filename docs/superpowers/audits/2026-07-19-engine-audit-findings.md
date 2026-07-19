@@ -1,5 +1,19 @@
 # Reconcile-Engine Audit Findings — 2026-07-19
 
+> **Fix status (2026-07-19, branch `audit-fixes`).** All 4 criticals and all 29
+> should-fixes are **fixed**, each behind a regression test written first. The
+> cheap noted items (F8, F10, F11, F23, F24, F27, F28, F29, F30, F31, F41, F52,
+> F54, F55, F56) are fixed too. **Deferred (documented instead):** F32 event-ctx
+> weak_ptr shim (currently sound; `close()` now detaches the callback first as
+> partial hardening), S29 Android gradle-library project, Mac Catalyst support,
+> and full Redis glob `?`/`[...]` classes. F26 was **refuted** during
+> verification. Fixes span commits `e88c5b6`…`051e611`. Verified end to end:
+> 91 Rust lib + 8 integration tests, 30 jest tests, `cargo clippy` zero errors
+> (was 19), all 7 native targets cross-compile, `pod install` hooks succeed, and
+> the sandbox app builds (NativeReconcileEngine.cpp compiles clean against
+> codegen headers).
+
+
 Scope: full audit per `docs/superpowers/specs/2026-07-19-engine-audit-and-real-db-rig-design.md` (Phase 1).
 Method: 5 specialist passes (merge correctness, durability/lifecycle, FFI soundness, JSI/TS API, packaging) -> cross-pass dedupe (60 raw -> 56 unique) -> independent adversarial verification of every finding (refute-first stance, grouped by file).
 Baseline: `cargo test` passes (4 suites), `cargo clippy` FAILS with 19 errors incl. `not_unsafe_ptr_arg_deref` on public FFI fns, `yarn test` passes 6/6.
