@@ -27,9 +27,13 @@ fn purge_if_expired(store: &Store, key: &str, now_ms: i64) -> Result<bool, Engin
         .ok();
     if let Some(at) = expires {
         if now_ms >= at {
-            store.conn.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
-            store.conn.execute("DELETE FROM hash WHERE key = ?1", params![key])?;
-            store.conn.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
+            // Audit S10: purge kv + hash + ttl rows in one transaction so a
+            // kill mid-purge can't resurrect a half-deleted key.
+            let tx = store.conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+            tx.execute("DELETE FROM hash WHERE key = ?1", params![key])?;
+            tx.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
+            tx.commit()?;
             return Ok(true);
         }
     }
@@ -104,9 +108,12 @@ pub fn del(engine: &mut Engine, key: &str) -> Result<bool, EngineError> {
     engine.kv.map.remove(key);
     engine.kv.ttl.remove(key);
     let store = &engine.store;
-    let a = store.conn.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
-    let b = store.conn.execute("DELETE FROM hash WHERE key = ?1", params![key])?;
-    store.conn.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
+    // Audit S10: one transaction for all three tables.
+    let tx = store.conn.unchecked_transaction()?;
+    let a = tx.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+    let b = tx.execute("DELETE FROM hash WHERE key = ?1", params![key])?;
+    tx.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
+    tx.commit()?;
     Ok(a + b > 0)
 }
 
@@ -271,6 +278,21 @@ mod tests {
         assert!(del(&mut en, "a").unwrap());
         assert!(!del(&mut en, "a").unwrap());
         assert_eq!(get(&mut en, "a", 0).unwrap(), None);
+    }
+
+    // Audit S10: del removes the kv row AND any hash rows AND the ttl row in
+    // one transaction — no window where a key is half-deleted.
+    #[test]
+    fn del_removes_kv_hash_and_ttl_atomically() {
+        let mut en = e();
+        set(&mut en, "k", "v").unwrap();
+        hset(&en.store, "k", "f", "hv").unwrap();
+        expire(&mut en, "k", 1000, 0).unwrap();
+        assert!(del(&mut en, "k").unwrap());
+        let kv: i64 = en.store.conn.query_row("SELECT count(*) FROM kv WHERE key='k'", [], |r| r.get(0)).unwrap();
+        let hash: i64 = en.store.conn.query_row("SELECT count(*) FROM hash WHERE key='k'", [], |r| r.get(0)).unwrap();
+        let ttl: i64 = en.store.conn.query_row("SELECT count(*) FROM key_ttl WHERE key='k'", [], |r| r.get(0)).unwrap();
+        assert_eq!((kv, hash, ttl), (0, 0, 0), "del left rows behind");
     }
 
     #[test]
