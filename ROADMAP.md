@@ -11,7 +11,8 @@ public/production release.
 - [ ] **CI** (`.github/workflows`): `cargo test` + `cargo clippy` + `yarn test`,
       plus the artifact drift-check (`scripts/check-artifacts.sh`). No CI exists
       today (audit S47).
-- [ ] `CONTRIBUTING.md` and issue/PR templates.
+- [x] `CONTRIBUTING.md`.
+- [ ] Issue/PR templates (`.github/`).
 - [ ] Decide artifact distribution: commit prebuilt `.a`/xcframework via git-lfs,
       or a published-package build flow. They are gitignored today and built
       locally by `scripts/build-*.sh`.
