@@ -348,6 +348,42 @@ pub extern "C" fn engine_kv_get(handle: *mut c_void, key: *const c_char) -> *mut
     })
 }
 
+/// Fast-path kv get that distinguishes a miss from an error (audit F40).
+/// Returns the value (free with engine_free_string) or NULL. When NULL, writes
+/// `*out_err` = 0 for a genuine miss or 1 for a storage error (last_error set).
+#[no_mangle]
+pub extern "C" fn engine_kv_get2(
+    handle: *mut c_void,
+    key: *const c_char,
+    out_err: *mut i32,
+) -> *mut c_char {
+    ffi_guard!(std::ptr::null_mut(), {
+        if !out_err.is_null() {
+            unsafe { *out_err = 0 };
+        }
+        if handle.is_null() {
+            return std::ptr::null_mut();
+        }
+        let ffi = unsafe { &*(handle as *mut EngineFfi) };
+        let Some(key) = (unsafe { cstr(key) }) else {
+            return std::ptr::null_mut();
+        };
+        let mut engine = lock_engine(&ffi.inner);
+        let now = engine.now();
+        match crate::commands::get(&mut engine, key, now) {
+            Ok(Some(v)) => to_c_string(v),
+            Ok(None) => std::ptr::null_mut(),
+            Err(e) => {
+                set_last_error(e.code(), &e.to_string());
+                if !out_err.is_null() {
+                    unsafe { *out_err = 1 };
+                }
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// Fast-path kv set: returns true on success; on failure sets engine_last_error.
 #[no_mangle]
 pub extern "C" fn engine_kv_set(handle: *mut c_void, key: *const c_char, value: *const c_char) -> bool {
@@ -760,6 +796,32 @@ mod tests {
         let s2 = unsafe { CStr::from_ptr(r2) }.to_str().unwrap().to_string();
         engine_free_string(r2);
         assert!(s2.contains("\"ok\":true"), "engine dead after panic: {s2}");
+        engine_close(h);
+    }
+
+    // Audit F40: engine_kv_get2 distinguishes a miss (err flag 0) from a
+    // present value.
+    #[test]
+    fn kv_get2_distinguishes_miss_from_hit() {
+        let path = CString::new(":memory:").unwrap();
+        let h = engine_open(path.as_ptr());
+        let set = CString::new(r#"{"cmd":"set","args":["k","v"]}"#).unwrap();
+        engine_free_string(unsafe { engine_execute(h, set.as_ptr()) });
+
+        let key = CString::new("k").unwrap();
+        let mut err: i32 = -1;
+        let got = engine_kv_get2(h, key.as_ptr(), &mut err);
+        assert!(!got.is_null());
+        assert_eq!(err, 0);
+        let s = unsafe { CStr::from_ptr(got) }.to_str().unwrap().to_string();
+        engine_free_string(got);
+        assert_eq!(s, "v");
+
+        let missing = CString::new("nope").unwrap();
+        let mut err2: i32 = -1;
+        let got2 = engine_kv_get2(h, missing.as_ptr(), &mut err2);
+        assert!(got2.is_null());
+        assert_eq!(err2, 0, "a genuine miss must report err flag 0");
         engine_close(h);
     }
 
