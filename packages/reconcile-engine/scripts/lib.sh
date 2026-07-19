@@ -7,8 +7,11 @@ write_manifest() {
   local rustc_ver
   rustc_ver=$(rustc --version)
   local tree_hash
-  tree_hash=$( cd "$pkg_dir/rust" && git ls-files src Cargo.toml Cargo.lock | LC_ALL=C sort \
-      | git hash-object --stdin-paths | git hash-object --stdin )
+  # ls-files -s emits mode+blobhash+path for tracked files (no file opens, and
+  # untracked/absent Cargo.lock is simply omitted), so this is stable across
+  # machines and never fails on a missing lockfile.
+  tree_hash=$( cd "$pkg_dir/rust" && git ls-files -s src Cargo.toml Cargo.lock \
+      | LC_ALL=C sort | git hash-object --stdin )
   cat > "$pkg_dir/artifacts-manifest.json" <<EOF
 {
   "rust_tree_hash": "$tree_hash",

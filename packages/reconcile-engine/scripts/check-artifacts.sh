@@ -20,10 +20,10 @@ fail() {
   exit 1
 }
 
-# rust source tree hash — stable across machines (sorted tracked files).
+# rust source tree hash — stable across machines. ls-files -s emits blob hashes
+# without opening files, and omits an untracked/absent Cargo.lock.
 rust_tree_hash() {
-  ( cd rust && git ls-files src Cargo.toml Cargo.lock | LC_ALL=C sort \
-      | git hash-object --stdin-paths | git hash-object --stdin )
+  ( cd rust && git ls-files -s src Cargo.toml Cargo.lock | LC_ALL=C sort | git hash-object --stdin )
 }
 
 [ -d "$IOS" ] || fail "missing iOS xcframework ($IOS)"
