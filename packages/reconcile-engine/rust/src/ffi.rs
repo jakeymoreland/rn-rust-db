@@ -21,6 +21,26 @@ pub struct EngineFfi {
     inner: Arc<Mutex<Engine>>,
     flusher_stop: Arc<AtomicBool>,
     flusher: Option<JoinHandle<()>>,
+    /// The change-event sink lives here, NOT inside the engine mutex, so it can
+    /// be invoked after `inner` is unlocked (audit S7/F14). Its own short-lived
+    /// lock is never held while `inner` is locked.
+    sink: Mutex<Option<crate::pubsub::Sink>>,
+}
+
+/// Delivers buffered change events by invoking the sink. MUST be called with
+/// the engine `inner` mutex released, so a subscriber callback may re-enter the
+/// engine without deadlocking.
+fn deliver_events(ffi: &EngineFfi, events: Vec<(String, String)>) {
+    if events.is_empty() {
+        return;
+    }
+    if let Ok(guard) = ffi.sink.lock() {
+        if let Some(sink) = guard.as_ref() {
+            for (channel, payload) in events {
+                sink(&channel, &payload);
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -84,7 +104,12 @@ pub extern "C" fn engine_open(path: *const c_char) -> *mut c_void {
                     let _ = engine.flush_kv();
                 }
             });
-            Box::into_raw(Box::new(EngineFfi { inner, flusher_stop, flusher: Some(flusher) })) as *mut c_void
+            Box::into_raw(Box::new(EngineFfi {
+                inner,
+                flusher_stop,
+                flusher: Some(flusher),
+                sink: Mutex::new(None),
+            })) as *mut c_void
         }
         Err(e) => {
             set_last_error(e.code(), &e.to_string());
@@ -110,8 +135,14 @@ pub extern "C" fn engine_execute(handle: *mut c_void, request_json: *const c_cha
     let Some(req) = (unsafe { cstr(request_json) }) else {
         return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null request\"}".into());
     };
-    let mut engine = ffi.inner.lock().unwrap();
-    to_c_string(execute(&mut engine, req))
+    let (response, events) = {
+        let mut engine = ffi.inner.lock().unwrap();
+        let response = execute(&mut engine, req);
+        (response, engine.take_events())
+    };
+    // Guard released — safe for a subscriber callback to re-enter the engine.
+    deliver_events(ffi, events);
+    to_c_string(response)
 }
 
 #[no_mangle]
@@ -157,17 +188,22 @@ pub extern "C" fn engine_query_entries_bin(
 /// plain strings instead of being escaped into a request envelope and parsed
 /// twice. Response envelope matches engine_execute's ingest exactly.
 fn ingest_response(ffi: &EngineFfi, source_id: &str, payload: &str) -> *mut c_char {
-    let mut engine = ffi.inner.lock().unwrap();
-    match engine.ingest(source_id, payload) {
-        Ok((summary, skipped)) => {
-            let mut v = serde_json::to_value(&summary).unwrap();
-            v["skipped"] = serde_json::json!(skipped);
-            to_c_string(serde_json::json!({"ok": true, "value": v}).to_string())
-        }
-        Err(e) => to_c_string(
-            serde_json::json!({"ok": false, "code": e.code(), "message": e.to_string()}).to_string(),
-        ),
-    }
+    let (response, events) = {
+        let mut engine = ffi.inner.lock().unwrap();
+        let response = match engine.ingest(source_id, payload) {
+            Ok((summary, skipped)) => {
+                let mut v = serde_json::to_value(&summary).unwrap();
+                v["skipped"] = serde_json::json!(skipped);
+                serde_json::json!({"ok": true, "value": v}).to_string()
+            }
+            Err(e) => {
+                serde_json::json!({"ok": false, "code": e.code(), "message": e.to_string()}).to_string()
+            }
+        };
+        (response, engine.take_events())
+    };
+    deliver_events(ffi, events);
+    to_c_string(response)
 }
 
 #[no_mangle]
@@ -364,11 +400,14 @@ pub extern "C" fn engine_set_event_callback(
         return;
     }
     let ffi = unsafe { &*(handle as *mut EngineFfi) };
-    let mut engine = ffi.inner.lock().unwrap();
+    // The sink lives on EngineFfi (audit S7), not inside the engine mutex, so
+    // events can be delivered after `inner` is unlocked. This short-lived lock
+    // is never held while `inner` is locked.
+    let mut sink_guard = ffi.sink.lock().unwrap();
     match cb {
         Some(cb) => {
             let holder = CallbackHolder { ctx: ctx as usize, cb };
-            engine.pubsub.set_sink(Box::new(move |channel, payload| {
+            *sink_guard = Some(Box::new(move |channel: &str, payload: &str| {
                 // Caller-supplied data (e.g. a collection name) may contain interior
                 // NUL bytes. CString::new would fail on those; unwrapping inside this
                 // callback would panic across an extern "C" boundary and abort the
@@ -385,7 +424,7 @@ pub extern "C" fn engine_set_event_callback(
                 (holder.cb)(holder.ctx as *mut c_void, ch.as_ptr(), pl.as_ptr());
             }));
         }
-        None => engine.pubsub.set_sink(Box::new(|_, _| {})),
+        None => *sink_guard = None,
     }
 }
 
@@ -553,6 +592,44 @@ mod tests {
         // if it fired, the callback body above already checked the strings
         // it received were valid, sanitized C strings.
         let _ = FIRED.load(Ordering::SeqCst);
+        engine_close(h);
+    }
+
+    // Audit S6/S7/F14: the change-event sink fires AFTER the engine mutex is
+    // released, so a callback that synchronously re-enters engine_execute must
+    // not deadlock. Before the fix, publish ran under the lock and this
+    // re-entrant call would hang the process.
+    #[test]
+    fn event_callback_may_reenter_engine_without_deadlock() {
+        use std::sync::atomic::{AtomicPtr, Ordering};
+        static HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+        static REENTERED: AtomicBool = AtomicBool::new(false);
+        extern "C" fn cb(_ctx: *mut c_void, _ch: *const c_char, _p: *const c_char) {
+            let h = HANDLE.load(Ordering::SeqCst);
+            if h.is_null() {
+                return;
+            }
+            // Re-enter the engine from inside the event callback.
+            let req = CString::new(r#"{"cmd":"get","args":["k"]}"#).unwrap();
+            let r = engine_execute(h, req.as_ptr());
+            engine_free_string(r);
+            REENTERED.store(true, Ordering::SeqCst);
+        }
+        let path = CString::new(":memory:").unwrap();
+        let h = engine_open(path.as_ptr());
+        HANDLE.store(h, Ordering::SeqCst);
+        engine_set_event_callback(h, std::ptr::null_mut(), Some(cb));
+        for req in [
+            r#"{"cmd":"registerSource","args":["{\"source_id\":\"api\",\"format\":\"Json\",\"collection\":\"people\",\"natural_key_field\":\"email\",\"timestamp_field\":null,\"priority\":10}"]}"#,
+            r#"{"cmd":"subscribe","args":["changes:*"]}"#,
+            r#"{"cmd":"ingest","args":["api","[{\"email\":\"a@x.com\"}]"]}"#,
+        ] {
+            let c = CString::new(req).unwrap();
+            let r = engine_execute(h, c.as_ptr());
+            engine_free_string(r);
+        }
+        assert!(REENTERED.load(Ordering::SeqCst), "callback never ran / deadlocked");
+        HANDLE.store(std::ptr::null_mut(), Ordering::SeqCst);
         engine_close(h);
     }
 

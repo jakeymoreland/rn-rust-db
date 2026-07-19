@@ -116,6 +116,27 @@ fn float_natural_key_dead_letters() {
     assert!(bad.as_object().map(|o| o.is_empty()).unwrap_or(true), "{bad}");
 }
 
+// S15: re-registering a source with a changed config must NOT let a
+// byte-identical payload hit the skip — the data has to reconcile under the
+// new rules (here, a changed priority).
+#[test]
+fn changed_source_config_defeats_payload_skip() {
+    let mut e = eng();
+    let cfg_a = r#"{"source_id":"api","format":"Json","collection":"people","natural_key_field":"email","timestamp_field":null,"priority":10}"#;
+    register(&mut e, cfg_a);
+    let payload = r#"[{"email":"a@x.com","name":"Ann"}]"#;
+    let s1 = ingest(&mut e, "api", payload);
+    assert_eq!(s1["inserted"], 1);
+    // Same payload again -> skipped.
+    let s2 = ingest(&mut e, "api", payload);
+    assert_eq!(s2["skipped"], true, "{s2}");
+    // Re-register with a different priority, then re-ingest identical bytes.
+    let cfg_b = r#"{"source_id":"api","format":"Json","collection":"people","natural_key_field":"email","timestamp_field":null,"priority":25}"#;
+    register(&mut e, cfg_b);
+    let s3 = ingest(&mut e, "api", payload);
+    assert_eq!(s3["skipped"], false, "config change must defeat the skip: {s3}");
+}
+
 // S1: numerically equal values from different formats must converge instead of
 // flip-flopping (JSON 1000.0 vs "1000").
 #[test]

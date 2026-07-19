@@ -283,6 +283,7 @@ pub fn reconcile(
     cfg: &SourceConfig,
     outcome: NormalizeOutcome,
     now_ms: i64,
+    content_hash: &str,
 ) -> Result<BatchSummary, EngineError> {
     let tx = store.conn.transaction()?;
     let mut summary = BatchSummary {
@@ -436,10 +437,13 @@ pub fn reconcile(
         )?;
     }
 
+    // Audit S6: the source's content_hash is written in THIS transaction with
+    // the row changes, not a separate post-commit UPDATE that could fail and
+    // leave a committed batch with no skip fingerprint (and no change event).
     tx.execute(
-        "INSERT INTO sync_meta(source, last_sync) VALUES (?1, ?2)
-         ON CONFLICT(source) DO UPDATE SET last_sync = excluded.last_sync",
-        params![cfg.source_id, now_ms],
+        "INSERT INTO sync_meta(source, last_sync, content_hash) VALUES (?1, ?2, ?3)
+         ON CONFLICT(source) DO UPDATE SET last_sync = excluded.last_sync, content_hash = excluded.content_hash",
+        params![cfg.source_id, now_ms, content_hash],
     )?;
 
     timings.write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
@@ -494,12 +498,12 @@ mod tests {
         // 300 groups > PARALLEL_THRESHOLD — insert wave, then an update wave
         let inserts: Vec<CanonicalRecord> =
             (0..300).map(|i| rec("api", &format!("u{i}@x.com"), "name", "A", 100)).collect();
-        let s = reconcile(&mut st, &cfg("api", 10), outcome(inserts), 0).unwrap();
+        let s = reconcile(&mut st, &cfg("api", 10), outcome(inserts), 0, "h").unwrap();
         assert_eq!(s.inserted, 300);
         let updates: Vec<CanonicalRecord> = (0..300)
             .map(|i| rec("api", &format!("u{i}@x.com"), "name", if i % 2 == 0 { "B" } else { "A" }, 200))
             .collect();
-        let s = reconcile(&mut st, &cfg("api", 10), outcome(updates), 0).unwrap();
+        let s = reconcile(&mut st, &cfg("api", 10), outcome(updates), 0, "h").unwrap();
         assert_eq!(s.updated, 150);
         assert_eq!(s.unchanged, 150); // same value, newer ts: advanced-not-dirty
         let n: i64 = st
@@ -525,7 +529,7 @@ mod tests {
             .unwrap();
         // newer value must win over the legacy row (no short-circuit possible:
         // hash columns are NULL)
-        let s = reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "old@x.com", "name", "New", 100)]), 0).unwrap();
+        let s = reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "old@x.com", "name", "New", 100)]), 0, "h").unwrap();
         assert_eq!(s.updated, 1);
         let (fields, meta): (String, String) = st
             .conn
@@ -549,14 +553,14 @@ mod tests {
     fn hash_short_circuit_never_blocks_meta_advance() {
         let mut st = Store::open(":memory:").unwrap();
         // source A (pri 10) writes the value at ts 100
-        reconcile(&mut st, &cfg("a", 10), outcome(vec![rec("a", "k@x.com", "name", "Ann", 100)]), 0).unwrap();
+        reconcile(&mut st, &cfg("a", 10), outcome(vec![rec("a", "k@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         // identical content, same ts, LOWER priority: short-circuit is sound (cannot advance)
-        let s = reconcile(&mut st, &cfg("low", 5), outcome(vec![rec("low", "k@x.com", "name", "Ann", 100)]), 0).unwrap();
+        let s = reconcile(&mut st, &cfg("low", 5), outcome(vec![rec("low", "k@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         assert_eq!(s.unchanged, 1);
         // identical content, same ts, HIGHER priority: must take the full path
         // and persist the newer meta (source b, pri 20), even though nothing
         // visibly changed
-        let s = reconcile(&mut st, &cfg("b", 20), outcome(vec![rec("b", "k@x.com", "name", "Ann", 100)]), 0).unwrap();
+        let s = reconcile(&mut st, &cfg("b", 20), outcome(vec![rec("b", "k@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         assert_eq!(s.unchanged, 1);
         let meta: String = st
             .conn
@@ -564,7 +568,7 @@ mod tests {
             .unwrap();
         assert!(meta.contains("\"b\""), "meta advance was skipped: {meta}");
         // now a same-ts pri-15 DIFFERENT value must lose against pri-20 meta
-        let s = reconcile(&mut st, &cfg("c", 15), outcome(vec![rec("c", "k@x.com", "name", "Evil", 100)]), 0).unwrap();
+        let s = reconcile(&mut st, &cfg("c", 15), outcome(vec![rec("c", "k@x.com", "name", "Evil", 100)]), 0, "h").unwrap();
         assert_eq!(s.updated, 0);
         let fields: String = st
             .conn
@@ -586,6 +590,7 @@ mod tests {
                 rec("api", "a@x.com", "name", "Annie", 200),
             ]),
             0,
+            "h",
         )
         .unwrap();
         assert_eq!(s.inserted, 1);
@@ -604,7 +609,7 @@ mod tests {
     #[test]
     fn insert_then_read_via_redis_surface() {
         let mut st = Store::open(":memory:").unwrap();
-        let s = reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        let s = reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         assert_eq!(s.inserted, 1);
         assert_eq!(s.collections, vec!["people".to_string()]);
         let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
@@ -615,8 +620,8 @@ mod tests {
     #[test]
     fn newer_timestamp_wins_per_field() {
         let mut st = Store::open(":memory:").unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
-        let s = reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "name", "Annie", 200)]), 0).unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
+        let s = reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "name", "Annie", 200)]), 0, "h").unwrap();
         assert_eq!(s.updated, 1);
         let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
         assert_eq!(h["name"], "Annie");
@@ -625,12 +630,12 @@ mod tests {
     #[test]
     fn older_timestamp_loses_higher_priority_ties_win() {
         let mut st = Store::open(":memory:").unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         // older -> loses
-        let s1 = reconcile(&mut st, &cfg("csv", 99), outcome(vec![rec("csv", "a@x.com", "name", "Old", 50)]), 0).unwrap();
+        let s1 = reconcile(&mut st, &cfg("csv", 99), outcome(vec![rec("csv", "a@x.com", "name", "Old", 50)]), 0, "h").unwrap();
         assert_eq!(s1.unchanged, 1);
         // same ts, higher priority -> wins
-        reconcile(&mut st, &cfg("dev", 20), outcome(vec![rec("dev", "a@x.com", "name", "Tie", 100)]), 0).unwrap();
+        reconcile(&mut st, &cfg("dev", 20), outcome(vec![rec("dev", "a@x.com", "name", "Tie", 100)]), 0, "h").unwrap();
         let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
         assert_eq!(h["name"], "Tie");
     }
@@ -638,8 +643,8 @@ mod tests {
     #[test]
     fn fields_merge_across_sources() {
         let mut st = Store::open(":memory:").unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
-        reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "phone", "555", 100)]), 0).unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
+        reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "phone", "555", 100)]), 0, "h").unwrap();
         let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
         assert_eq!(h["name"], "Ann");
         assert_eq!(h["phone"], "555");
@@ -652,7 +657,7 @@ mod tests {
             records: vec![rec("api", "a@x.com", "name", "Ann", 100)],
             rejects: vec![("{bad}".into(), "missing email".into())],
         };
-        let s = reconcile(&mut st, &cfg("api", 10), out, 123).unwrap();
+        let s = reconcile(&mut st, &cfg("api", 10), out, 123, "h").unwrap();
         assert_eq!(s.inserted, 1);
         assert_eq!(s.dead_lettered, 1);
         let n: i64 = st.conn.query_row("SELECT count(*) FROM dead_letter", [], |r| r.get(0)).unwrap();
@@ -662,8 +667,8 @@ mod tests {
     #[test]
     fn identical_reingest_is_unchanged() {
         let mut st = Store::open(":memory:").unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
-        let s = reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
+        let s = reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         assert_eq!(s.unchanged, 1);
         assert!(s.collections.is_empty());
     }
@@ -671,7 +676,7 @@ mod tests {
     #[test]
     fn scan_sees_entry_virtual_keys() {
         let mut en = crate::engine::Engine::open(":memory:", Box::new(|| 0)).unwrap();
-        reconcile(&mut en.store, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        reconcile(&mut en.store, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         let keys = crate::commands::scan(&mut en, "entry:people:*", 0).unwrap();
         assert_eq!(keys, vec!["entry:people:a@x.com"]);
     }
@@ -679,10 +684,10 @@ mod tests {
     #[test]
     fn row_updated_at_never_regresses() {
         let mut st = Store::open(":memory:").unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         // Second batch only adds a brand-new field with an older record timestamp.
         // The row's updated_at must stay at 100, not regress to 50.
-        reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "addr", "123 Main St", 50)]), 0).unwrap();
+        reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "addr", "123 Main St", 50)]), 0, "h").unwrap();
         let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
         assert_eq!(h["_updated_at"], "100");
         assert_eq!(h["addr"], "123 Main St");
@@ -691,14 +696,14 @@ mod tests {
     #[test]
     fn same_value_win_advances_meta() {
         let mut st = Store::open(":memory:").unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         // Same value, but wins on newer timestamp with lower priority - must still advance FieldMeta.
-        let s = reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "name", "Ann", 150)]), 0).unwrap();
+        let s = reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "name", "Ann", 150)]), 0, "h").unwrap();
         assert_eq!(s.unchanged, 1);
         assert_eq!(s.updated, 0);
         // A later record with an older timestamp than the persisted 150 must lose,
         // even though its priority differs, proving the meta actually advanced to 150.
-        reconcile(&mut st, &cfg("dev", 1), outcome(vec![rec("dev", "a@x.com", "name", "Changed", 120)]), 0).unwrap();
+        reconcile(&mut st, &cfg("dev", 1), outcome(vec![rec("dev", "a@x.com", "name", "Changed", 120)]), 0, "h").unwrap();
         let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
         assert_eq!(h["name"], "Ann");
     }
@@ -717,6 +722,7 @@ mod tests {
                 rec("api", "a@x.com", "name", "Corrected", 100),
             ]),
             0,
+            "h",
         )
         .unwrap();
         assert_eq!(s.inserted, 1);
@@ -727,8 +733,8 @@ mod tests {
     #[test]
     fn exact_tie_cross_source_keeps_existing() {
         let mut st = Store::open(":memory:").unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
-        let s = reconcile(&mut st, &cfg("other", 10), outcome(vec![rec("other", "a@x.com", "name", "Intruder", 100)]), 0).unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
+        let s = reconcile(&mut st, &cfg("other", 10), outcome(vec![rec("other", "a@x.com", "name", "Intruder", 100)]), 0, "h").unwrap();
         assert_eq!(s.updated, 0);
         let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
         assert_eq!(h["name"], "Ann");
@@ -739,7 +745,7 @@ mod tests {
     #[test]
     fn hash_collision_with_new_field_still_stores_it() {
         let mut st = Store::open(":memory:").unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         // Build an incoming record with an EXTRA field, then force the stored
         // content_hash to collide with it (simulating the 2^-64 case).
         let mut extra = rec("api", "a@x.com", "name", "Ann", 50); // old ts: cannot_advance
@@ -748,7 +754,7 @@ mod tests {
         st.conn
             .execute("UPDATE entries SET content_hash = ?1 WHERE natural_key = 'a@x.com'", params![forged])
             .unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![extra]), 0).unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![extra]), 0, "h").unwrap();
         let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
         assert_eq!(h["nickname"], "Nan", "colliding hash swallowed the new field");
     }
@@ -761,7 +767,7 @@ mod tests {
             let rejects: Vec<(String, String)> =
                 (0..600).map(|i| (format!("frag-{wave}-{i}"), "bad".into())).collect();
             let out = NormalizeOutcome { records: vec![], rejects };
-            reconcile(&mut st, &cfg("api", 10), out, wave).unwrap();
+            reconcile(&mut st, &cfg("api", 10), out, wave, "h").unwrap();
         }
         let n: i64 = st.conn.query_row("SELECT count(*) FROM dead_letter", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1000, "dead_letter must cap at 1000 per source");
@@ -776,8 +782,8 @@ mod tests {
     #[test]
     fn same_value_win_publishes_no_change() {
         let mut st = Store::open(":memory:").unwrap();
-        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0).unwrap();
-        let s = reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "name", "Ann", 150)]), 0).unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
+        let s = reconcile(&mut st, &cfg("csv", 5), outcome(vec![rec("csv", "a@x.com", "name", "Ann", 150)]), 0, "h").unwrap();
         assert!(s.collections.is_empty());
     }
 }

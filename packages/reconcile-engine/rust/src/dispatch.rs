@@ -223,9 +223,6 @@ mod tests {
     #[test]
     fn register_source_and_ingest_publishes_changes() {
         let mut e = eng();
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
-        let s2 = seen.clone();
-        e.pubsub.set_sink(Box::new(move |ch, _| s2.lock().unwrap().push(ch.to_string())));
         let cfg = r#"{"source_id":"api","format":"Json","collection":"people","natural_key_field":"email","timestamp_field":null,"priority":10}"#;
         ok_value(&execute(&mut e, &format!(
             r#"{{"cmd":"registerSource","args":[{}]}}"#,
@@ -238,10 +235,29 @@ mod tests {
             serde_json::to_string(payload).unwrap()
         )));
         assert_eq!(summary["inserted"], 1);
-        assert_eq!(seen.lock().unwrap().as_slice(), ["changes:people"]);
+        // Events are buffered (audit S7) for the FFI layer to deliver lock-free.
+        let events = e.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "changes:people");
         // read back through redis surface
         let h = ok_value(&execute(&mut e, r#"{"cmd":"hgetall","args":["entry:people:a@x.com"]}"#));
         assert_eq!(h["name"], "Ann");
+    }
+
+    #[test]
+    fn no_subscription_buffers_no_events() {
+        let mut e = eng();
+        let cfg = r#"{"source_id":"api","format":"Json","collection":"people","natural_key_field":"email","timestamp_field":null,"priority":10}"#;
+        ok_value(&execute(&mut e, &format!(
+            r#"{{"cmd":"registerSource","args":[{}]}}"#,
+            serde_json::to_string(cfg).unwrap()
+        )));
+        let payload = r#"[{"email":"a@x.com","name":"Ann"}]"#;
+        ok_value(&execute(&mut e, &format!(
+            r#"{{"cmd":"ingest","args":["api",{}]}}"#,
+            serde_json::to_string(payload).unwrap()
+        )));
+        assert!(e.take_events().is_empty());
     }
 
     #[test]
