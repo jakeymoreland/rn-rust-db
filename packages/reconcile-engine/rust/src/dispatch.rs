@@ -25,6 +25,11 @@ fn arg(args: &[String], i: usize) -> Result<&str, EngineError> {
 }
 
 fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
+    // Audit S12: surface a background-flush failure recorded since the last
+    // command so a silently failing disk becomes visible to the caller.
+    if let Some(e) = engine.take_sticky_error() {
+        return Err(e);
+    }
     let req: Value = serde_json::from_str(request_json)
         .map_err(|e| EngineError::Command(format!("bad request: {e}")))?;
     let cmd = req["cmd"]
@@ -52,9 +57,9 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
         "scan" => Ok(json!(commands::scan(engine, arg(&args, 0)?, now)?)),
         "hget" => Ok(json!(commands::hget(&engine.store, arg(&args, 0)?, arg(&args, 1)?, now)?)),
         "hset" => {
+            // Audit S4: hset preserves any existing TTL (Redis semantics), so
+            // the cache TTL mirror is left untouched.
             commands::hset(&engine.store, arg(&args, 0)?, arg(&args, 1)?, arg(&args, 2)?)?;
-            // hset clears the key's TTL row; keep the cache's mirror in sync
-            engine.kv.ttl.remove(arg(&args, 0)?);
             Ok(json!("OK"))
         }
         "hgetall" => Ok(json!(commands::hgetall(&engine.store, arg(&args, 0)?, now)?)),

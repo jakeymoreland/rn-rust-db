@@ -35,6 +35,10 @@ pub struct Engine {
     /// FFI layer AFTER the engine mutex is released (audit S7) so a subscriber
     /// callback can re-enter the engine without deadlocking.
     pub pending_events: Vec<(String, String)>,
+    /// A write-behind flush failure recorded by the background flusher (audit
+    /// S12). Surfaced (and cleared) by the next command so a silently failing
+    /// disk becomes visible instead of losing acknowledged sets quietly.
+    pub sticky_error: Option<EngineError>,
 }
 
 impl Engine {
@@ -53,6 +57,7 @@ impl Engine {
                 coalesce: true,
             },
             pending_events: Vec::new(),
+            sticky_error: None,
         })
     }
 
@@ -60,6 +65,11 @@ impl Engine {
     /// layer after the engine mutex is released so the sink runs lock-free.
     pub fn take_events(&mut self) -> Vec<(String, String)> {
         std::mem::take(&mut self.pending_events)
+    }
+
+    /// Takes any recorded background-flush failure (audit S12).
+    pub fn take_sticky_error(&mut self) -> Option<EngineError> {
+        self.sticky_error.take()
     }
 
     /// Drains pending kv sets into SQLite in one transaction. Each set also

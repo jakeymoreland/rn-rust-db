@@ -101,7 +101,11 @@ pub extern "C" fn engine_open(path: *const c_char) -> *mut c_void {
                     return;
                 }
                 if let Ok(mut engine) = inner2.lock() {
-                    let _ = engine.flush_kv();
+                    // Audit S12: record a flush failure so the next command can
+                    // surface it, instead of silently retrying forever.
+                    if let Err(e) = engine.flush_kv() {
+                        engine.sticky_error = Some(e);
+                    }
                 }
             });
             Box::into_raw(Box::new(EngineFfi {
@@ -454,7 +458,11 @@ pub extern "C" fn engine_close(handle: *mut c_void) {
             let _ = h.join();
         }
         if let Ok(mut engine) = ffi.inner.lock() {
-            let _ = engine.flush_kv(); // final flush so no pending set is lost
+            // Audit S12: report a final-flush failure via last_error instead of
+            // dropping acknowledged write-behind sets silently.
+            if let Err(e) = engine.flush_kv() {
+                set_last_error(e.code(), &format!("final flush failed on close: {e}"));
+            }
             // fold the WAL back into the main DB so the next open starts clean
             let _ = engine
                 .store
