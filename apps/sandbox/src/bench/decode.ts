@@ -28,32 +28,47 @@ export function decodeEntriesBuffer(buf: ArrayBuffer): Row[] {
 }
 
 // Lazy view over the PLAIN entries wire format (count, then klen/key/jlen/json
-// per row). The index walk is 2 u32 reads per row — ~12x fewer interpreter
-// dispatches than walking the schema format in Hermes — and materialization is
-// a single-row JSON.parse. This is the cheapest full-transfer lazy path: the
-// native side ships stored JSON verbatim with no per-row re-encoding.
+// per row). Row start-offsets are indexed INCREMENTALLY — the constructor only
+// reads the count, and accessing row i walks the buffer forward just far enough
+// to reach it (caching progress). A virtualized list touching 20 of 10k rows
+// therefore pays O(20) index reads, not O(10k): the constructor no longer walks
+// the whole buffer. Materialization is a single-row JSON.parse; the native side
+// ships stored JSON verbatim with no per-row re-encoding.
 export function createLazyEntryRows(buf: ArrayBuffer): LazyRows {
   const dv = new DataView(buf);
   const td = new TextDecoder();
   if (buf.byteLength < 4) throw new Error('corrupt entry buffer');
   const count = dv.getUint32(0, true);
   const offsets = new Uint32Array(count);
-  let off = 4;
-  for (let i = 0; i < count; i++) {
-    offsets[i] = off;
-    if (off + 4 > buf.byteLength) throw new Error('corrupt entry buffer');
-    off += 4 + dv.getUint32(off, true); // key
-    if (off + 4 > buf.byteLength) throw new Error('corrupt entry buffer');
-    off += 4 + dv.getUint32(off, true); // fields json
-    if (off > buf.byteLength) throw new Error('corrupt entry buffer');
-  }
   const memo: Array<Row | undefined> = new Array(count);
+  // Rows [0, indexed) have their start byte-offset recorded in `offsets`.
+  // `nextOffset` is where the first un-indexed row begins.
+  let indexed = 0;
+  let nextOffset = 4;
+
+  // Records start offsets up to and including row `target`, validating bounds
+  // as it skips each row (2 u32 length prefixes, no string decoding).
+  const ensureIndexed = (target: number): void => {
+    while (indexed <= target) {
+      let p = nextOffset;
+      offsets[indexed] = p;
+      if (p + 4 > buf.byteLength) throw new Error('corrupt entry buffer');
+      p += 4 + dv.getUint32(p, true); // skip key
+      if (p + 4 > buf.byteLength) throw new Error('corrupt entry buffer');
+      p += 4 + dv.getUint32(p, true); // skip fields json
+      if (p > buf.byteLength) throw new Error('corrupt entry buffer');
+      nextOffset = p;
+      indexed++;
+    }
+  };
+
   return {
     length: count,
     row(i: number): Row {
       if (i < 0 || i >= count) throw new Error(`row ${i} out of range (0..${count - 1})`);
       const cached = memo[i];
       if (cached) return cached;
+      ensureIndexed(i);
       let p = offsets[i];
       const klen = dv.getUint32(p, true);
       p += 4;

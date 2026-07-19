@@ -126,6 +126,17 @@ export async function runIndustry(onProgress: (msg: string) => void): Promise<In
     done('marshalLazy', median(lazyWaves));
     // same measurement graded against the STED RN-storage data-load table
     done('rnStorageLoad10k', median(lazyWaves));
+
+    // Fair 1:1 with the reference: fetch the buffer ONCE (exclude the query,
+    // like the reference), then measure only the lazy-view construction +
+    // materialize-20 that the reference's "pre-built buffer transfer" covers.
+    onProgress('lazy view + 20 materialized over a pre-fetched buffer (5 reads)...');
+    const prefetched = fastPath().queryEntriesBuffer('industry_10k');
+    const fairWaves = await timed(5, () => {
+      const lazy = createLazyEntryRows(prefetched);
+      for (let i = 0; i < Math.min(20, lazy.length); i++) lazy.row(i);
+    });
+    done('marshalLazyFair', median(fairWaves));
   }
 
   onProgress('dead-letter 100 bad payloads (3 waves)...');

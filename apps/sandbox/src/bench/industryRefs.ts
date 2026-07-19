@@ -81,7 +81,20 @@ export const INDUSTRY_REFS: IndustryRef[] = [
     refLoMs: 0.5,
     refHiMs: 1.5,
     unit: 'ms total',
-    caveat: 'reference transfers a pre-built buffer; ours includes the 10k-row SQLite query',
+    caveat: 'reference transfers a pre-built buffer; ours includes the 10k-row SQLite query — see marshalLazyFair for the 1:1',
+  },
+  {
+    // The apples-to-apples version of marshalLazy: the buffer is fetched ONCE
+    // (query cost excluded, like the reference), and each rep times only the
+    // lazy-view construction + materializing 20 rows. Directly comparable to
+    // the "transfer a pre-built buffer" reference.
+    key: 'marshalLazyFair',
+    component: 'JSI marshaling (1:1)',
+    operation: 'lazy view + 20 materialized over a pre-fetched 10k buffer',
+    refLoMs: 0.5,
+    refHiMs: 1.5,
+    unit: 'ms total',
+    caveat: 'query excluded (buffer fetched once), matching the reference; measures only view build + materialize',
   },
   {
     key: 'offlineDbInsert',

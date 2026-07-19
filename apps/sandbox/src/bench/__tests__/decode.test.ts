@@ -172,10 +172,44 @@ describe('createLazyEntryRows', () => {
     expect(lazy.row(0)).toBe(lazy.row(0)); // memoized
   });
 
-  it('throws on truncated buffer and bad index', () => {
+  it('throws on out-of-range index', () => {
     const { createLazyEntryRows } = require('../decode');
-    expect(() => createLazyEntryRows(encodeEntries(rows).slice(0, 9))).toThrow();
     const lazy = createLazyEntryRows(encodeEntries(rows));
     expect(() => lazy.row(2)).toThrow();
+  });
+
+  // Lazy indexing (perf): the constructor no longer walks the whole buffer, so
+  // corruption in a LATER row must not stop earlier rows from materializing —
+  // and length is still available from the header without a full walk.
+  it('indexes incrementally: early rows read despite later truncation', () => {
+    const { createLazyEntryRows } = require('../decode');
+    const three = [
+      { key: 'entry:c:1', fields: { name: 'Ann' } },
+      { key: 'entry:c:2', fields: { name: 'Bob' } },
+      { key: 'entry:c:3', fields: { name: 'Cat' } },
+    ];
+    const full = encodeEntries(three);
+    // Cut the buffer partway into the third row; header still says 3 rows.
+    const truncated = full.slice(0, full.byteLength - 4);
+    const lazy = createLazyEntryRows(truncated);
+    expect(lazy.length).toBe(3); // length from header, no walk needed
+    expect(lazy.row(0)).toEqual({ key: 'entry:c:1', fields: { name: 'Ann' } });
+    expect(lazy.row(1)).toEqual({ key: 'entry:c:2', fields: { name: 'Bob' } });
+    expect(() => lazy.row(2)).toThrow(); // corruption surfaces only on access
+  });
+
+  it('materializes a high index without requiring earlier access', () => {
+    const { createLazyEntryRows } = require('../decode');
+    const many = Array.from({ length: 50 }, (_, i) => ({
+      key: `entry:c:${i}`,
+      fields: { n: String(i) },
+    }));
+    const lazy = createLazyEntryRows(encodeEntries(many));
+    expect(lazy.row(42)).toEqual({ key: 'entry:c:42', fields: { n: '42' } });
+  });
+
+  it('throws on a header that undershoots the buffer minimum', () => {
+    const { createLazyEntryRows } = require('../decode');
+    expect(() => createLazyEntryRows(new ArrayBuffer(2))).toThrow();
   });
 });
