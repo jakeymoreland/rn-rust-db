@@ -138,6 +138,10 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
                 .query_row("SELECT count(*) FROM dead_letter", [], |r| r.get(0))?;
             Ok(json!(n))
         }
+        // Test-only: a reachable panic site to exercise the FFI catch_unwind
+        // containment (audit S16). Never registered in release dispatch tables.
+        #[cfg(test)]
+        "__test_panic" => panic!("intentional test panic"),
         other => Err(EngineError::Command(format!("unknown command '{other}'"))),
     }
 }

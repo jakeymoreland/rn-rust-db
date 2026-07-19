@@ -1,13 +1,51 @@
+// Every function here is a `#[no_mangle] extern "C"` boundary export. They take
+// raw pointers by contract with the C++/JSI caller (documented in engine.h) and
+// there are no safe Rust callers to protect, so clippy's not_unsafe_ptr_arg_deref
+// is suppressed module-wide rather than forcing `unsafe fn` on the whole ABI.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use crate::binenc::encode_entries;
 use crate::dispatch::execute;
 use crate::engine::Engine;
 use rusqlite::params;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Live EngineFfi handle addresses (audit S8). engine_close only frees a handle
+/// present here, so a double close or a stale/unknown handle is a safe no-op
+/// instead of a double free / use-after-free.
+fn live_handles() -> &'static Mutex<HashSet<usize>> {
+    static LIVE: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Poison-safe engine lock (audit S9): a prior panic while the mutex was held
+/// must not turn every later call into an abort. The engine state is
+/// SQLite-backed and safe to keep using, so recover the guard.
+fn lock_engine(inner: &Mutex<Engine>) -> std::sync::MutexGuard<'_, Engine> {
+    inner.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Wraps an extern "C" body in catch_unwind (audit S16): a panic reachable from
+/// the boundary is contained and mapped to `$fallback` instead of unwinding
+/// across the C ABI (which aborts the whole app).
+macro_rules! ffi_guard {
+    ($fallback:expr, $body:expr) => {
+        match catch_unwind(AssertUnwindSafe(|| $body)) {
+            Ok(v) => v,
+            Err(_) => {
+                set_last_error(500, "internal panic in engine FFI");
+                $fallback
+            }
+        }
+    };
+}
 
 type EventCb = extern "C" fn(*mut c_void, *const c_char, *const c_char);
 
@@ -84,42 +122,47 @@ fn real_clock() -> i64 {
 
 #[no_mangle]
 pub extern "C" fn engine_open(path: *const c_char) -> *mut c_void {
-    let Some(path) = (unsafe { cstr(path) }) else {
-        set_last_error(4, "null or invalid path");
-        return std::ptr::null_mut();
-    };
-    match Engine::open(path, Box::new(real_clock)) {
-        Ok(e) => {
-            let inner = Arc::new(Mutex::new(e));
-            let flusher_stop = Arc::new(AtomicBool::new(false));
-            // Write-behind durability: pending kv sets flush every ~100 ms even
-            // if no flush-forcing command runs. Woken early via unpark on close.
-            let (inner2, stop2) = (Arc::clone(&inner), Arc::clone(&flusher_stop));
-            let flusher = std::thread::spawn(move || loop {
-                std::thread::park_timeout(Duration::from_millis(100));
-                if stop2.load(Ordering::Relaxed) {
-                    return;
-                }
-                if let Ok(mut engine) = inner2.lock() {
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(path) = (unsafe { cstr(path) }) else {
+            set_last_error(4, "null or invalid path");
+            return std::ptr::null_mut();
+        };
+        match Engine::open(path, Box::new(real_clock)) {
+            Ok(e) => {
+                let inner = Arc::new(Mutex::new(e));
+                let flusher_stop = Arc::new(AtomicBool::new(false));
+                // Write-behind durability: pending kv sets flush every ~100 ms
+                // even if no flush-forcing command runs. Woken early on close.
+                let (inner2, stop2) = (Arc::clone(&inner), Arc::clone(&flusher_stop));
+                let flusher = std::thread::spawn(move || loop {
+                    std::thread::park_timeout(Duration::from_millis(100));
+                    if stop2.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut engine = lock_engine(&inner2);
                     // Audit S12: record a flush failure so the next command can
                     // surface it, instead of silently retrying forever.
                     if let Err(e) = engine.flush_kv() {
                         engine.sticky_error = Some(e);
                     }
+                });
+                let handle = Box::into_raw(Box::new(EngineFfi {
+                    inner,
+                    flusher_stop,
+                    flusher: Some(flusher),
+                    sink: Mutex::new(None),
+                })) as *mut c_void;
+                if let Ok(mut live) = live_handles().lock() {
+                    live.insert(handle as usize);
                 }
-            });
-            Box::into_raw(Box::new(EngineFfi {
-                inner,
-                flusher_stop,
-                flusher: Some(flusher),
-                sink: Mutex::new(None),
-            })) as *mut c_void
+                handle
+            }
+            Err(e) => {
+                set_last_error(e.code(), &e.to_string());
+                std::ptr::null_mut()
+            }
         }
-        Err(e) => {
-            set_last_error(e.code(), &e.to_string());
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 #[no_mangle]
@@ -132,21 +175,26 @@ pub extern "C" fn engine_last_error() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn engine_execute(handle: *mut c_void, request_json: *const c_char) -> *mut c_char {
-    if handle.is_null() {
-        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null engine handle\"}".into());
-    }
-    let ffi = unsafe { &*(handle as *mut EngineFfi) };
-    let Some(req) = (unsafe { cstr(request_json) }) else {
-        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null request\"}".into());
-    };
-    let (response, events) = {
-        let mut engine = ffi.inner.lock().unwrap();
-        let response = execute(&mut engine, req);
-        (response, engine.take_events())
-    };
-    // Guard released — safe for a subscriber callback to re-enter the engine.
-    deliver_events(ffi, events);
-    to_c_string(response)
+    ffi_guard!(
+        to_c_string("{\"ok\":false,\"code\":500,\"message\":\"internal panic\"}".into()),
+        {
+            if handle.is_null() {
+                return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null engine handle\"}".into());
+            }
+            let ffi = unsafe { &*(handle as *mut EngineFfi) };
+            let Some(req) = (unsafe { cstr(request_json) }) else {
+                return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null request\"}".into());
+            };
+            let (response, events) = {
+                let mut engine = lock_engine(&ffi.inner);
+                let response = execute(&mut engine, req);
+                (response, engine.take_events())
+            };
+            // Guard released — safe for a subscriber callback to re-enter.
+            deliver_events(ffi, events);
+            to_c_string(response)
+        }
+    )
 }
 
 #[no_mangle]
@@ -155,37 +203,42 @@ pub extern "C" fn engine_query_entries_bin(
     collection: *const c_char,
     out_len: *mut usize,
 ) -> *mut u8 {
-    if handle.is_null() || out_len.is_null() {
-        return std::ptr::null_mut();
-    }
-    let ffi = unsafe { &*(handle as *mut EngineFfi) };
-    let Some(collection) = (unsafe { cstr(collection) }) else {
-        return std::ptr::null_mut();
-    };
-    let engine = ffi.inner.lock().unwrap();
-    let mut rows: Vec<(String, String)> = vec![];
-    let result = (|| -> Result<(), rusqlite::Error> {
-        let mut stmt = engine
-            .store
-            .conn
-            .prepare("SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key")?;
-        let iter = stmt.query_map(params![collection], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in iter {
-            rows.push(row?);
+    ffi_guard!(std::ptr::null_mut(), {
+        if handle.is_null() || out_len.is_null() {
+            return std::ptr::null_mut();
         }
-        Ok(())
-    })();
-    if let Err(e) = result {
-        set_last_error(2, &e.to_string());
-        return std::ptr::null_mut();
-    }
-    let buf = encode_entries(&rows);
-    let len = buf.len();
-    let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
-    unsafe { *out_len = len };
-    ptr
+        // Audit F29: define *out_len on every return path so a caller that
+        // reads it without checking the NULL return sees 0, not stale memory.
+        unsafe { *out_len = 0 };
+        let ffi = unsafe { &*(handle as *mut EngineFfi) };
+        let Some(collection) = (unsafe { cstr(collection) }) else {
+            return std::ptr::null_mut();
+        };
+        let engine = lock_engine(&ffi.inner);
+        let mut rows: Vec<(String, String)> = vec![];
+        let result = (|| -> Result<(), rusqlite::Error> {
+            let mut stmt = engine
+                .store
+                .conn
+                .prepare("SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key")?;
+            let iter = stmt.query_map(params![collection], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in iter {
+                rows.push(row?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            set_last_error(2, &e.to_string());
+            return std::ptr::null_mut();
+        }
+        let buf = encode_entries(&rows);
+        let len = buf.len();
+        let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
+        unsafe { *out_len = len };
+        ptr
+    })
 }
 
 /// Ingest without the JSON command envelope: source id and payload cross as
@@ -193,13 +246,17 @@ pub extern "C" fn engine_query_entries_bin(
 /// twice. Response envelope matches engine_execute's ingest exactly.
 fn ingest_response(ffi: &EngineFfi, source_id: &str, payload: &str) -> *mut c_char {
     let (response, events) = {
-        let mut engine = ffi.inner.lock().unwrap();
+        let mut engine = lock_engine(&ffi.inner);
         let response = match engine.ingest(source_id, payload) {
-            Ok((summary, skipped)) => {
-                let mut v = serde_json::to_value(&summary).unwrap();
-                v["skipped"] = serde_json::json!(skipped);
-                serde_json::json!({"ok": true, "value": v}).to_string()
-            }
+            // Audit F30: a serialization failure returns an error envelope
+            // rather than unwrap-panicking across the FFI boundary.
+            Ok((summary, skipped)) => match serde_json::to_value(&summary) {
+                Ok(mut v) => {
+                    v["skipped"] = serde_json::json!(skipped);
+                    serde_json::json!({"ok": true, "value": v}).to_string()
+                }
+                Err(e) => serde_json::json!({"ok": false, "code": 2, "message": e.to_string()}).to_string(),
+            },
             Err(e) => {
                 serde_json::json!({"ok": false, "code": e.code(), "message": e.to_string()}).to_string()
             }
@@ -216,14 +273,19 @@ pub extern "C" fn engine_ingest_direct(
     source_id: *const c_char,
     payload: *const c_char,
 ) -> *mut c_char {
-    if handle.is_null() {
-        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null engine handle\"}".into());
-    }
-    let ffi = unsafe { &*(handle as *mut EngineFfi) };
-    let (Some(source_id), Some(payload)) = (unsafe { cstr(source_id) }, unsafe { cstr(payload) }) else {
-        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null argument\"}".into());
-    };
-    ingest_response(ffi, source_id, payload)
+    ffi_guard!(
+        to_c_string("{\"ok\":false,\"code\":500,\"message\":\"internal panic\"}".into()),
+        {
+            if handle.is_null() {
+                return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null engine handle\"}".into());
+            }
+            let ffi = unsafe { &*(handle as *mut EngineFfi) };
+            let (Some(source_id), Some(payload)) = (unsafe { cstr(source_id) }, unsafe { cstr(payload) }) else {
+                return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null argument\"}".into());
+            };
+            ingest_response(ffi, source_id, payload)
+        }
+    )
 }
 
 /// Byte-slice ingest: the payload arrives as (ptr, len) — no NUL-terminated
@@ -237,64 +299,75 @@ pub extern "C" fn engine_ingest_bytes(
     payload: *const u8,
     payload_len: usize,
 ) -> *mut c_char {
-    if handle.is_null() {
-        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null engine handle\"}".into());
-    }
-    let ffi = unsafe { &*(handle as *mut EngineFfi) };
-    let Some(source_id) = (unsafe { cstr(source_id) }) else {
-        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null source id\"}".into());
-    };
-    if payload.is_null() {
-        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null payload\"}".into());
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
-    let Ok(payload) = std::str::from_utf8(bytes) else {
-        return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"payload is not valid UTF-8\"}".into());
-    };
-    ingest_response(ffi, source_id, payload)
+    ffi_guard!(
+        to_c_string("{\"ok\":false,\"code\":500,\"message\":\"internal panic\"}".into()),
+        {
+            if handle.is_null() {
+                return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null engine handle\"}".into());
+            }
+            let ffi = unsafe { &*(handle as *mut EngineFfi) };
+            let Some(source_id) = (unsafe { cstr(source_id) }) else {
+                return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null source id\"}".into());
+            };
+            // Audit F28: reject an over-large length that would violate
+            // from_raw_parts' isize::MAX precondition (immediate UB).
+            if payload.is_null() || payload_len > isize::MAX as usize {
+                return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null or oversized payload\"}".into());
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+            let Ok(payload) = std::str::from_utf8(bytes) else {
+                return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"payload is not valid UTF-8\"}".into());
+            };
+            ingest_response(ffi, source_id, payload)
+        }
+    )
 }
 
 /// Fast-path kv get: returns the value (free with engine_free_string) or NULL
 /// when the key is missing or on error (see engine_last_error).
 #[no_mangle]
 pub extern "C" fn engine_kv_get(handle: *mut c_void, key: *const c_char) -> *mut c_char {
-    if handle.is_null() {
-        return std::ptr::null_mut();
-    }
-    let ffi = unsafe { &*(handle as *mut EngineFfi) };
-    let Some(key) = (unsafe { cstr(key) }) else {
-        return std::ptr::null_mut();
-    };
-    let mut engine = ffi.inner.lock().unwrap();
-    let now = engine.now();
-    match crate::commands::get(&mut engine, key, now) {
-        Ok(Some(v)) => to_c_string(v),
-        Ok(None) => std::ptr::null_mut(),
-        Err(e) => {
-            set_last_error(e.code(), &e.to_string());
-            std::ptr::null_mut()
+    ffi_guard!(std::ptr::null_mut(), {
+        if handle.is_null() {
+            return std::ptr::null_mut();
         }
-    }
+        let ffi = unsafe { &*(handle as *mut EngineFfi) };
+        let Some(key) = (unsafe { cstr(key) }) else {
+            return std::ptr::null_mut();
+        };
+        let mut engine = lock_engine(&ffi.inner);
+        let now = engine.now();
+        match crate::commands::get(&mut engine, key, now) {
+            Ok(Some(v)) => to_c_string(v),
+            Ok(None) => std::ptr::null_mut(),
+            Err(e) => {
+                set_last_error(e.code(), &e.to_string());
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 /// Fast-path kv set: returns true on success; on failure sets engine_last_error.
 #[no_mangle]
 pub extern "C" fn engine_kv_set(handle: *mut c_void, key: *const c_char, value: *const c_char) -> bool {
-    if handle.is_null() {
-        return false;
-    }
-    let ffi = unsafe { &*(handle as *mut EngineFfi) };
-    let (Some(key), Some(value)) = (unsafe { cstr(key) }, unsafe { cstr(value) }) else {
-        return false;
-    };
-    let mut engine = ffi.inner.lock().unwrap();
-    match crate::commands::set(&mut engine, key, value) {
-        Ok(()) => true,
-        Err(e) => {
-            set_last_error(e.code(), &e.to_string());
-            false
+    ffi_guard!(false, {
+        if handle.is_null() {
+            return false;
         }
-    }
+        let ffi = unsafe { &*(handle as *mut EngineFfi) };
+        let (Some(key), Some(value)) = (unsafe { cstr(key) }, unsafe { cstr(value) }) else {
+            return false;
+        };
+        let mut engine = lock_engine(&ffi.inner);
+        match crate::commands::set(&mut engine, key, value) {
+            Ok(()) => true,
+            Err(e) => {
+                set_last_error(e.code(), &e.to_string());
+                false
+            }
+        }
+    })
 }
 
 #[no_mangle]
@@ -306,44 +379,47 @@ pub extern "C" fn engine_query_entries_schema_bin_range(
     offset: i64,
     out_len: *mut usize,
 ) -> *mut u8 {
-    if handle.is_null() || out_len.is_null() {
-        return std::ptr::null_mut();
-    }
-    let ffi = unsafe { &*(handle as *mut EngineFfi) };
-    let Some(collection) = (unsafe { cstr(collection) }) else {
-        return std::ptr::null_mut();
-    };
-    let Some(fields_csv) = (unsafe { cstr(fields_csv) }) else {
-        return std::ptr::null_mut();
-    };
-    let fields: Vec<&str> = fields_csv.split(',').map(str::trim).filter(|f| !f.is_empty()).collect();
-    if fields.is_empty() || limit <= 0 || offset < 0 {
-        set_last_error(4, "bad fields/limit/offset");
-        return std::ptr::null_mut();
-    }
-    let engine = ffi.inner.lock().unwrap();
-    let mut rows: Vec<(String, String)> = vec![];
-    let result = (|| -> Result<(), rusqlite::Error> {
-        let mut stmt = engine.store.conn.prepare_cached(
-            "SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key LIMIT ?2 OFFSET ?3",
-        )?;
-        let iter = stmt.query_map(params![collection, limit, offset], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in iter {
-            rows.push(row?);
+    ffi_guard!(std::ptr::null_mut(), {
+        if handle.is_null() || out_len.is_null() {
+            return std::ptr::null_mut();
         }
-        Ok(())
-    })();
-    if let Err(e) = result {
-        set_last_error(2, &e.to_string());
-        return std::ptr::null_mut();
-    }
-    let buf = crate::binenc::encode_entries_schema(&rows, &fields);
-    let len = buf.len();
-    let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
-    unsafe { *out_len = len };
-    ptr
+        unsafe { *out_len = 0 }; // audit F29
+        let ffi = unsafe { &*(handle as *mut EngineFfi) };
+        let Some(collection) = (unsafe { cstr(collection) }) else {
+            return std::ptr::null_mut();
+        };
+        let Some(fields_csv) = (unsafe { cstr(fields_csv) }) else {
+            return std::ptr::null_mut();
+        };
+        let fields: Vec<&str> = fields_csv.split(',').map(str::trim).filter(|f| !f.is_empty()).collect();
+        if fields.is_empty() || limit <= 0 || offset < 0 {
+            set_last_error(4, "bad fields/limit/offset");
+            return std::ptr::null_mut();
+        }
+        let engine = lock_engine(&ffi.inner);
+        let mut rows: Vec<(String, String)> = vec![];
+        let result = (|| -> Result<(), rusqlite::Error> {
+            let mut stmt = engine.store.conn.prepare_cached(
+                "SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key LIMIT ?2 OFFSET ?3",
+            )?;
+            let iter = stmt.query_map(params![collection, limit, offset], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in iter {
+                rows.push(row?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            set_last_error(2, &e.to_string());
+            return std::ptr::null_mut();
+        }
+        let buf = crate::binenc::encode_entries_schema(&rows, &fields);
+        let len = buf.len();
+        let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
+        unsafe { *out_len = len };
+        ptr
+    })
 }
 
 #[no_mangle]
@@ -353,45 +429,48 @@ pub extern "C" fn engine_query_entries_schema_bin(
     fields_csv: *const c_char,
     out_len: *mut usize,
 ) -> *mut u8 {
-    if handle.is_null() || out_len.is_null() {
-        return std::ptr::null_mut();
-    }
-    let ffi = unsafe { &*(handle as *mut EngineFfi) };
-    let Some(collection) = (unsafe { cstr(collection) }) else {
-        return std::ptr::null_mut();
-    };
-    let Some(fields_csv) = (unsafe { cstr(fields_csv) }) else {
-        return std::ptr::null_mut();
-    };
-    let fields: Vec<&str> = fields_csv.split(',').map(str::trim).filter(|f| !f.is_empty()).collect();
-    if fields.is_empty() {
-        set_last_error(4, "no fields given");
-        return std::ptr::null_mut();
-    }
-    let engine = ffi.inner.lock().unwrap();
-    let mut rows: Vec<(String, String)> = vec![];
-    let result = (|| -> Result<(), rusqlite::Error> {
-        let mut stmt = engine
-            .store
-            .conn
-            .prepare("SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key")?;
-        let iter = stmt.query_map(params![collection], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in iter {
-            rows.push(row?);
+    ffi_guard!(std::ptr::null_mut(), {
+        if handle.is_null() || out_len.is_null() {
+            return std::ptr::null_mut();
         }
-        Ok(())
-    })();
-    if let Err(e) = result {
-        set_last_error(2, &e.to_string());
-        return std::ptr::null_mut();
-    }
-    let buf = crate::binenc::encode_entries_schema(&rows, &fields);
-    let len = buf.len();
-    let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
-    unsafe { *out_len = len };
-    ptr
+        unsafe { *out_len = 0 }; // audit F29
+        let ffi = unsafe { &*(handle as *mut EngineFfi) };
+        let Some(collection) = (unsafe { cstr(collection) }) else {
+            return std::ptr::null_mut();
+        };
+        let Some(fields_csv) = (unsafe { cstr(fields_csv) }) else {
+            return std::ptr::null_mut();
+        };
+        let fields: Vec<&str> = fields_csv.split(',').map(str::trim).filter(|f| !f.is_empty()).collect();
+        if fields.is_empty() {
+            set_last_error(4, "no fields given");
+            return std::ptr::null_mut();
+        }
+        let engine = lock_engine(&ffi.inner);
+        let mut rows: Vec<(String, String)> = vec![];
+        let result = (|| -> Result<(), rusqlite::Error> {
+            let mut stmt = engine
+                .store
+                .conn
+                .prepare("SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key")?;
+            let iter = stmt.query_map(params![collection], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in iter {
+                rows.push(row?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            set_last_error(2, &e.to_string());
+            return std::ptr::null_mut();
+        }
+        let buf = crate::binenc::encode_entries_schema(&rows, &fields);
+        let len = buf.len();
+        let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
+        unsafe { *out_len = len };
+        ptr
+    })
 }
 
 #[no_mangle]
@@ -403,11 +482,12 @@ pub extern "C" fn engine_set_event_callback(
     if handle.is_null() {
         return;
     }
+    ffi_guard!((), {
     let ffi = unsafe { &*(handle as *mut EngineFfi) };
     // The sink lives on EngineFfi (audit S7), not inside the engine mutex, so
     // events can be delivered after `inner` is unlocked. This short-lived lock
     // is never held while `inner` is locked.
-    let mut sink_guard = ffi.sink.lock().unwrap();
+    let mut sink_guard = ffi.sink.lock().unwrap_or_else(|p| p.into_inner());
     match cb {
         Some(cb) => {
             let holder = CallbackHolder { ctx: ctx as usize, cb };
@@ -430,6 +510,7 @@ pub extern "C" fn engine_set_event_callback(
         }
         None => *sink_guard = None,
     }
+    })
 }
 
 #[no_mangle]
@@ -443,21 +524,39 @@ pub extern "C" fn engine_free_string(s: *mut c_char) {
 pub extern "C" fn engine_free_bytes(p: *mut u8, len: usize) {
     if !p.is_null() {
         unsafe {
-            drop(Box::from_raw(std::slice::from_raw_parts_mut(p, len) as *mut [u8]));
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, len)));
         }
     }
 }
 
 #[no_mangle]
 pub extern "C" fn engine_close(handle: *mut c_void) {
-    if !handle.is_null() {
+    if handle.is_null() {
+        return;
+    }
+    // Audit S8: only free a handle currently registered as live. Removing it
+    // here (atomically) means a concurrent or duplicate close finds it absent
+    // and returns without touching freed memory — no double free / UAF.
+    {
+        let mut live = match live_handles().lock() {
+            Ok(l) => l,
+            Err(p) => p.into_inner(),
+        };
+        if !live.remove(&(handle as usize)) {
+            return; // unknown or already-closed handle
+        }
+    }
+    ffi_guard!((), {
         let mut ffi = unsafe { Box::from_raw(handle as *mut EngineFfi) };
         ffi.flusher_stop.store(true, Ordering::Relaxed);
         if let Some(h) = ffi.flusher.take() {
             h.thread().unpark();
             let _ = h.join();
         }
-        if let Ok(mut engine) = ffi.inner.lock() {
+        {
+            // Poison-safe (audit S9): still flush + checkpoint even if a prior
+            // panic poisoned the engine mutex.
+            let mut engine = ffi.inner.lock().unwrap_or_else(|p| p.into_inner());
             // Audit S12: report a final-flush failure via last_error instead of
             // dropping acknowledged write-behind sets silently.
             if let Err(e) = engine.flush_kv() {
@@ -470,7 +569,7 @@ pub extern "C" fn engine_close(handle: *mut c_void) {
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         }
         drop(ffi);
-    }
+    })
 }
 
 #[cfg(test)]
@@ -639,6 +738,38 @@ mod tests {
         assert!(REENTERED.load(Ordering::SeqCst), "callback never ran / deadlocked");
         HANDLE.store(std::ptr::null_mut(), Ordering::SeqCst);
         engine_close(h);
+    }
+
+    // Audit S16: a panic reachable from an extern "C" fn must be caught and
+    // turned into an error envelope, not unwind across the ABI (which aborts
+    // the whole app). The process surviving to the assert IS the test.
+    #[test]
+    fn panic_in_command_is_contained_as_error_envelope() {
+        let path = CString::new(":memory:").unwrap();
+        let h = engine_open(path.as_ptr());
+        let req = CString::new(r#"{"cmd":"__test_panic","args":[]}"#).unwrap();
+        let r = unsafe { engine_execute(h, req.as_ptr()) };
+        let s = unsafe { CStr::from_ptr(r) }.to_str().unwrap().to_string();
+        engine_free_string(r);
+        assert!(s.contains("\"ok\":false"), "panic not contained: {s}");
+        assert!(s.contains("500"), "expected internal-panic code: {s}");
+        // Audit S9: the engine must still work after the panic (mutex not left
+        // in an abort-cascading poisoned state).
+        let req2 = CString::new(r#"{"cmd":"set","args":["a","1"]}"#).unwrap();
+        let r2 = unsafe { engine_execute(h, req2.as_ptr()) };
+        let s2 = unsafe { CStr::from_ptr(r2) }.to_str().unwrap().to_string();
+        engine_free_string(r2);
+        assert!(s2.contains("\"ok\":true"), "engine dead after panic: {s2}");
+        engine_close(h);
+    }
+
+    // Audit S8: a double close must not double-free / crash.
+    #[test]
+    fn double_close_is_safe() {
+        let path = CString::new(":memory:").unwrap();
+        let h = engine_open(path.as_ptr());
+        engine_close(h);
+        engine_close(h); // must be a no-op, not a double free
     }
 
     #[test]
