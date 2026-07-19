@@ -31,6 +31,14 @@ pub struct Engine {
     pub pubsub: PubSub,
     pub clock: Box<dyn Fn() -> i64 + Send>,
     pub kv: KvCache,
+    /// Change events buffered during a command, drained and delivered by the
+    /// FFI layer AFTER the engine mutex is released (audit S7) so a subscriber
+    /// callback can re-enter the engine without deadlocking.
+    pub pending_events: Vec<(String, String)>,
+    /// A write-behind flush failure recorded by the background flusher (audit
+    /// S12). Surfaced (and cleared) by the next command so a silently failing
+    /// disk becomes visible instead of losing acknowledged sets quietly.
+    pub sticky_error: Option<EngineError>,
 }
 
 impl Engine {
@@ -48,7 +56,20 @@ impl Engine {
                 high_water: 256,
                 coalesce: true,
             },
+            pending_events: Vec::new(),
+            sticky_error: None,
         })
+    }
+
+    /// Drains change events buffered by the last command. Called by the FFI
+    /// layer after the engine mutex is released so the sink runs lock-free.
+    pub fn take_events(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_events)
+    }
+
+    /// Takes any recorded background-flush failure (audit S12).
+    pub fn take_sticky_error(&mut self) -> Option<EngineError> {
+        self.sticky_error.take()
     }
 
     /// Drains pending kv sets into SQLite in one transaction. Each set also
@@ -103,8 +124,12 @@ impl Engine {
             .ok_or_else(|| EngineError::Source(format!("unknown source '{source_id}'")))?;
         let now = self.now();
 
+        // Audit S15: fold the source config into the skip fingerprint, so
+        // re-registering a source with different merge rules (priority, key,
+        // collection) never lets a byte-identical payload hit the skip.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         payload.hash(&mut hasher);
+        serde_json::to_string(&cfg).unwrap_or_default().hash(&mut hasher);
         let content_hash = format!("{:x}", hasher.finish());
         let prev: Option<String> = self
             .store
@@ -133,19 +158,23 @@ impl Engine {
         let t_parse = std::time::Instant::now();
         let outcome = normalize(&cfg, payload, now)?;
         let parse_ms = t_parse.elapsed().as_secs_f64() * 1000.0;
-        let mut summary = reconcile(&mut self.store, &cfg, outcome, now)?;
+        // Audit S6: content_hash is written inside reconcile's transaction, so
+        // a committed batch always has its skip fingerprint (and no post-commit
+        // step can fail and swallow the change events).
+        let mut summary = reconcile(&mut self.store, &cfg, outcome, now, &content_hash)?;
         if let Some(t) = summary.timings.as_mut() {
             t.parse_ms = parse_ms;
         }
         let summary = summary;
-        self.store.conn.execute(
-            "UPDATE sync_meta SET content_hash = ?2 WHERE source = ?1",
-            params![source_id, content_hash],
-        )?;
+        // Audit S7: buffer events instead of firing the sink here (under the
+        // engine lock). The FFI layer delivers them after releasing the lock.
         if !summary.collections.is_empty() {
             let payload_json = serde_json::to_string(&summary).unwrap();
             for c in &summary.collections {
-                self.pubsub.publish(&format!("changes:{c}"), &payload_json);
+                let channel = format!("changes:{c}");
+                if self.pubsub.any_match(&channel) {
+                    self.pending_events.push((channel, payload_json.clone()));
+                }
             }
         }
         Ok((summary, false))

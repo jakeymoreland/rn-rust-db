@@ -2,10 +2,39 @@ use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::glob::glob_match;
 use crate::store::Store;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use std::collections::BTreeMap;
 
 pub const RESERVED_PREFIXES: [&str; 4] = ["entry:", "idx:", "meta:", "changes:"];
+
+/// Bound on the write-behind queue: beyond this, set() fails rather than grow
+/// RAM without limit when flushes keep failing (audit S12).
+pub(crate) const PENDING_CAP: usize = 4096;
+/// Bound on the read cache so it can't accumulate every key touched in a
+/// session (audit F24). Non-pending entries are evicted past this.
+pub(crate) const MAP_CAP: usize = 8192;
+
+/// Evicts arbitrary non-pending entries from the read cache until it is within
+/// MAP_CAP. Pending keys are the source of truth until flushed, so they stay
+/// resident regardless of coalesce mode.
+fn bound_read_cache(kv: &mut crate::engine::KvCache) {
+    if kv.map.len() <= MAP_CAP {
+        return;
+    }
+    let pending: std::collections::HashSet<&str> =
+        kv.pending.iter().map(|(k, _)| k.as_str()).collect();
+    let victims: Vec<String> = kv
+        .map
+        .keys()
+        .filter(|k| !pending.contains(k.as_str()))
+        .take(kv.map.len() - MAP_CAP)
+        .cloned()
+        .collect();
+    for k in victims {
+        kv.map.remove(&k);
+        kv.ttl.remove(&k);
+    }
+}
 
 fn check_writable(key: &str) -> Result<(), EngineError> {
     for p in RESERVED_PREFIXES {
@@ -20,16 +49,22 @@ fn check_writable(key: &str) -> Result<(), EngineError> {
 
 /// Deletes key rows if expired. Returns true if the key was expired+purged.
 fn purge_if_expired(store: &Store, key: &str, now_ms: i64) -> Result<bool, EngineError> {
+    // Audit S11: .optional() distinguishes "no TTL row" from a real storage
+    // error — the latter propagates instead of being read as "not expired".
     let expires: Option<i64> = store
         .conn
         .prepare_cached("SELECT expires_at FROM key_ttl WHERE key = ?1")?
         .query_row(params![key], |r| r.get(0))
-        .ok();
+        .optional()?;
     if let Some(at) = expires {
         if now_ms >= at {
-            store.conn.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
-            store.conn.execute("DELETE FROM hash WHERE key = ?1", params![key])?;
-            store.conn.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
+            // Audit S10: purge kv + hash + ttl rows in one transaction so a
+            // kill mid-purge can't resurrect a half-deleted key.
+            let tx = store.conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+            tx.execute("DELETE FROM hash WHERE key = ?1", params![key])?;
+            tx.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
+            tx.commit()?;
             return Ok(true);
         }
     }
@@ -55,12 +90,13 @@ pub fn get(engine: &mut Engine, key: &str, now_ms: i64) -> Result<Option<String>
     if purge_if_expired(&engine.store, key, now_ms)? {
         return Ok(None);
     }
+    // Audit S11: a storage error here must not read as a cache miss.
     let v: Option<String> = engine
         .store
         .conn
         .prepare_cached("SELECT value FROM kv WHERE key = ?1")?
         .query_row(params![key], |r| r.get(0))
-        .ok();
+        .optional()?;
     if let Some(ref value) = v {
         engine.kv.map.insert(key.to_string(), value.clone());
         let expires: Option<i64> = engine
@@ -68,17 +104,27 @@ pub fn get(engine: &mut Engine, key: &str, now_ms: i64) -> Result<Option<String>
             .conn
             .prepare_cached("SELECT expires_at FROM key_ttl WHERE key = ?1")?
             .query_row(params![key], |r| r.get(0))
-            .ok();
+            .optional()?;
         if let Some(at) = expires {
             engine.kv.ttl.insert(key.to_string(), at);
         }
+        bound_read_cache(&mut engine.kv); // audit F24
     }
     Ok(v)
 }
 
 pub fn set(engine: &mut Engine, key: &str, value: &str) -> Result<(), EngineError> {
     check_writable(key)?;
+    // Audit S12: refuse to grow the write-behind queue past its cap (which
+    // happens when flushes keep failing on a dead disk). Not-yet-queued keys
+    // are checked so an update to an already-pending key still succeeds.
+    if engine.kv.pending.len() >= PENDING_CAP && !engine.kv.pending_index.contains_key(key) {
+        return Err(EngineError::Storage(format!(
+            "write-behind queue full ({PENDING_CAP}); flush is failing"
+        )));
+    }
     engine.kv.map.insert(key.to_string(), value.to_string());
+    bound_read_cache(&mut engine.kv); // audit F24
     // Redis SET semantics: overwriting a key clears any existing TTL. The
     // matching key_ttl row is cleared when this pending write flushes.
     engine.kv.ttl.remove(key);
@@ -104,9 +150,12 @@ pub fn del(engine: &mut Engine, key: &str) -> Result<bool, EngineError> {
     engine.kv.map.remove(key);
     engine.kv.ttl.remove(key);
     let store = &engine.store;
-    let a = store.conn.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
-    let b = store.conn.execute("DELETE FROM hash WHERE key = ?1", params![key])?;
-    store.conn.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
+    // Audit S10: one transaction for all three tables.
+    let tx = store.conn.unchecked_transaction()?;
+    let a = tx.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+    let b = tx.execute("DELETE FROM hash WHERE key = ?1", params![key])?;
+    tx.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
+    tx.commit()?;
     Ok(a + b > 0)
 }
 
@@ -121,8 +170,8 @@ pub fn hset(store: &Store, key: &str, field: &str, value: &str) -> Result<(), En
          ON CONFLICT(key, field) DO UPDATE SET value = excluded.value",
         params![key, field, value],
     )?;
-    // Redis SET semantics: (re)writing a key clears any existing TTL.
-    store.conn.execute("DELETE FROM key_ttl WHERE key = ?1", params![key])?;
+    // Audit S4: Redis HSET preserves an existing TTL — only whole-key
+    // replacement (SET) clears it. The TTL row is intentionally left intact.
     Ok(())
 }
 
@@ -134,7 +183,7 @@ pub fn hget(store: &Store, key: &str, field: &str, now_ms: i64) -> Result<Option
         .conn
         .prepare_cached("SELECT value FROM hash WHERE key = ?1 AND field = ?2")?
         .query_row(params![key, field], |r| r.get(0))
-        .ok())
+        .optional()?)
 }
 
 pub fn hgetall(store: &Store, key: &str, now_ms: i64) -> Result<BTreeMap<String, String>, EngineError> {
@@ -146,7 +195,7 @@ pub fn hgetall(store: &Store, key: &str, now_ms: i64) -> Result<BTreeMap<String,
                     "SELECT fields, updated_at FROM entries WHERE collection = ?1 AND natural_key = ?2",
                 )?
                 .query_row(params![collection, natural_key], |r| Ok((r.get(0)?, r.get(1)?)))
-                .ok();
+                .optional()?;
             return Ok(match row {
                 None => BTreeMap::new(),
                 Some((fields_json, updated_at)) => {
@@ -204,26 +253,31 @@ pub fn scan(engine: &mut Engine, pattern: &str, now_ms: i64) -> Result<Vec<Strin
 
 pub fn expire(engine: &mut Engine, key: &str, ttl_ms: i64, now_ms: i64) -> Result<(), EngineError> {
     check_writable(key)?;
+    // Audit F23: reject a non-positive ttl instead of storing an already-past
+    // expiry, and saturate rather than overflow on an absurd ttl.
+    if ttl_ms <= 0 {
+        return Err(EngineError::Command(format!("ttl must be positive, got {ttl_ms}")));
+    }
+    let expires_at = now_ms.saturating_add(ttl_ms);
     engine.flush_kv()?; // the key may only exist as a pending set
     let store = &engine.store;
-    let exists: bool = store
-        .conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM kv WHERE key = ?1 UNION SELECT 1 FROM hash WHERE key = ?1)",
-            params![key],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
+    // Audit S11: a storage failure here must surface, not masquerade as a
+    // missing key (which would return a misleading code-4 "missing key" error).
+    let exists: bool = store.conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kv WHERE key = ?1 UNION SELECT 1 FROM hash WHERE key = ?1)",
+        params![key],
+        |r| r.get(0),
+    )?;
     if !exists {
         return Err(EngineError::Command(format!("cannot expire missing key '{key}'")));
     }
     store.conn.execute(
         "INSERT INTO key_ttl(key, expires_at) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET expires_at = excluded.expires_at",
-        params![key, now_ms + ttl_ms],
+        params![key, expires_at],
     )?;
     if engine.kv.map.contains_key(key) {
-        engine.kv.ttl.insert(key.to_string(), now_ms + ttl_ms);
+        engine.kv.ttl.insert(key.to_string(), expires_at);
     }
     Ok(())
 }
@@ -235,6 +289,7 @@ pub fn ttl(engine: &mut Engine, key: &str, now_ms: i64) -> Result<Option<i64>, E
         engine.kv.ttl.remove(key);
         return Ok(None);
     }
+    // Audit S11: propagate storage errors instead of reading them as "no TTL".
     let expires: Option<i64> = engine
         .store
         .conn
@@ -243,7 +298,7 @@ pub fn ttl(engine: &mut Engine, key: &str, now_ms: i64) -> Result<Option<i64>, E
             params![key],
             |r| r.get(0),
         )
-        .ok();
+        .optional()?;
     Ok(expires.map(|at| at - now_ms))
 }
 
@@ -271,6 +326,21 @@ mod tests {
         assert!(del(&mut en, "a").unwrap());
         assert!(!del(&mut en, "a").unwrap());
         assert_eq!(get(&mut en, "a", 0).unwrap(), None);
+    }
+
+    // Audit S10: del removes the kv row AND any hash rows AND the ttl row in
+    // one transaction — no window where a key is half-deleted.
+    #[test]
+    fn del_removes_kv_hash_and_ttl_atomically() {
+        let mut en = e();
+        set(&mut en, "k", "v").unwrap();
+        hset(&en.store, "k", "f", "hv").unwrap();
+        expire(&mut en, "k", 1000, 0).unwrap();
+        assert!(del(&mut en, "k").unwrap());
+        let kv: i64 = en.store.conn.query_row("SELECT count(*) FROM kv WHERE key='k'", [], |r| r.get(0)).unwrap();
+        let hash: i64 = en.store.conn.query_row("SELECT count(*) FROM hash WHERE key='k'", [], |r| r.get(0)).unwrap();
+        let ttl: i64 = en.store.conn.query_row("SELECT count(*) FROM key_ttl WHERE key='k'", [], |r| r.get(0)).unwrap();
+        assert_eq!((kv, hash, ttl), (0, 0, 0), "del left rows behind");
     }
 
     #[test]
@@ -406,16 +476,61 @@ mod tests {
         assert_eq!(get(&mut en, "a", 1_000).unwrap(), Some("2".into()));
     }
 
+    // Audit S4: Redis HSET preserves an existing TTL (only whole-key
+    // replacement like SET clears it). After the fix, a key with a TTL that is
+    // then hset must still expire.
     #[test]
-    fn hset_after_expiry_survives() {
+    fn hset_preserves_existing_ttl() {
         let en = e();
         hset(&en.store, "h", "f", "1").unwrap();
-        // hash-only key: expire via the engine wrapper
         let mut en = en;
         expire(&mut en, "h", 10, 0).unwrap();
-        // time passes well past expiry, but nothing reads the key in between
-        hset(&en.store, "h", "f", "2").unwrap();
-        assert_eq!(hget(&en.store, "h", "f", 1_000).unwrap(), Some("2".into()));
+        hset(&en.store, "h", "f", "2").unwrap(); // must NOT clear the TTL
+        assert_eq!(ttl(&mut en, "h", 5).unwrap(), Some(5), "hset wrongly cleared the TTL");
+        assert!(hget(&en.store, "h", "f", 1_000).unwrap().is_none(), "key should have expired");
+    }
+
+    // Audit F23: expire must not overflow on an absurd ttl and must reject a
+    // non-positive ttl.
+    #[test]
+    fn expire_bounds() {
+        let mut en = e();
+        set(&mut en, "a", "1").unwrap();
+        // saturating: no panic, key stays alive far in the future
+        expire(&mut en, "a", i64::MAX, 0).unwrap();
+        assert_eq!(get(&mut en, "a", 1_000_000).unwrap(), Some("1".into()));
+        // non-positive ttl rejected
+        set(&mut en, "b", "1").unwrap();
+        assert!(matches!(expire(&mut en, "b", 0, 0), Err(EngineError::Command(_))));
+        assert!(matches!(expire(&mut en, "b", -5, 0), Err(EngineError::Command(_))));
+    }
+
+    // Audit S12: the pending write-behind queue is bounded — beyond the cap,
+    // set fails loudly instead of growing RAM without limit.
+    #[test]
+    fn pending_queue_is_bounded() {
+        let mut en = e();
+        en.kv.high_water = usize::MAX; // never auto-flush
+        en.kv.coalesce = false; // every set pends distinctly
+        let mut hit_cap = false;
+        for i in 0..(super::PENDING_CAP + 100) {
+            if set(&mut en, &format!("k{i}"), "v").is_err() {
+                hit_cap = true;
+                break;
+            }
+        }
+        assert!(hit_cap, "pending queue grew past the cap unbounded");
+    }
+
+    // Audit F24: the read cache is bounded — it must not accumulate every key
+    // ever touched for the whole session.
+    #[test]
+    fn read_cache_is_bounded() {
+        let mut en = e();
+        for i in 0..(super::MAP_CAP + 1000) {
+            set(&mut en, &format!("k{i}"), "v").unwrap();
+        }
+        assert!(en.kv.map.len() <= super::MAP_CAP, "cache size {} exceeded cap", en.kv.map.len());
     }
 
     #[test]

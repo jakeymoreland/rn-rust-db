@@ -1,10 +1,25 @@
+/// Largest byte length a u32 length prefix can carry without truncating, and
+/// without colliding with the SCHEMA_FIELD_MISSING sentinel (audit F27). On
+/// mobile this is unreachable (SQLite's default 1 GB string limit caps rows far
+/// below), but a length past it would frame-shift the whole buffer, so it is
+/// guarded rather than silently cast.
+const MAX_LEN: usize = (u32::MAX - 1) as usize;
+
+/// LE length prefix with a debug assertion and a release-mode clamp so an
+/// oversized length can never truncate/frame-shift the buffer.
+#[inline]
+fn le_len(n: usize) -> [u8; 4] {
+    debug_assert!(n <= MAX_LEN, "binenc length {n} exceeds MAX_LEN");
+    (n.min(MAX_LEN) as u32).to_le_bytes()
+}
+
 pub fn encode_entries(rows: &[(String, String)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + rows.iter().map(|(k, v)| 8 + k.len() + v.len()).sum::<usize>());
     buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
     for (key, json) in rows {
-        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&le_len(key.len()));
         buf.extend_from_slice(key.as_bytes());
-        buf.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&le_len(json.len()));
         buf.extend_from_slice(json.as_bytes());
     }
     buf
@@ -24,12 +39,12 @@ pub fn encode_entries_schema(rows: &[(String, String)], fields: &[&str]) -> Vec<
     let mut buf = Vec::new();
     buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
     for f in fields {
-        buf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&le_len(f.len()));
         buf.extend_from_slice(f.as_bytes());
     }
     buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
     for (key, json) in rows {
-        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&le_len(key.len()));
         buf.extend_from_slice(key.as_bytes());
         let parsed: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
         for f in fields {
@@ -38,12 +53,12 @@ pub fn encode_entries_schema(rows: &[(String, String)], fields: &[&str]) -> Vec<
                     buf.extend_from_slice(&SCHEMA_FIELD_MISSING.to_le_bytes());
                 }
                 Some(serde_json::Value::String(s)) => {
-                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&le_len(s.len()));
                     buf.extend_from_slice(s.as_bytes());
                 }
                 Some(v) => {
                     let s = v.to_string();
-                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&le_len(s.len()));
                     buf.extend_from_slice(s.as_bytes());
                 }
             }

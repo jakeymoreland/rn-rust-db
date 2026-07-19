@@ -48,6 +48,13 @@ impl PubSub {
         }
         matches
     }
+
+    /// Whether any active subscription matches this channel. Used to decide
+    /// which change events to buffer for delivery AFTER the engine lock is
+    /// released (audit S7) — the sink itself is invoked by the FFI layer.
+    pub fn any_match(&self, channel: &str) -> bool {
+        self.subs.iter().any(|s| glob_match(&s.pattern, channel))
+    }
 }
 
 #[cfg(test)]

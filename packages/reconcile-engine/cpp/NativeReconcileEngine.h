@@ -55,6 +55,9 @@ class NativeReconcileEngine
   static void eventTrampoline(void* ctx, const char* channel, const char* payload);
 
   engine_handle_t engine_{nullptr};
+  // Path the engine is currently open at, so a second open with a DIFFERENT
+  // path is rejected instead of silently no-oping (audit F37).
+  std::string openPath_;
   std::mutex engineMutex_;
 
   std::thread worker_;

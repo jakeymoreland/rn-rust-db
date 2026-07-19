@@ -1,6 +1,9 @@
 #include "NativeReconcileEngine.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -15,6 +18,37 @@ std::string takeRustString(char* s) {
   std::string out(s);
   engine_free_string(s);
   return out;
+}
+
+// Extracts code/message from an engine last-error JSON envelope
+// ({"code":n,"message":"..."}) and formats it as the "EngineError:<code>:<msg>"
+// tag the TS layer parses into an EngineError (audit F38). Minimal, dependency-
+// free extraction — the envelope shape is produced by our own Rust layer.
+std::string toEngineErrorTag(const std::string& envelope) {
+  int code = 2;
+  std::string message = envelope;
+  auto codePos = envelope.find("\"code\":");
+  if (codePos != std::string::npos) {
+    code = std::atoi(envelope.c_str() + codePos + 7);
+  }
+  auto msgKey = envelope.find("\"message\":\"");
+  if (msgKey != std::string::npos) {
+    size_t start = msgKey + 11;
+    std::string out;
+    for (size_t i = start; i < envelope.size(); i++) {
+      char c = envelope[i];
+      if (c == '\\' && i + 1 < envelope.size()) {
+        char n = envelope[++i];
+        out.push_back(n == 'n' ? '\n' : n == 't' ? '\t' : n);
+      } else if (c == '"') {
+        break;
+      } else {
+        out.push_back(c);
+      }
+    }
+    message = out;
+  }
+  return "EngineError:" + std::to_string(code) + ":" + message;
 }
 
 // RAII guard for buffers returned by engine_query_entries_bin. Ensures
@@ -121,21 +155,34 @@ void NativeReconcileEngine::eventTrampoline(void* ctx, const char* channel, cons
 void NativeReconcileEngine::open(jsi::Runtime& rt, std::string path) {
   std::lock_guard<std::mutex> lock(engineMutex_);
   if (engine_ != nullptr) {
-    return; // already open — idempotent for the sandbox
+    // Audit F37: opening the same path again is a genuine no-op, but opening a
+    // DIFFERENT path while already open is a caller error — reporting success
+    // would silently keep operations pointed at the old database.
+    if (path == openPath_) {
+      return;
+    }
+    throw jsi::JSError(
+        rt, "engine already open at '" + openPath_ + "'; close it before opening '" + path + "'");
   }
   engine_ = engine_open(path.c_str());
   if (engine_ == nullptr) {
+    // Audit F38: rethrow with the EngineError tag the TS layer unwraps, so the
+    // native code/message survive instead of becoming opaque JSON soup.
     std::string err = takeRustString(engine_last_error());
-    throw jsi::JSError(rt, "engine_open failed: " + err);
+    throw jsi::JSError(rt, toEngineErrorTag(err));
   }
+  openPath_ = path;
   engine_set_event_callback(engine_, this, &NativeReconcileEngine::eventTrampoline);
 }
 
 void NativeReconcileEngine::close(jsi::Runtime& rt) {
   std::lock_guard<std::mutex> lock(engineMutex_);
   if (engine_ != nullptr) {
+    // Detach the callback before close so no event can reference this after.
+    engine_set_event_callback(engine_, nullptr, nullptr);
     engine_close(engine_);
     engine_ = nullptr;
+    openPath_.clear();
   }
 }
 
@@ -144,7 +191,10 @@ AsyncPromise<std::string> NativeReconcileEngine::execute(jsi::Runtime& rt, std::
   post([this, promise, requestJson = std::move(requestJson)]() mutable {
     std::lock_guard<std::mutex> lock(engineMutex_);
     if (engine_ == nullptr) {
-      promise.reject("engine not open");
+      // Audit F39: resolve the canonical error envelope so the TS unwrap()
+      // throws a typed EngineError, matching every other engine failure —
+      // rather than rejecting with a bare string that has no .code.
+      promise.resolve("{\"ok\":false,\"code\":4,\"message\":\"engine not open\"}");
       return;
     }
     char* resp = engine_execute(engine_, requestJson.c_str());
@@ -161,7 +211,8 @@ AsyncPromise<std::string> NativeReconcileEngine::ingestDirect(
   post([this, promise, sourceId = std::move(sourceId), payload = std::move(payload)]() mutable {
     std::lock_guard<std::mutex> lock(engineMutex_);
     if (engine_ == nullptr) {
-      promise.reject("engine not open");
+      // Audit F39: canonical envelope, not a bare reject (see execute()).
+      promise.resolve("{\"ok\":false,\"code\":4,\"message\":\"engine not open\"}");
       return;
     }
     char* resp = engine_ingest_direct(engine_, sourceId.c_str(), payload.c_str());
@@ -253,8 +304,16 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         }
         std::string collection = args[0].asString(rt).utf8(rt);
         std::string fieldsCsv = args[1].asString(rt).utf8(rt);
-        auto limit = static_cast<long long>(args[2].asNumber());
-        auto offset = static_cast<long long>(args[3].asNumber());
+        // Audit F41: validate before casting — a non-finite or out-of-range
+        // double is undefined behavior in static_cast<long long>.
+        double limitD = args[2].asNumber();
+        double offsetD = args[3].asNumber();
+        if (!std::isfinite(limitD) || !std::isfinite(offsetD)) {
+          throw jsi::JSError(rt, "limit/offset must be finite numbers");
+        }
+        constexpr double kMaxRange = 9007199254740992.0; // 2^53
+        auto limit = static_cast<long long>(std::clamp(limitD, 0.0, kMaxRange));
+        auto offset = static_cast<long long>(std::clamp(offsetD, 0.0, kMaxRange));
         size_t len = 0;
         unsigned char* data = nullptr;
         {
@@ -316,14 +375,21 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         }
         std::string key = args[0].asString(rt).utf8(rt);
         char* value = nullptr;
+        int err = 0;
         {
           std::lock_guard<std::mutex> lock(strong->engineMutex_);
           if (strong->engine_ == nullptr) {
             throw jsi::JSError(rt, "engine not open");
           }
-          value = engine_kv_get(strong->engine_, key.c_str());
+          // Audit F40: distinguish a genuine miss from a storage error instead
+          // of returning undefined for both (which reads a failed read as
+          // "no value" and can silently overwrite good data).
+          value = engine_kv_get2(strong->engine_, key.c_str(), &err);
         }
         if (value == nullptr) {
+          if (err != 0) {
+            throw jsi::JSError(rt, "kvGet failed: " + takeRustString(engine_last_error()));
+          }
           return jsi::Value::undefined();
         }
         return jsi::String::createFromUtf8(rt, takeRustString(value));
@@ -384,13 +450,18 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         }
         RustBufferGuard guard{data, len};
         // Decode: LE [u32 count]([u32 klen][key][u32 jlen][json])*
+        // Audit F31: assemble the u32 explicitly little-endian (binenc always
+        // writes to_le_bytes) instead of a host-endian memcpy.
+        // Audit F26: bounds checks use subtraction form (off <= len is an
+        // invariant) so they cannot wrap on a 32-bit size_t.
         auto readU32 = [&](size_t off) -> uint32_t {
-          if (off + 4 > len) {
+          if (off > len || len - off < 4) {
             throw jsi::JSError(rt, "corrupt entry buffer");
           }
-          uint32_t v;
-          std::memcpy(&v, data + off, 4);
-          return v;
+          return static_cast<uint32_t>(data[off]) |
+              (static_cast<uint32_t>(data[off + 1]) << 8) |
+              (static_cast<uint32_t>(data[off + 2]) << 16) |
+              (static_cast<uint32_t>(data[off + 3]) << 24);
         };
         size_t off = 0;
         uint32_t rows = readU32(off);
@@ -408,12 +479,12 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
             .getPropertyAsFunction(rt, "parse");
         for (uint32_t i = 0; i < rows; i++) {
           uint32_t klen = readU32(off); off += 4;
-          if (off + klen > len) {
+          if (klen > len - off) { // audit F26: no-wrap subtraction form
             throw jsi::JSError(rt, "corrupt entry buffer");
           }
           std::string key(reinterpret_cast<char*>(data + off), klen); off += klen;
           uint32_t jlen = readU32(off); off += 4;
-          if (off + jlen > len) {
+          if (jlen > len - off) {
             throw jsi::JSError(rt, "corrupt entry buffer");
           }
           std::string json(reinterpret_cast<char*>(data + off), jlen); off += jlen;

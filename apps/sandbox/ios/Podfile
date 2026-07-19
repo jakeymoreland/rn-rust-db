@@ -71,14 +71,20 @@ target 'sandbox' do
     # method map at runtime). Point it at the library spec file explicitly.
     # A narrow file input cannot recreate the old EXConstants dependency cycle
     # (that needed a directory-tree input covering script outputs).
+    # Audit F52: resolve the spec path via node so it works from node_modules or
+    # the workspace, and APPEND it (don't replace existing inputs). Warn if the
+    # phase can't be found so the staleness hole doesn't return silently.
+    spec_path = `node --print "require.resolve('@rn-experiments/reconcile-engine/src/NativeReconcileEngine.ts')" 2>/dev/null`.strip
+    spec_path = File.expand_path('../../../packages/reconcile-engine/src/NativeReconcileEngine.ts', __dir__) if spec_path.empty?
+    matched = false
     installer.pods_project.targets.each do |target|
       next unless target.name == 'ReactCodegen'
       target.build_phases.each do |phase|
         next unless phase.respond_to?(:name) && phase.name.to_s.include?('Generate Specs')
-        phase.input_paths = [
-          '${PODS_ROOT}/../../../../packages/reconcile-engine/src/NativeReconcileEngine.ts',
-        ]
+        phase.input_paths = ((phase.input_paths || []) + [spec_path]).uniq
+        matched = true
       end
     end
+    Pod::UI.warn('reconcile-engine: could not find the ReactCodegen Generate Specs phase; codegen may go stale on spec changes') unless matched
   end
 end

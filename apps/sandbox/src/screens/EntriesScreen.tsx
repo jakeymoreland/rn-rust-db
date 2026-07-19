@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { FlatList, Text, View } from 'react-native';
-import { redis, subscribe } from '@rn-experiments/reconcile-engine';
+import { redis, subscribeWithCleanup } from '@rn-experiments/reconcile-engine';
 
 type Row = { key: string; fields: Record<string, string> };
 
@@ -18,9 +18,9 @@ export function EntriesScreen() {
 
   useEffect(() => {
     void refresh();
-    let unsub: (() => void) | undefined;
-    void subscribe('changes:people', () => void refresh()).then((u) => (unsub = u));
-    return () => unsub?.();
+    // Audit S24: subscribeWithCleanup unsubscribes even if this unmounts before
+    // the async subscribe resolves, so no listener leaks past the screen.
+    return subscribeWithCleanup('changes:people', () => void refresh());
   }, [refresh]);
 
   return (

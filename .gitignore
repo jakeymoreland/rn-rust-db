@@ -12,3 +12,4 @@ jniLibs/
 .superpowers/
 packages/reconcile-engine/ios-rust/
 packages/reconcile-engine/android-rust/
+packages/reconcile-engine/artifacts-manifest.json

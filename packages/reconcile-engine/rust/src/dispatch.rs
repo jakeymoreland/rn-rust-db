@@ -25,6 +25,11 @@ fn arg(args: &[String], i: usize) -> Result<&str, EngineError> {
 }
 
 fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
+    // Audit S12: surface a background-flush failure recorded since the last
+    // command so a silently failing disk becomes visible to the caller.
+    if let Some(e) = engine.take_sticky_error() {
+        return Err(e);
+    }
     let req: Value = serde_json::from_str(request_json)
         .map_err(|e| EngineError::Command(format!("bad request: {e}")))?;
     let cmd = req["cmd"]
@@ -52,9 +57,9 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
         "scan" => Ok(json!(commands::scan(engine, arg(&args, 0)?, now)?)),
         "hget" => Ok(json!(commands::hget(&engine.store, arg(&args, 0)?, arg(&args, 1)?, now)?)),
         "hset" => {
+            // Audit S4: hset preserves any existing TTL (Redis semantics), so
+            // the cache TTL mirror is left untouched.
             commands::hset(&engine.store, arg(&args, 0)?, arg(&args, 1)?, arg(&args, 2)?)?;
-            // hset clears the key's TTL row; keep the cache's mirror in sync
-            engine.kv.ttl.remove(arg(&args, 0)?);
             Ok(json!("OK"))
         }
         "hgetall" => Ok(json!(commands::hgetall(&engine.store, arg(&args, 0)?, now)?)),
@@ -92,8 +97,27 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
         "registerSource" => {
             let cfg: SourceConfig = serde_json::from_str(arg(&args, 0)?)
                 .map_err(|e| EngineError::Command(format!("bad source config: {e}")))?;
+            // Audit S5: ':' in a collection name corrupts the
+            // entry:{collection}:{key} namespace (hgetall splits on the first
+            // ':'), and an empty name produces unreadable keys.
+            if cfg.collection.is_empty() || cfg.collection.contains(':') {
+                return Err(EngineError::Command(format!(
+                    "invalid collection name '{}' (must be non-empty, no ':')",
+                    cfg.collection
+                )));
+            }
             engine.sources.insert(cfg.source_id.clone(), cfg);
             Ok(json!("OK"))
+        }
+        "deadLetterClear" => {
+            let n = match args.first() {
+                Some(src) => engine
+                    .store
+                    .conn
+                    .execute("DELETE FROM dead_letter WHERE source = ?1", rusqlite::params![src])?,
+                None => engine.store.conn.execute("DELETE FROM dead_letter", [])?,
+            };
+            Ok(json!(n))
         }
         "ingest" => {
             let (summary, skipped) = engine.ingest(arg(&args, 0)?, arg(&args, 1)?)?;
@@ -114,6 +138,10 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
                 .query_row("SELECT count(*) FROM dead_letter", [], |r| r.get(0))?;
             Ok(json!(n))
         }
+        // Test-only: a reachable panic site to exercise the FFI catch_unwind
+        // containment (audit S16). Never registered in release dispatch tables.
+        #[cfg(test)]
+        "__test_panic" => panic!("intentional test panic"),
         other => Err(EngineError::Command(format!("unknown command '{other}'"))),
     }
 }
@@ -204,9 +232,6 @@ mod tests {
     #[test]
     fn register_source_and_ingest_publishes_changes() {
         let mut e = eng();
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
-        let s2 = seen.clone();
-        e.pubsub.set_sink(Box::new(move |ch, _| s2.lock().unwrap().push(ch.to_string())));
         let cfg = r#"{"source_id":"api","format":"Json","collection":"people","natural_key_field":"email","timestamp_field":null,"priority":10}"#;
         ok_value(&execute(&mut e, &format!(
             r#"{{"cmd":"registerSource","args":[{}]}}"#,
@@ -219,10 +244,29 @@ mod tests {
             serde_json::to_string(payload).unwrap()
         )));
         assert_eq!(summary["inserted"], 1);
-        assert_eq!(seen.lock().unwrap().as_slice(), ["changes:people"]);
+        // Events are buffered (audit S7) for the FFI layer to deliver lock-free.
+        let events = e.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "changes:people");
         // read back through redis surface
         let h = ok_value(&execute(&mut e, r#"{"cmd":"hgetall","args":["entry:people:a@x.com"]}"#));
         assert_eq!(h["name"], "Ann");
+    }
+
+    #[test]
+    fn no_subscription_buffers_no_events() {
+        let mut e = eng();
+        let cfg = r#"{"source_id":"api","format":"Json","collection":"people","natural_key_field":"email","timestamp_field":null,"priority":10}"#;
+        ok_value(&execute(&mut e, &format!(
+            r#"{{"cmd":"registerSource","args":[{}]}}"#,
+            serde_json::to_string(cfg).unwrap()
+        )));
+        let payload = r#"[{"email":"a@x.com","name":"Ann"}]"#;
+        ok_value(&execute(&mut e, &format!(
+            r#"{{"cmd":"ingest","args":["api",{}]}}"#,
+            serde_json::to_string(payload).unwrap()
+        )));
+        assert!(e.take_events().is_empty());
     }
 
     #[test]
@@ -243,6 +287,45 @@ mod tests {
         let second = ok_value(&execute(&mut e, &req));
         assert_eq!(second["inserted"], 0);
         assert_eq!(second["skipped"], true);
+    }
+
+    // Audit S5: ':' in a collection name corrupts the entry:{collection}:{key}
+    // namespace (hgetall splits on the first ':'), so registration rejects it.
+    #[test]
+    fn register_source_rejects_colon_and_empty_collection() {
+        let mut e = eng();
+        for bad in ["crm:people", ""] {
+            let cfg = format!(
+                r#"{{"source_id":"api","format":"Json","collection":"{bad}","natural_key_field":"id","timestamp_field":null,"priority":10}}"#
+            );
+            let v: serde_json::Value = serde_json::from_str(&execute(
+                &mut e,
+                &format!(r#"{{"cmd":"registerSource","args":[{}]}}"#, serde_json::to_string(&cfg).unwrap()),
+            ))
+            .unwrap();
+            assert_eq!(v["ok"], false, "collection {bad:?} was accepted");
+            assert_eq!(v["code"], 4);
+        }
+    }
+
+    // Audit S13: deadLetterClear drains the quarantine.
+    #[test]
+    fn dead_letter_clear_command() {
+        let mut e = eng();
+        let cfg = r#"{"source_id":"api","format":"Json","collection":"people","natural_key_field":"email","timestamp_field":null,"priority":10}"#;
+        ok_value(&execute(&mut e, &format!(
+            r#"{{"cmd":"registerSource","args":[{}]}}"#,
+            serde_json::to_string(cfg).unwrap()
+        )));
+        let payload = r#"[{"name":"NoKey1"},{"name":"NoKey2"}]"#;
+        ok_value(&execute(&mut e, &format!(
+            r#"{{"cmd":"ingest","args":["api",{}]}}"#,
+            serde_json::to_string(payload).unwrap()
+        )));
+        assert_eq!(ok_value(&execute(&mut e, r#"{"cmd":"deadLetterCount","args":[]}"#)), 2);
+        let cleared = ok_value(&execute(&mut e, r#"{"cmd":"deadLetterClear","args":[]}"#));
+        assert_eq!(cleared, 2);
+        assert_eq!(ok_value(&execute(&mut e, r#"{"cmd":"deadLetterCount","args":[]}"#)), 0);
     }
 
     #[test]
