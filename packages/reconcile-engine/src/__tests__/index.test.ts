@@ -1,5 +1,13 @@
 import { mockNative } from './rn-mock';
-import { openEngine, redis, ingest, registerSource, subscribe } from '../index';
+import {
+  openEngine,
+  redis,
+  ingest,
+  registerSource,
+  subscribe,
+  subscribeWithCleanup,
+  EngineError,
+} from '../index';
 
 const okResp = (value: unknown) => JSON.stringify({ ok: true, value });
 const errResp = (code: number, message: string) =>
@@ -61,4 +69,81 @@ test('subscribe routes matching channels and unsubscribes', async () => {
   unsub();
   mockNative.onChange.emit({ channel: 'changes:people', payload: '{}' });
   expect(seen).toEqual(['changes:people']);
+});
+
+// Audit S18: a throwing handler must not escape into the emitter dispatch; it
+// goes to onError, and sibling subscriptions keep working.
+test('throwing handler is routed to onError and does not break siblings', async () => {
+  mockNative.execute.mockResolvedValue(okResp(1));
+  const errors: unknown[] = [];
+  const sibling: string[] = [];
+  await subscribe('changes:*', () => { throw new Error('boom'); }, (e) => errors.push(e));
+  await subscribe('changes:*', (ch) => sibling.push(ch));
+  expect(() =>
+    mockNative.onChange.emit({ channel: 'changes:people', payload: '{}' }),
+  ).not.toThrow();
+  expect(errors).toHaveLength(1);
+  expect(sibling).toEqual(['changes:people']);
+});
+
+// Audit S18: a non-JSON payload goes to onError instead of throwing.
+test('non-JSON payload is routed to onError', async () => {
+  mockNative.execute.mockResolvedValue(okResp(1));
+  const errors: unknown[] = [];
+  await subscribe('changes:*', () => {}, (e) => errors.push(e));
+  mockNative.onChange.emit({ channel: 'changes:people', payload: 'not json' });
+  expect(errors).toHaveLength(1);
+});
+
+// Audit S19: unsubscribe after closeEngine must not produce an unhandled
+// rejection, and calling it twice sends the native unsubscribe only once.
+test('unsubscribe is idempotent and swallows rejection', async () => {
+  mockNative.execute.mockResolvedValueOnce(okResp(7)); // subscribe
+  const unsub = await subscribe('changes:*', () => {});
+  mockNative.execute.mockReset();
+  mockNative.execute.mockRejectedValue(new Error('engine not open'));
+  let unhandled: unknown;
+  const onUnhandled = (e: unknown) => (unhandled = e);
+  process.on('unhandledRejection', onUnhandled);
+  unsub();
+  unsub(); // second call must be a no-op
+  await new Promise((r) => setTimeout(r, 10));
+  process.off('unhandledRejection', onUnhandled);
+  expect(mockNative.execute).toHaveBeenCalledTimes(1); // only one native unsubscribe
+  expect(unhandled).toBeUndefined();
+});
+
+// Audit S24: cancelling before the async subscribe resolves must still
+// unsubscribe (no leaked listener) once it resolves.
+test('subscribeWithCleanup cancels a still-pending subscription', async () => {
+  let resolveSub!: (v: string) => void;
+  mockNative.execute.mockReturnValueOnce(new Promise((r) => (resolveSub = r)));
+  const seen: string[] = [];
+  const cancel = subscribeWithCleanup('changes:*', (ch) => seen.push(ch));
+  cancel(); // unmount before subscribe resolves
+  mockNative.execute.mockResolvedValue(okResp(true)); // the deferred unsubscribe
+  resolveSub(okResp(1)); // subscription now resolves
+  await new Promise((r) => setTimeout(r, 10));
+  // the listener must have been removed, so no events are delivered
+  mockNative.onChange.emit({ channel: 'changes:people', payload: '{}' });
+  expect(seen).toEqual([]);
+});
+
+// Audit F36: openEngine surfaces a tagged native error as an EngineError.
+test('openEngine rethrows a tagged native error as EngineError', async () => {
+  mockNative.open.mockImplementationOnce(() => {
+    throw new Error('EngineError:2:disk is full');
+  });
+  const err = await openEngine('/bad/path').catch((e) => e);
+  expect(err).toBeInstanceOf(EngineError);
+  expect(err).toMatchObject({ code: 2, message: 'disk is full' });
+});
+
+test('openEngine wraps an untagged native error generically', async () => {
+  mockNative.open.mockImplementationOnce(() => {
+    throw new Error('some native failure');
+  });
+  const err = await openEngine('/bad/path').catch((e) => e);
+  expect(err).toBeInstanceOf(EngineError);
+  expect(err).toMatchObject({ code: 0, message: 'some native failure' });
 });
