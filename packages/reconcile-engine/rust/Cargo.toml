@@ -2,6 +2,7 @@
 name = "reconcile_engine"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.81"  # audit S26: floor for the FFI panic=abort-on-unwind behavior
 
 [lib]
 crate-type = ["staticlib", "lib"]

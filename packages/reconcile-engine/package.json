@@ -1,12 +1,23 @@
 {
   "name": "@rn-experiments/reconcile-engine",
   "version": "0.1.0",
+  "private": true,
   "main": "src/index.ts",
+  "files": [
+    "src",
+    "cpp",
+    "ios",
+    "ios-rust",
+    "android-rust",
+    "scripts",
+    "ReconcileEngine.podspec"
+  ],
   "scripts": {
-    "test": "jest"
+    "test": "jest",
+    "check-artifacts": "bash scripts/check-artifacts.sh"
   },
   "peerDependencies": {
-    "react-native": "*"
+    "react-native": ">=0.86.0"
   },
   "devDependencies": {
     "@types/jest": "^29.5.0",
@@ -18,6 +29,9 @@
     "name": "ReconcileEngineSpec",
     "type": "modules",
     "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.rnexperiments.reconcileengine"
+    },
     "ios": {
       "modulesProvider": {
         "NativeReconcileEngine": "ReconcileEngineProvider"
