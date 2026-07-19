@@ -131,6 +131,50 @@ describe('createLazyRows', () => {
     const lazy = createLazyRows(encodeSchema(['name', 'city'], rows));
     expect(() => lazy.row(3)).toThrow();
   });
+
+  // Incremental indexing (perf): the constructor must not walk the whole
+  // buffer, so a later corrupt row can't block earlier ones, and a high index
+  // is reachable without touching earlier rows.
+  it('indexes incrementally: early rows read despite later truncation', () => {
+    const { createLazyRows } = require('../decode');
+    const full = encodeSchema(['name', 'city'], rows);
+    const truncated = full.slice(0, full.byteLength - 3);
+    const lazy = createLazyRows(truncated);
+    expect(lazy.length).toBe(3);
+    expect(lazy.row(0)).toEqual({ key: 'entry:c:1', fields: { name: 'Ann', city: 'Sydney' } });
+    expect(() => lazy.row(2)).toThrow();
+  });
+
+  it('materializes a high index without earlier access', () => {
+    const { createLazyRows } = require('../decode');
+    const many = Array.from({ length: 40 }, (_, i) => ({ key: `k${i}`, values: [String(i), null] as Array<string | null> }));
+    const lazy = createLazyRows(encodeSchema(['n', 'c'], many));
+    expect(lazy.row(37)).toEqual({ key: 'k37', fields: { n: '37' } });
+  });
+});
+
+describe('utf8 fast-path decode (unicode correctness)', () => {
+  it('lazy entry rows decode multibyte values correctly', () => {
+    const { createLazyEntryRows } = require('../decode');
+    const te = new TextEncoder();
+    const fields = { name: 'Bób', emoji: '🌟', notes: 'plain ascii' };
+    const k = te.encode('entry:c:1');
+    const j = te.encode(JSON.stringify(fields));
+    const buf = new ArrayBuffer(4 + 8 + k.length + j.length);
+    const dv = new DataView(buf);
+    const u8 = new Uint8Array(buf);
+    let off = 0;
+    dv.setUint32(off, 1, true); off += 4;
+    dv.setUint32(off, k.length, true); off += 4; u8.set(k, off); off += k.length;
+    dv.setUint32(off, j.length, true); off += 4; u8.set(j, off);
+    expect(createLazyEntryRows(buf).row(0)).toEqual({ key: 'entry:c:1', fields });
+  });
+
+  it('lazy schema rows decode multibyte values correctly', () => {
+    const { createLazyRows } = require('../decode');
+    const buf = encodeSchema(['name', 'flag'], [{ key: 'ké', values: ['Zöe', '🚀'] }]);
+    expect(createLazyRows(buf).row(0)).toEqual({ key: 'ké', fields: { name: 'Zöe', flag: '🚀' } });
+  });
 });
 
 describe('createLazyEntryRows', () => {
@@ -172,10 +216,44 @@ describe('createLazyEntryRows', () => {
     expect(lazy.row(0)).toBe(lazy.row(0)); // memoized
   });
 
-  it('throws on truncated buffer and bad index', () => {
+  it('throws on out-of-range index', () => {
     const { createLazyEntryRows } = require('../decode');
-    expect(() => createLazyEntryRows(encodeEntries(rows).slice(0, 9))).toThrow();
     const lazy = createLazyEntryRows(encodeEntries(rows));
     expect(() => lazy.row(2)).toThrow();
+  });
+
+  // Lazy indexing (perf): the constructor no longer walks the whole buffer, so
+  // corruption in a LATER row must not stop earlier rows from materializing —
+  // and length is still available from the header without a full walk.
+  it('indexes incrementally: early rows read despite later truncation', () => {
+    const { createLazyEntryRows } = require('../decode');
+    const three = [
+      { key: 'entry:c:1', fields: { name: 'Ann' } },
+      { key: 'entry:c:2', fields: { name: 'Bob' } },
+      { key: 'entry:c:3', fields: { name: 'Cat' } },
+    ];
+    const full = encodeEntries(three);
+    // Cut the buffer partway into the third row; header still says 3 rows.
+    const truncated = full.slice(0, full.byteLength - 4);
+    const lazy = createLazyEntryRows(truncated);
+    expect(lazy.length).toBe(3); // length from header, no walk needed
+    expect(lazy.row(0)).toEqual({ key: 'entry:c:1', fields: { name: 'Ann' } });
+    expect(lazy.row(1)).toEqual({ key: 'entry:c:2', fields: { name: 'Bob' } });
+    expect(() => lazy.row(2)).toThrow(); // corruption surfaces only on access
+  });
+
+  it('materializes a high index without requiring earlier access', () => {
+    const { createLazyEntryRows } = require('../decode');
+    const many = Array.from({ length: 50 }, (_, i) => ({
+      key: `entry:c:${i}`,
+      fields: { n: String(i) },
+    }));
+    const lazy = createLazyEntryRows(encodeEntries(many));
+    expect(lazy.row(42)).toEqual({ key: 'entry:c:42', fields: { n: '42' } });
+  });
+
+  it('throws on a header that undershoots the buffer minimum', () => {
+    const { createLazyEntryRows } = require('../decode');
+    expect(() => createLazyEntryRows(new ArrayBuffer(2))).toThrow();
   });
 });
