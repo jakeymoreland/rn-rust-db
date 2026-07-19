@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (test + clippy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/reconcile-engine/rust
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml in this dir pins the channel + clippy component;
+      # rustup installs it automatically on first cargo invocation.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/reconcile-engine/rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('packages/reconcile-engine/rust/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: cargo test
+        run: cargo test
+      - name: cargo clippy (zero errors)
+        run: cargo clippy --all-targets
+
+  js:
+    name: TypeScript (tsc + jest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+      - name: Install
+        run: yarn install --frozen-lockfile
+      - name: Engine package tests
+        run: yarn test
+        working-directory: packages/reconcile-engine
+      - name: Sandbox typecheck
+        run: npx tsc --noEmit
+        working-directory: apps/sandbox
+      - name: Sandbox bench tests
+        run: yarn test
+        working-directory: apps/sandbox
+
+  # Native artifact builds (iOS xcframework / Android .a for all ABIs) need
+  # macOS + Xcode / the Android NDK and are heavy; they are intentionally not
+  # in the per-PR gate yet. Track adding a scheduled/opt-in native build job in
+  # ROADMAP.md (CI section) alongside the artifact-distribution decision.

@@ -8,9 +8,11 @@ public/production release.
 
 - [x] **LICENSE file at repo root** (MIT, matching the podspec's declaration).
 - [x] Root README and this roadmap.
-- [ ] **CI** (`.github/workflows`): `cargo test` + `cargo clippy` + `yarn test`,
-      plus the artifact drift-check (`scripts/check-artifacts.sh`). No CI exists
-      today (audit S47).
+- [x] **CI** (`.github/workflows/ci.yml`): `cargo test` + `cargo clippy`, engine
+      `yarn test`, sandbox `tsc` + `yarn test`. Headless only (audit S47 closed).
+- [ ] Native build job (macOS/Xcode + Android NDK) running the artifact
+      drift-check — heavy, so scheduled/opt-in rather than per-PR. Pairs with the
+      artifact-distribution decision below.
 - [x] `CONTRIBUTING.md`.
 - [ ] Issue/PR templates (`.github/`).
 - [ ] Decide artifact distribution: commit prebuilt `.a`/xcframework via git-lfs,
