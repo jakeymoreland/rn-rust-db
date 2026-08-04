@@ -13,3 +13,16 @@ jniLibs/
 packages/reconcile-engine/ios-rust/
 packages/reconcile-engine/android-rust/
 packages/reconcile-engine/artifacts-manifest.json
+
+# The only app lives in apps/sandbox. Anything Expo generates at the workspace
+# root is a stray prebuild — never commit a second copy of the native projects.
+/ios/
+/android/
+/app.json
+/tsconfig.json
+.expo/
+
+# Local agent/editor tooling (apps/sandbox/.claude is deliberately tracked).
+/.claude/
+/.agents/
+/skills-lock.json

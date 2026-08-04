@@ -74,4 +74,8 @@ first. That work is the reason the engine is stable enough to open up.
 
 ## License
 
-MIT (see `LICENSE`).
+MIT (see `LICENSE`) — that file governs this repository.
+
+`apps/sandbox/LICENSE` is a different file: it is the MIT notice that shipped
+with the Expo app template the sandbox was generated from, retained for the
+scaffolding it covers. It is not the license of this project.
