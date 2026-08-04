@@ -13,6 +13,12 @@ pub struct PubSub {
     sink: Option<Sink>,
 }
 
+impl Default for PubSub {
+    fn default() -> Self {
+        PubSub::new()
+    }
+}
+
 impl PubSub {
     pub fn new() -> PubSub {
         PubSub { subs: vec![], next_id: 1, sink: None }
@@ -62,9 +68,12 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    fn recording_pubsub() -> (PubSub, Arc<Mutex<Vec<(String, String)>>>) {
+    /// Channel/payload pairs the sink saw, in order.
+    type EventLog = Arc<Mutex<Vec<(String, String)>>>;
+
+    fn recording_pubsub() -> (PubSub, EventLog) {
         let mut ps = PubSub::new();
-        let log: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(vec![]));
+        let log: EventLog = Arc::new(Mutex::new(vec![]));
         let l2 = log.clone();
         ps.set_sink(Box::new(move |ch, payload| {
             l2.lock().unwrap().push((ch.to_string(), payload.to_string()));

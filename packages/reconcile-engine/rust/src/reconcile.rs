@@ -141,6 +141,9 @@ struct GroupOutcome {
     write: Option<WriteRow>,
 }
 
+/// A group's in-flight row state: (fields, per-field merge meta, row updated_at).
+type RowState = (BTreeMap<String, String>, BTreeMap<String, FieldMeta>, i64);
+
 /// Folds all of one key's records into its final row state, entirely in RAM.
 /// The DB row is parsed at most once per group (and not at all when the hash
 /// short-circuit fires on the first record); the final state serializes once.
@@ -155,8 +158,8 @@ fn merge_group(
     let mut unchanged = 0u32;
     let mut visibly_changed = false;
     let mut wrote = false;
-    // (fields, meta, row updated_at); None until inserted or parsed from db_row
-    let mut state: Option<(BTreeMap<String, String>, BTreeMap<String, FieldMeta>, i64)> = None;
+    // None until inserted or parsed from db_row
+    let mut state: Option<RowState> = None;
 
     for rec in recs {
         if state.is_none() && db_row.is_none() {

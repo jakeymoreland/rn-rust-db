@@ -32,8 +32,8 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
       - name: cargo test
         run: cargo test
-      - name: cargo clippy (zero errors)
-        run: cargo clippy --all-targets
+      - name: cargo clippy (zero warnings)
+        run: cargo clippy --all-targets -- -D warnings
 
   js:
     name: TypeScript (tsc + jest)

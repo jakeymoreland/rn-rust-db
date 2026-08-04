@@ -784,7 +784,7 @@ mod tests {
         let path = CString::new(":memory:").unwrap();
         let h = engine_open(path.as_ptr());
         let req = CString::new(r#"{"cmd":"__test_panic","args":[]}"#).unwrap();
-        let r = unsafe { engine_execute(h, req.as_ptr()) };
+        let r = engine_execute(h, req.as_ptr());
         let s = unsafe { CStr::from_ptr(r) }.to_str().unwrap().to_string();
         engine_free_string(r);
         assert!(s.contains("\"ok\":false"), "panic not contained: {s}");
@@ -792,7 +792,7 @@ mod tests {
         // Audit S9: the engine must still work after the panic (mutex not left
         // in an abort-cascading poisoned state).
         let req2 = CString::new(r#"{"cmd":"set","args":["a","1"]}"#).unwrap();
-        let r2 = unsafe { engine_execute(h, req2.as_ptr()) };
+        let r2 = engine_execute(h, req2.as_ptr());
         let s2 = unsafe { CStr::from_ptr(r2) }.to_str().unwrap().to_string();
         engine_free_string(r2);
         assert!(s2.contains("\"ok\":true"), "engine dead after panic: {s2}");
@@ -806,7 +806,7 @@ mod tests {
         let path = CString::new(":memory:").unwrap();
         let h = engine_open(path.as_ptr());
         let set = CString::new(r#"{"cmd":"set","args":["k","v"]}"#).unwrap();
-        engine_free_string(unsafe { engine_execute(h, set.as_ptr()) });
+        engine_free_string(engine_execute(h, set.as_ptr()));
 
         let key = CString::new("k").unwrap();
         let mut err: i32 = -1;

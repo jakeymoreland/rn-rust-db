@@ -51,14 +51,14 @@ fn realistic_row_queries_do_not_panic() {
         let scan = exec(h, r#"{"cmd":"scan","args":["entry:bench_real:*"]}"#);
         assert!(scan.contains("\"ok\":true"), "scan failed round {round}");
         let mut len = 0usize;
-        let p = unsafe { engine_query_entries_bin(h, col.as_ptr(), &mut len) };
+        let p = engine_query_entries_bin(h, col.as_ptr(), &mut len);
         assert!(!p.is_null(), "bin null round {round}");
-        unsafe { engine_free_bytes(p, len) };
+        engine_free_bytes(p, len);
         let mut slen = 0usize;
-        let sp = unsafe { engine_query_entries_schema_bin(h, col.as_ptr(), fields.as_ptr(), &mut slen) };
+        let sp = engine_query_entries_schema_bin(h, col.as_ptr(), fields.as_ptr(), &mut slen);
         assert!(!sp.is_null(), "schema null round {round}");
         let bytes = unsafe { std::slice::from_raw_parts(sp, slen) }.to_vec();
-        unsafe { engine_free_bytes(sp, slen) };
+        engine_free_bytes(sp, slen);
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 23, "round {round}");
     }
     engine_close(h);
