@@ -651,6 +651,22 @@ pub extern "C" fn engine_close(handle: *mut c_void) {
     })
 }
 
+/// Whether a request is a pure store read, so the caller can route it off the
+/// write path. Lets the C++ layer keep one source of truth for the read/write
+/// split (`dispatch::is_read_only_cmd`) rather than duplicating a command list.
+///
+/// Returns false for a null pointer, invalid UTF-8, or an unparseable envelope
+/// — the safe default is "treat it as a write".
+#[no_mangle]
+pub extern "C" fn engine_command_is_read_only(request_json: *const c_char) -> bool {
+    ffi_guard!(false, {
+        let Some(req) = (unsafe { cstr(request_json) }) else {
+            return false;
+        };
+        crate::dispatch::request_is_read_only(req)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

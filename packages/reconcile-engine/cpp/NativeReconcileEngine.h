@@ -2,6 +2,7 @@
 
 #include <ReconcileEngineSpecJSI.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -51,6 +52,13 @@ class NativeReconcileEngine
  private:
   void workerLoop();
   void post(std::function<void()> task);
+  // Read worker: a second single-threaded queue for commands the engine
+  // reports as pure store reads (engine_command_is_read_only). They no longer
+  // take the engine mutex, so putting them on the write worker only made them
+  // queue behind whatever ingest was ahead of them — measured as ~51 ms per
+  // async hgetall under load against a 0.018 ms uncontended baseline.
+  void readerLoop();
+  void postRead(std::function<void()> task);
   static void eventTrampoline(void* ctx, const char* channel, const char* payload);
 
   engine_handle_t engine_{nullptr};
@@ -73,8 +81,16 @@ class NativeReconcileEngine
   std::thread worker_;
   std::mutex queueMutex_;
   std::condition_variable queueCv_;
+
+  std::thread readerWorker_;
+  std::mutex readerQueueMutex_;
+  std::condition_variable readerQueueCv_;
+  std::queue<std::function<void()>> readerQueue_;
   std::queue<std::function<void()>> queue_;
-  bool stopping_{false};
+  // Atomic because two loops now observe it under two different mutexes:
+  // the destructor sets it while holding queueMutex_, and readerLoop reads it
+  // under readerQueueMutex_. A plain bool would be a data race.
+  std::atomic<bool> stopping_{false};
 };
 
 } // namespace facebook::react

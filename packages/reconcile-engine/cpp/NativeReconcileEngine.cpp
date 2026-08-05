@@ -90,7 +90,8 @@ class RustOwnedBuffer : public facebook::jsi::MutableBuffer {
 
 NativeReconcileEngine::NativeReconcileEngine(std::shared_ptr<CallInvoker> jsInvoker)
     : NativeReconcileEngineCxxSpec(std::move(jsInvoker)),
-      worker_([this] { workerLoop(); }) {}
+      worker_([this] { workerLoop(); }),
+      readerWorker_([this] { readerLoop(); }) {}
 
 NativeReconcileEngine::~NativeReconcileEngine() {
   {
@@ -98,8 +99,12 @@ NativeReconcileEngine::~NativeReconcileEngine() {
     stopping_ = true;
   }
   queueCv_.notify_all();
+  readerQueueCv_.notify_all();
   if (worker_.joinable()) {
     worker_.join();
+  }
+  if (readerWorker_.joinable()) {
+    readerWorker_.join();
   }
   // Exclusive: drains any call still holding a shared lock before the handle
   // is closed, so no in-flight FFI call can touch a freed engine.
@@ -124,6 +129,32 @@ void NativeReconcileEngine::workerLoop() {
     }
     task();
   }
+}
+
+void NativeReconcileEngine::readerLoop() {
+  for (;;) {
+    std::function<void()> task;
+    {
+      std::unique_lock<std::mutex> lock(readerQueueMutex_);
+      readerQueueCv_.wait(lock, [this] { return stopping_ || !readerQueue_.empty(); });
+      if (stopping_ && readerQueue_.empty()) {
+        return;
+      }
+      task = std::move(readerQueue_.front());
+      readerQueue_.pop();
+    }
+    task();
+  }
+}
+
+void NativeReconcileEngine::postRead(std::function<void()> task) {
+  // Same lifetime argument as post(): the destructor sets stopping_, notifies
+  // both queues and joins both threads before engine_ is torn down.
+  {
+    std::lock_guard<std::mutex> lock(readerQueueMutex_);
+    readerQueue_.push(std::move(task));
+  }
+  readerQueueCv_.notify_one();
 }
 
 void NativeReconcileEngine::post(std::function<void()> task) {
@@ -192,7 +223,14 @@ void NativeReconcileEngine::close(jsi::Runtime& rt) {
 
 AsyncPromise<std::string> NativeReconcileEngine::execute(jsi::Runtime& rt, std::string requestJson) {
   auto promise = AsyncPromise<std::string>(rt, jsInvoker_);
-  post([this, promise, requestJson = std::move(requestJson)]() mutable {
+  // Pure store reads go to the read worker. They no longer take the engine
+  // mutex (engine_execute serves them from the read-only connection), so the
+  // only thing the write worker added was queueing behind whatever ingest was
+  // ahead of them: an async hgetall measured ~51 ms under write load against a
+  // 0.018 ms uncontended baseline, and 100 of them consumed a whole 5 s window.
+  // The engine is the single source of truth for what qualifies.
+  const bool readOnly = engine_command_is_read_only(requestJson.c_str());
+  auto task = [this, promise, requestJson = std::move(requestJson)]() mutable {
     std::shared_lock<std::shared_mutex> lock(engineMutex_);
     if (engine_ == nullptr) {
       // Audit F39: resolve the canonical error envelope so the TS unwrap()
@@ -203,7 +241,12 @@ AsyncPromise<std::string> NativeReconcileEngine::execute(jsi::Runtime& rt, std::
     }
     char* resp = engine_execute(engine_, requestJson.c_str());
     promise.resolve(takeRustString(resp));
-  });
+  };
+  if (readOnly) {
+    postRead(std::move(task));
+  } else {
+    post(std::move(task));
+  }
   return promise;
 }
 

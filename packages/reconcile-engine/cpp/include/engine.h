@@ -25,6 +25,11 @@ char* engine_last_error(void);
 /* Executes a {"cmd":...,"args":[...]} request; returns response JSON. Free with engine_free_string. */
 char* engine_execute(engine_handle_t engine, const char* request_json);
 
+/* True when the request is a pure store read (hget/hgetall/hmgetall), so the
+ * caller can run it off the write path. False for null/invalid input — the safe
+ * default is "treat it as a write". Mirrors dispatch::is_read_only_cmd. */
+bool engine_command_is_read_only(const char* request_json);
+
 /* Binary rows: LE [u32 count]([u32 klen][key][u32 jlen][fields-json])*. Free with engine_free_bytes. */
 unsigned char* engine_query_entries_bin(engine_handle_t engine, const char* collection, size_t* out_len);
 

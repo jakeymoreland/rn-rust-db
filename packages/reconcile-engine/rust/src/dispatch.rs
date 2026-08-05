@@ -18,6 +18,24 @@ pub fn execute(engine: &mut Engine, request_json: &str) -> String {
     }
 }
 
+/// The single source of truth for "this command is a pure store read".
+///
+/// Used twice: to serve the command off the read-only connection instead of the
+/// engine mutex, and (via `engine_command_is_read_only`) to let the C++ layer
+/// route it to the read worker instead of queueing it behind writes on the
+/// single write worker.
+pub fn is_read_only_cmd(cmd: &str) -> bool {
+    matches!(cmd, "hget" | "hgetall" | "hmgetall")
+}
+
+/// Envelope-only check of the above, for callers holding just the raw request.
+pub fn request_is_read_only(request_json: &str) -> bool {
+    serde_json::from_str::<Value>(request_json)
+        .ok()
+        .and_then(|req| req["cmd"].as_str().map(is_read_only_cmd))
+        .unwrap_or(false)
+}
+
 /// Serves the commands that are pure store reads against a bare connection,
 /// so the FFI can run them on the read-only connection instead of taking the
 /// engine mutex. Returns `None` for everything else, and the caller falls
@@ -37,7 +55,7 @@ pub fn execute_read_only(
 ) -> Option<String> {
     let req: Value = serde_json::from_str(request_json).ok()?;
     let cmd = req["cmd"].as_str()?;
-    if !matches!(cmd, "hget" | "hgetall" | "hmgetall") {
+    if !is_read_only_cmd(cmd) {
         return None;
     }
     let args: Vec<String> = req["args"]
