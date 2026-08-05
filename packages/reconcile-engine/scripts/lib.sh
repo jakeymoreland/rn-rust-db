@@ -1,5 +1,17 @@
 # Shared helpers for the build scripts. Sourced, not executed.
 
+# Content hash of the Rust source tree, read from the working tree so that
+# uncommitted edits change it. Run with rust/ as the working directory.
+rust_tree_hash() {
+  git ls-files --cached --others --exclude-standard -- src Cargo.toml Cargo.lock \
+    | LC_ALL=C sort \
+    | while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        printf '%s %s\n' "$(git hash-object -- "$f")" "$f"
+      done \
+    | git hash-object --stdin
+}
+
 # Writes/merges artifacts-manifest.json (audit S25/S47) recording the source
 # hash and toolchain so check-artifacts.sh can detect drift.
 write_manifest() {
@@ -7,11 +19,13 @@ write_manifest() {
   local rustc_ver
   rustc_ver=$(rustc --version)
   local tree_hash
-  # ls-files -s emits mode+blobhash+path for tracked files (no file opens, and
-  # untracked/absent Cargo.lock is simply omitted), so this is stable across
-  # machines and never fails on a missing lockfile.
-  tree_hash=$( cd "$pkg_dir/rust" && git ls-files -s src Cargo.toml Cargo.lock \
-      | LC_ALL=C sort | git hash-object --stdin )
+  # Hash the WORKING TREE, not the index. `git ls-files -s` emits the staged
+  # blob hash, so uncommitted edits to rust/src left this value unchanged — the
+  # guard that exists to stop stale native code shipping passed happily while
+  # the .a on disk was older than the source, which is exactly when it should
+  # fire. --others --exclude-standard also catches a brand-new, not-yet-added
+  # module file.
+  tree_hash=$( cd "$pkg_dir/rust" && rust_tree_hash )
   cat > "$pkg_dir/artifacts-manifest.json" <<EOF
 {
   "rust_tree_hash": "$tree_hash",

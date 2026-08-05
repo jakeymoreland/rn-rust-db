@@ -20,10 +20,22 @@ fail() {
   exit 1
 }
 
-# rust source tree hash — stable across machines. ls-files -s emits blob hashes
-# without opening files, and omits an untracked/absent Cargo.lock.
+# Content hash of the Rust source tree, read from the WORKING TREE.
+#
+# This previously used `git ls-files -s`, which emits the *staged* blob hash —
+# so uncommitted edits to rust/src did not move it, and this guard passed while
+# the built artifacts were older than the source. That is precisely the case it
+# exists to catch. --others --exclude-standard also covers a new module file
+# that has not been git-added yet.
 rust_tree_hash() {
-  ( cd rust && git ls-files -s src Cargo.toml Cargo.lock | LC_ALL=C sort | git hash-object --stdin )
+  ( cd rust \
+    && git ls-files --cached --others --exclude-standard -- src Cargo.toml Cargo.lock \
+       | LC_ALL=C sort \
+       | while IFS= read -r f; do
+           [ -f "$f" ] || continue
+           printf '%s %s\n' "$(git hash-object -- "$f")" "$f"
+         done \
+       | git hash-object --stdin )
 }
 
 [ -d "$IOS" ] || fail "missing iOS xcframework ($IOS)"
