@@ -74,10 +74,15 @@ export async function runIndustry(onProgress: (msg: string) => void): Promise<In
     const base = Math.floor(performance.now()) % 100000;
     const payloads = [0, 1, 2].map((i) => realisticRows(1300, 900, base + i));
     let w = 0;
+    // Two numbers from the same three ingests: the engine's own parse phase
+    // (like-for-like with a serde-parse reference) and the full pipeline.
+    const parseMs: number[] = [];
     const waves = await timed(3, async () => {
-      await ingest('industry', payloads[w++]);
+      const s = await ingest('industry', payloads[w++]);
+      if (s.timings) parseMs.push(s.timings.parse_ms);
     });
-    done('parse1mb', median(waves));
+    if (parseMs.length) done('parse1mb', median(parseMs));
+    done('ingest1mbFull', median(waves));
   }
 
   onProgress('SQLite single-row inserts (20 x 1 row)...');

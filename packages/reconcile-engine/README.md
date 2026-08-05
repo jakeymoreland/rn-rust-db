@@ -66,6 +66,17 @@ Because nothing lives in the app's own native project any more, a regenerating
 `reactNativeArchitectures` in the app's `gradle.properties` may be narrowed for
 faster local builds; all four RN-default ABIs are available.
 
+## Never run Expo/CLI commands inside this package
+
+`npx expo run:ios` (or any `expo prebuild`) executed with this directory as the
+working directory treats the package as an app: it adds `expo`, `react` and
+`react-native` to this package's `dependencies`, scaffolds an `app.json` and a
+full `ios/` Xcode project here, and **deletes `ios/ReconcileEngineProvider.{h,mm}`**
+— the iOS TurboModule provider — because prebuild owns that directory in an app.
+
+Build the app from `apps/sandbox`, and this package's native artifacts with
+`./scripts/build-ios.sh` / `./scripts/build-android.sh` only.
+
 ## C ABI header
 
 `cpp/include/engine.h` is a hand-maintained mirror of the `#[no_mangle]` exports

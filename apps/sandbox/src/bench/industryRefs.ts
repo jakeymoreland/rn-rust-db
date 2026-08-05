@@ -10,6 +10,12 @@ export type IndustryRef = {
   refHiMs: number;
   unit: 'ms/op' | 'ms total';
   caveat?: string;
+  /**
+   * Informational only: there is no comparable published figure, so the row
+   * reports our number without passing judgement. Grading ourselves against a
+   * reference that does materially less work produces a meaningless verdict.
+   */
+  unscored?: boolean;
 };
 
 export const INDUSTRY_REFS: IndustryRef[] = [
@@ -40,31 +46,47 @@ export const INDUSTRY_REFS: IndustryRef[] = [
     caveat: 'ours reads the in-memory cache (SQLite only on cold miss)',
   },
   {
+    // Like-for-like: the reference measures a serde parse of ~1 MB and nothing
+    // else, so this row measures OUR parse and nothing else — the engine
+    // reports it as timings.parse_ms. The full-pipeline number is the
+    // `ingest1mbFull` row below, which has no industry counterpart because no
+    // published figure covers parse + reconcile + write.
     key: 'parse1mb',
     component: 'Serialization',
-    operation: '~1 MB JSON ingest',
+    operation: '~1 MB JSON parse (parse phase only)',
     refLoMs: 2,
     refHiMs: 15,
     unit: 'ms total',
-    caveat: 'reference is serde parse only; ours also reconciles + writes SQLite',
+  },
+  {
+    key: 'ingest1mbFull',
+    component: 'Serialization',
+    operation: '~1 MB ingest end to end (parse + reconcile + write)',
+    refLoMs: 0,
+    refHiMs: 0,
+    unit: 'ms total',
+    unscored: true,
+    caveat: 'no comparable published reference — a parser benchmark is not a database write',
   },
   {
     key: 'sqliteSingle',
     component: 'SQLite (WAL)',
     operation: 'single-row insert',
-    refLoMs: 0.5,
-    refHiMs: 1.5,
+    refLoMs: 0,
+    refHiMs: 0,
     unit: 'ms/op',
-    caveat: 'reference is a bare INSERT; ours parses, normalizes, and reconciles per row',
+    unscored: true,
+    caveat: 'reference was a bare INSERT — not comparable. See the offline-first DB row, which compares full inserts',
   },
   {
     key: 'sqliteBulk1k',
     component: 'SQLite (WAL)',
     operation: '1,000-row bulk insert (one txn)',
-    refLoMs: 12,
-    refHiMs: 25,
+    refLoMs: 0,
+    refHiMs: 0,
     unit: 'ms total',
-    caveat: 'reference is a bare INSERT loop; ours parses, content-hashes, and reconciles per row',
+    unscored: true,
+    caveat: 'reference was a bare INSERT loop — not comparable; ours parses, content-hashes and reconciles per row',
   },
   {
     key: 'marshal10k',
@@ -124,9 +146,10 @@ export const INDUSTRY_REFS: IndustryRef[] = [
   },
 ];
 
-export type Verdict = 'better' | 'within' | 'slower';
+export type Verdict = 'better' | 'within' | 'slower' | 'unscored';
 
 export function verdict(oursMs: number, ref: IndustryRef): Verdict {
+  if (ref.unscored) return 'unscored';
   if (oursMs < ref.refLoMs) return 'better';
   if (oursMs <= ref.refHiMs) return 'within';
   return 'slower';
@@ -134,7 +157,7 @@ export function verdict(oursMs: number, ref: IndustryRef): Verdict {
 
 export type IndustryResult = { ref: IndustryRef; oursMs: number };
 
-const MARK: Record<Verdict, string> = { better: '✓ faster', within: '✓ within', slower: '✗ slower' };
+const MARK: Record<Verdict, string> = { better: '✓ faster', within: '✓ within', slower: '✗ slower', unscored: '· informational' };
 
 export function renderIndustry(results: IndustryResult[]): string {
   const fmt = (ms: number) => (ms < 0.1 ? ms.toFixed(4) : ms < 10 ? ms.toFixed(2) : ms.toFixed(1));

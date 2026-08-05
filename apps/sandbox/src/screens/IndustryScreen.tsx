@@ -131,7 +131,7 @@ export function IndustryScreen() {
         <View style={{ marginTop: 8 }}>
           {results.map(({ ref, oursMs }) => {
             const v = verdict(oursMs, ref);
-            const tint = v === 'slower' ? '#c8332b' : '#1a7f37';
+            const tint = v === 'unscored' ? '#6b6b70' : v === 'slower' ? '#c8332b' : '#1a7f37';
             const fmt = (ms: number) => (ms < 0.1 ? ms.toFixed(4) : ms < 10 ? ms.toFixed(2) : ms.toFixed(1));
             const refStr =
               ref.refLoMs === ref.refHiMs ? `~${fmt(ref.refLoMs)}` : `${fmt(ref.refLoMs)}–${fmt(ref.refHiMs)}`;
@@ -145,7 +145,9 @@ export function IndustryScreen() {
                 }}
               >
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  <Text style={{ color: tint, fontSize: 13, width: 16 }}>{v === 'slower' ? '✗' : '✓'}</Text>
+                  <Text style={{ color: tint, fontSize: 13, width: 16 }}>
+                    {v === 'unscored' ? '·' : v === 'slower' ? '✗' : '✓'}
+                  </Text>
                   <Text style={{ fontSize: 14, color: '#111', flexShrink: 1 }}>
                     {ref.component}: {ref.operation}
                   </Text>
@@ -155,7 +157,7 @@ export function IndustryScreen() {
                     {fmt(oursMs)} {ref.unit}
                   </Text>
                   <Text style={{ fontFamily: 'monospace', fontSize: 11, color: '#6b6b70' }}>
-                    {'  vs industry '}{refStr}
+                    {v === 'unscored' ? '  (no comparable reference)' : `  vs industry ${refStr}`}
                   </Text>
                 </View>
                 {ref.caveat && (
