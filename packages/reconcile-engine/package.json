@@ -18,8 +18,10 @@
     "cpp",
     "ios",
     "ios-rust",
+    "android",
     "android-rust",
     "scripts",
+    "react-native.config.js",
     "ReconcileEngine.podspec"
   ],
   "scripts": {

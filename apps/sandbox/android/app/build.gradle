@@ -130,39 +130,10 @@ android {
     androidResources {
         ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'
     }
-    externalNativeBuild {
-        cmake {
-            path "src/main/jni/CMakeLists.txt"
-        }
-    }
-}
-
-/**
- * The gradle plugin's own app-level codegen (generateCodegenArtifactsFromSchema) only
- * processes this app's `codegenConfig.jsSrcsDir` ("specs/", which is empty). The
- * ReconcileEngine spec lives in the @rn-experiments/reconcile-engine dependency, which has
- * no android/ project, so Android autolinking never generates its codegen either. Run the
- * full RN codegen executor (the same one `pod install` uses on iOS) so the dependency's
- * ReconcileEngineSpec artifacts land in build/generated/source/codegen, where
- * ReactNative-application.cmake picks them up and links them into libappmodules.so.
- */
-def generateAppLevelCodegen = tasks.register("generateAppLevelCodegen", Exec) {
-    def reactNativeDirPath = new File(["node", "--print", "require.resolve('react-native/package.json')"].execute(null, rootDir).text.trim()).getParentFile().getAbsolutePath()
-    workingDir projectRoot
-    commandLine "node",
-            "$reactNativeDirPath/scripts/generate-codegen-artifacts.js",
-            "--path", projectRoot,
-            "--targetPlatform", "android"
-    // Must win over generateCodegenArtifactsFromSchema, which writes a jni/CMakeLists.txt
-    // for the (empty) app schema into the same output directory.
-    mustRunAfter("generateCodegenArtifactsFromSchema")
-}
-tasks.named("preBuild") { dependsOn(generateAppLevelCodegen) }
-tasks.configureEach { task ->
-    // The generated sources must exist before CMake configures src/main/jni/CMakeLists.txt.
-    if (task.name.startsWith("configureCMake") || task.name.startsWith("buildCMake")) {
-        task.dependsOn(generateAppLevelCodegen)
-    }
+    // No externalNativeBuild block on purpose. @rn-experiments/reconcile-engine now
+    // ships its own android/ gradle library, so autolinking compiles the C++ Turbo
+    // Module and links the Rust static lib into libappmodules.so on its own; React
+    // Native's default app CMakeLists/OnLoad.cpp are all this app needs.
 }
 
 // Apply static values from `gradle.properties` to the `android.packagingOptions`

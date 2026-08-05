@@ -1,0 +1,64 @@
+// Gradle library project for @rn-experiments/reconcile-engine (audit S29).
+//
+// Its job is small but load-bearing: existing at all is what makes React
+// Native's Android autolinking pick the package up. Concretely, applying the
+// `com.facebook.react` plugin to a library project runs library-level codegen,
+// which writes ReconcileEngineSpec (JSI header + Java spec + a jni/CMakeLists.txt
+// defining `react_codegen_ReconcileEngineSpec`) into
+//   android/build/generated/source/codegen/
+// Autolinking `add_subdirectory`s that generated CMakeLists into the consuming
+// app's libappmodules.so, alongside src/main/jni/CMakeLists.txt (declared in the
+// package's react-native.config.js), which compiles the C++ TurboModule and
+// links the Rust static library.
+//
+// No native build is configured here on purpose: the C++ is compiled into the
+// *app's* libappmodules.so via autolinking, not into a .so of our own, so the
+// module ends up in the same binary as the generated autolinking.cpp that
+// instantiates it.
+
+// No buildscript block: this project is only ever built as part of a consuming
+// React Native app, whose root build.gradle already puts the Android Gradle
+// Plugin, the Kotlin plugin and com.facebook.react on the buildscript classpath
+// (both the bare RN and the Expo templates do). Declaring them again here would
+// mean pinning versions this package has no business pinning.
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+apply plugin: "com.facebook.react"
+
+// Consuming apps set these in their root build.gradle (the RN/Expo templates
+// both do); the fallbacks keep this buildable from a bare app.
+def safeExtGet(prop, fallback) {
+  rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+}
+
+android {
+  namespace "com.rnexperiments.reconcileengine"
+
+  compileSdk safeExtGet("compileSdkVersion", 36)
+  if (rootProject.ext.has("buildToolsVersion")) {
+    buildToolsVersion rootProject.ext.get("buildToolsVersion")
+  }
+  if (rootProject.ext.has("ndkVersion")) {
+    ndkVersion rootProject.ext.get("ndkVersion")
+  }
+
+  defaultConfig {
+    // 24 matches the --platform passed to cargo-ndk in scripts/build-android.sh;
+    // raising it here without rebuilding the Rust artifacts would be a lie.
+    minSdk safeExtGet("minSdkVersion", 24)
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+}
+
+kotlin {
+  jvmToolchain(17)
+}
+
+dependencies {
+  // Version is supplied by the app's `com.facebook.react.rootproject` plugin.
+  implementation "com.facebook.react:react-android"
+}
