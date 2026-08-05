@@ -1,12 +1,11 @@
 import { useEffect, useState } from 'react';
-import { Button, Platform, ScrollView, Text, View } from 'react-native';
+import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { executeRaw } from '@rn-experiments/reconcile-engine';
 import { runAll, type RunOutput } from '../bench/phases';
 import {
   CATEGORY_LABELS,
   categoryWorstMetrics,
-  renderScorecard,
   toMarkdown,
   type CategoryKey,
 } from '../bench/markdown';
@@ -23,6 +22,80 @@ if (__DEV__) {
     toMarkdown,
     executeRaw,
   };
+}
+
+/** Chunky pill button. `tone` picks the accent; `busy` dims and disables. */
+function ActionButton({
+  label,
+  onPress,
+  busy,
+}: {
+  label: string;
+  onPress: () => void;
+  busy?: boolean;
+  emoji?: string;
+  tone?: string;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={busy}
+      style={({ pressed }) => ({
+        backgroundColor: pressed ? '#f2f2f4' : 'transparent',
+        paddingVertical: 14,
+        paddingHorizontal: 2,
+        borderBottomWidth: StyleSheet.hairlineWidth,
+        borderBottomColor: '#e3e3e6',
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+      })}
+    >
+      <Text style={{ fontSize: 15, color: busy ? '#9a9aa0' : '#111' }}>{label}</Text>
+      <Text style={{ fontSize: 13, color: '#9a9aa0' }}>{busy ? 'running' : '\u203A'}</Text>
+    </Pressable>
+  );
+}
+
+function CopyButton({ onPress, label = 'Copy as markdown' }: { onPress: () => void; label?: string }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => ({ alignSelf: 'flex-start', marginTop: 12, opacity: pressed ? 0.5 : 1 })}
+    >
+      <Text style={{ fontSize: 12, color: '#0b6bcb' }}>{label}</Text>
+    </Pressable>
+  );
+}
+
+const OK = '#1a7f37';
+const BAD = '#c8332b';
+const MUTED = '#6b6b70';
+
+/** One result line: status glyph, name, and a muted monospace detail under it. */
+function ResultRow({ pass, name, detail }: { pass?: boolean; name: string; detail: string }) {
+  const tint = pass === undefined ? MUTED : pass ? OK : BAD;
+  return (
+    <View style={{ paddingVertical: 9, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#e3e3e6' }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+        <Text style={{ color: tint, fontSize: 13, width: 16 }}>
+          {pass === undefined ? '·' : pass ? '✓' : '✗'}
+        </Text>
+        <Text style={{ fontSize: 14, color: '#111', flexShrink: 1 }}>{name}</Text>
+      </View>
+      <Text style={{ fontFamily: 'monospace', fontSize: 11, color: MUTED, marginTop: 3, marginLeft: 16 }}>
+        {detail}
+      </Text>
+    </View>
+  );
+}
+
+function SectionTitle({ children }: { children: React.ReactNode }) {
+  return (
+    <Text style={{ fontSize: 12, fontWeight: '600', color: MUTED, letterSpacing: 0.6, marginTop: 22, marginBottom: 4 }}>
+      {String(children).toUpperCase()}
+    </Text>
+  );
 }
 
 export function ExperimentsScreen() {
@@ -101,69 +174,73 @@ export function ExperimentsScreen() {
 
   return (
     <ScrollView style={{ padding: 16 }}>
-      <Button
-        title={running ? 'Running…' : 'Run benchmarks (quick)'}
-        disabled={running}
-        onPress={() => run(false)}
-      />
-      <Button
-        title={running ? 'Running…' : 'Run full benchmarks (incl. 100k)'}
-        disabled={running}
-        onPress={() => run(true)}
-      />
-      <Button
-        title={running ? 'Running…' : 'Run real-app list benchmark (LegendList)'}
-        disabled={running}
-        onPress={() => void runReal()}
-      />
-      <Button
-        title={running ? 'Running…' : 'Run betting-feed scenarios'}
-        disabled={running}
-        onPress={() => void runFeedScenarios()}
-      />
+      <ActionButton label="Run benchmarks (quick)" busy={running} onPress={() => run(false)} />
+      <ActionButton label="Full benchmarks (incl. 100k)" busy={running} onPress={() => run(true)} />
+      <ActionButton label="Real-app list (LegendList)" busy={running} onPress={() => void runReal()} />
+      <ActionButton label="Betting-feed scenarios" busy={running} onPress={() => void runFeedScenarios()} />
       {feeds && (
-        <>
-          <Text style={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 'bold', marginTop: 8 }}>
-            Betting feeds (multi-source price book)
-          </Text>
-          <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderFeeds(feeds)}</Text>
-        </>
+        <View>
+          <SectionTitle>Betting feeds · multi-source price book</SectionTitle>
+          {feeds.map((r) => (
+            <ResultRow key={r.name} pass={r.pass} name={r.name} detail={r.detail} />
+          ))}
+          <CopyButton
+            onPress={() =>
+              void Clipboard.setStringAsync(
+                `### betting feeds (${Platform.OS}) — ${new Date().toISOString()}\n\n\`\`\`\n${renderFeeds(feeds)}\n\`\`\`\n`,
+              )
+            }
+          />
+        </View>
       )}
       {realApp && (
-        <>
-          <Text style={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 'bold', marginTop: 8 }}>
-            Real-app list (lazy zero-copy backing)
-          </Text>
-          <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderRealApp(realApp)}</Text>
-          <Button
-            title="Copy real-app results"
-            onPress={() => void Clipboard.setStringAsync('```\n' + renderRealApp(realApp) + '\n```')}
-          />
-        </>
+        <View>
+          <SectionTitle>Real-app list · lazy zero-copy backing</SectionTitle>
+          {realApp.map((r) => (
+            <ResultRow key={r.name} name={r.name} detail={r.value} />
+          ))}
+          <CopyButton onPress={() => void Clipboard.setStringAsync('```\n' + renderRealApp(realApp) + '\n```')} />
+        </View>
       )}
       {output && (
-        <Button
-          title="Copy as markdown"
-          onPress={() => void Clipboard.setStringAsync(toMarkdown(Platform.OS, output))}
-        />
+        <View>
+          <SectionTitle>Benchmark score</SectionTitle>
+          {(Object.keys(CATEGORY_LABELS) as CategoryKey[]).map((k) => {
+            const c = output.score[k];
+            const ratio = c.measured ? c.earned / c.max : -1;
+            const tint = !c.measured ? MUTED : ratio >= 0.999 ? OK : ratio >= 0.6 ? '#111' : BAD;
+            const worst = categoryWorstMetrics(output.metrics)[k];
+            return (
+              <View
+                key={k}
+                style={{ paddingVertical: 7, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#e3e3e6' }}
+              >
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                  <Text style={{ fontSize: 14, color: '#111' }}>{CATEGORY_LABELS[k]}</Text>
+                  <Text style={{ fontSize: 14, fontVariant: ['tabular-nums'], color: tint, fontWeight: '600' }}>
+                    {c.measured ? `${Math.round(c.earned)}/${c.max}` : `--/${c.max}`}
+                  </Text>
+                </View>
+                {c.measured && Math.round(c.earned) < c.max && worst && (
+                  <Text style={{ fontFamily: 'monospace', fontSize: 10, color: BAD, marginTop: 2 }}>
+                    worst: {worst}
+                  </Text>
+                )}
+              </View>
+            );
+          })}
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', paddingTop: 10 }}>
+            <Text style={{ fontSize: 15, fontWeight: '700' }}>Total</Text>
+            <Text style={{ fontSize: 15, fontWeight: '700', fontVariant: ['tabular-nums'] }}>
+              {Math.round(output.score.overall.earned)}/{output.score.overall.available}
+            </Text>
+          </View>
+          <CopyButton onPress={() => void Clipboard.setStringAsync(toMarkdown(Platform.OS, output))} />
+        </View>
       )}
-      {output && (
-        <>
-          <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderScorecard(output.score)}</Text>
-          {Object.entries(categoryWorstMetrics(output.metrics))
-            .filter(([key]) => {
-              const c = output.score[key as CategoryKey];
-              return c.measured && Math.round(c.earned) < c.max;
-            })
-            .map(([key, detail]) => (
-              <Text key={key} style={{ fontFamily: 'monospace', fontSize: 11, color: '#a55' }}>
-                {CATEGORY_LABELS[key as CategoryKey]} lost most on: {detail}
-              </Text>
-            ))}
-        </>
-      )}
+      {progress.length > 0 && <SectionTitle>Log</SectionTitle>}
       {progress.map((m, i) => (
-        <Text key={i} style={{ fontFamily: 'monospace', fontSize: 12 }}>
+        <Text key={i} style={{ fontFamily: 'monospace', fontSize: 10, color: MUTED, lineHeight: 15 }}>
           {m}
         </Text>
       ))}

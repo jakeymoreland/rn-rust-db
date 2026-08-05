@@ -1,10 +1,53 @@
 import { useState } from 'react';
-import { Button, ScrollView, Text, View } from 'react-native';
+import { Pressable, ScrollView, Text, View, StyleSheet } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { runIndustry } from '../bench/industryRun';
-import { renderIndustry, type IndustryResult } from '../bench/industryRefs';
+import { renderIndustry, verdict, type IndustryResult } from '../bench/industryRefs';
 import { renderHotPath, runHotPath, type HotPathResult } from '../bench/hotPathRun';
 import { renderPhase2, runPhase2, type Phase2Result } from '../bench/phase2Run';
+
+function ActionButton({
+  label,
+  onPress,
+  busy,
+}: {
+  label: string;
+  onPress: () => void;
+  busy?: boolean;
+  emoji?: string;
+  tone?: string;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={busy}
+      style={({ pressed }) => ({
+        backgroundColor: pressed ? '#f2f2f4' : 'transparent',
+        paddingVertical: 14,
+        paddingHorizontal: 2,
+        borderBottomWidth: StyleSheet.hairlineWidth,
+        borderBottomColor: '#e3e3e6',
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+      })}
+    >
+      <Text style={{ fontSize: 15, color: busy ? '#9a9aa0' : '#111' }}>{label}</Text>
+      <Text style={{ fontSize: 13, color: '#9a9aa0' }}>{busy ? 'running' : '\u203A'}</Text>
+    </Pressable>
+  );
+}
+
+function CopyButton({ onPress, label = 'Copy as markdown' }: { onPress: () => void; label?: string }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => ({ alignSelf: 'flex-start', marginTop: 12, opacity: pressed ? 0.5 : 1 })}
+    >
+      <Text style={{ fontSize: 12, color: '#0b6bcb' }}>{label}</Text>
+    </Pressable>
+  );
+}
 
 export function IndustryScreen() {
   const [progress, setProgress] = useState<string[]>([]);
@@ -27,9 +70,9 @@ export function IndustryScreen() {
 
   return (
     <ScrollView style={{ padding: 16 }}>
-      <Button
-        title={running ? 'Running…' : 'Run industry comparison'}
-        disabled={running}
+      <ActionButton
+        label="Industry comparison"
+        busy={running}
         onPress={() =>
           run(async () => {
             setResults(null);
@@ -37,9 +80,9 @@ export function IndustryScreen() {
           })
         }
       />
-      <Button
-        title={running ? 'Running…' : 'Run hot-path benchmarks (kv)'}
-        disabled={running}
+      <ActionButton
+        label="Hot-path benchmarks (kv)"
+        busy={running}
         onPress={() =>
           run(async () => {
             setHotPath(null);
@@ -47,9 +90,9 @@ export function IndustryScreen() {
           })
         }
       />
-      <Button
-        title={running ? 'Running…' : 'Run bulk & flush benchmarks (phase 2)'}
-        disabled={running}
+      <ActionButton
+        label="Bulk & flush (phase 2)"
+        busy={running}
         onPress={() =>
           run(async () => {
             setPhase2(null);
@@ -58,8 +101,7 @@ export function IndustryScreen() {
         }
       />
       {(results || hotPath || phase2) && (
-        <Button
-          title="Copy as markdown"
+        <CopyButton
           onPress={() => {
             const parts = [];
             if (results) parts.push(renderIndustry(results));
@@ -86,13 +128,49 @@ export function IndustryScreen() {
         </>
       )}
       {results && (
-        <>
-          <Text style={{ fontFamily: 'monospace', fontSize: 12, marginTop: 8 }}>{renderIndustry(results)}</Text>
-          <Text style={{ fontFamily: 'monospace', fontSize: 10, color: '#888', marginTop: 8 }}>
-            Reference ranges are indicative figures for JSI/Rust stacks on modern hardware; rows with caveats
-            compare different amounts of work.
+        <View style={{ marginTop: 8 }}>
+          {results.map(({ ref, oursMs }) => {
+            const v = verdict(oursMs, ref);
+            const tint = v === 'slower' ? '#c8332b' : '#1a7f37';
+            const fmt = (ms: number) => (ms < 0.1 ? ms.toFixed(4) : ms < 10 ? ms.toFixed(2) : ms.toFixed(1));
+            const refStr =
+              ref.refLoMs === ref.refHiMs ? `~${fmt(ref.refLoMs)}` : `${fmt(ref.refLoMs)}–${fmt(ref.refHiMs)}`;
+            return (
+              <View
+                key={ref.key}
+                style={{
+                  paddingVertical: 9,
+                  borderBottomWidth: StyleSheet.hairlineWidth,
+                  borderBottomColor: '#e3e3e6',
+                }}
+              >
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  <Text style={{ color: tint, fontSize: 13, width: 16 }}>{v === 'slower' ? '✗' : '✓'}</Text>
+                  <Text style={{ fontSize: 14, color: '#111', flexShrink: 1 }}>
+                    {ref.component}: {ref.operation}
+                  </Text>
+                </View>
+                <View style={{ flexDirection: 'row', marginLeft: 16, marginTop: 3 }}>
+                  <Text style={{ fontFamily: 'monospace', fontSize: 11, color: tint, fontWeight: '600' }}>
+                    {fmt(oursMs)} {ref.unit}
+                  </Text>
+                  <Text style={{ fontFamily: 'monospace', fontSize: 11, color: '#6b6b70' }}>
+                    {'  vs industry '}{refStr}
+                  </Text>
+                </View>
+                {ref.caveat && (
+                  <Text style={{ fontSize: 10, color: '#6b6b70', marginLeft: 16, marginTop: 2, fontStyle: 'italic' }}>
+                    {ref.caveat}
+                  </Text>
+                )}
+              </View>
+            );
+          })}
+          <Text style={{ fontSize: 10, color: '#8a8a8e', marginTop: 10 }}>
+            Reference ranges are indicative figures for JSI/Rust stacks on modern hardware (iPhone 14+/SD 8 Gen 2+);
+            rows with caveats compare different amounts of work.
           </Text>
-        </>
+        </View>
       )}
       {progress.map((m, i) => (
         <Text key={i} style={{ fontFamily: 'monospace', fontSize: 12 }}>

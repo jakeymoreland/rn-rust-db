@@ -130,3 +130,25 @@ fn oversized_batches_flag_truncation() {
     );
     engine_close(h);
 }
+
+/// A partial-field update — the shape a real delta feed sends — must still
+/// report its keys. The full-row tests pass trivially because every field
+/// moves; a price feed republishes the key plus a handful of volatile fields
+/// and nothing else.
+#[test]
+fn partial_field_updates_report_their_keys() {
+    let h = open(&[("api", "sel")]);
+    // Full snapshot row.
+    let full = r#"[{"id":"s1","event":"A v B","market":"Match Odds","back_price":"2.40","updated_at":"2026-08-05T00:00:00Z"}]"#;
+    let v = ingest(h, "api", full);
+    assert_eq!(v["changed_keys"]["sel"].as_array().unwrap().len(), 1, "{v}");
+
+    // Delta: key + one volatile field + a newer timestamp. Nothing else.
+    let delta = r#"[{"id":"s1","back_price":"2.44","updated_at":"2026-08-05T00:00:01Z"}]"#;
+    let v = ingest(h, "api", delta);
+    assert_eq!(v["updated"], 1, "delta should update the row: {v}");
+    let keys = v["changed_keys"]["sel"].as_array().expect("changed_keys.sel missing on a delta update");
+    assert_eq!(keys.len(), 1, "delta update reported no keys: {v}");
+    assert_eq!(keys[0], "s1", "{v}");
+    engine_close(h);
+}
