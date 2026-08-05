@@ -1,5 +1,8 @@
 # rn-rust-db
 
+[![CI](https://github.com/jakeymoreland/rn-rust-db/actions/workflows/ci.yml/badge.svg)](https://github.com/jakeymoreland/rn-rust-db/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+
 An offline-first **sync engine for React Native, with its core written in Rust**.
 It's the on-device replica layer of a local-first app: it owns local storage,
 field-level conflict resolution, change events, and a redis-style key–value
@@ -40,6 +43,9 @@ core:
 ## Quickstart
 
 ```bash
+# Install workspace dependencies first (yarn v1, workspaces)
+yarn install
+
 # Build the Rust artifacts (see packages/reconcile-engine/README.md for toolchain setup)
 cd packages/reconcile-engine
 ./scripts/build-ios.sh        # and/or ./scripts/build-android.sh

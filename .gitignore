@@ -14,6 +14,11 @@ packages/reconcile-engine/ios-rust/
 packages/reconcile-engine/android-rust/
 packages/reconcile-engine/artifacts-manifest.json
 
+# cargo-flamegraph output (BENCHMARKS.md documents how to regenerate it).
+flamegraph.svg
+cargo-flamegraph.trace
+perf.data*
+
 # The only app lives in apps/sandbox. Anything Expo generates at the workspace
 # root is a stray prebuild — never commit a second copy of the native projects.
 /ios/

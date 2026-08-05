@@ -5,7 +5,7 @@ Pod::Spec.new do |s|
   s.name         = "ReconcileEngine"
   s.version      = package["version"]
   s.summary      = "Redis-esque Rust reconcile engine turbo module"
-  s.homepage     = "https://example.invalid/reconcile-engine"
+  s.homepage     = "https://github.com/jakeymoreland/rn-rust-db"
   s.license      = "MIT"
   s.authors      = { "Initial Studios" => "jake@initialstudios.com.au" }
   s.platforms    = { :ios => "15.1" }

@@ -10,7 +10,9 @@ keep them in sync.
   `packages/reconcile-engine/rust/rust-toolchain.toml`; rustup installs them
   automatically in that directory.
 - **Node + yarn** for the TS API and the sandbox app.
-- **iOS**: Xcode. **Android**: the Android NDK and `cargo install cargo-ndk`.
+- **iOS**: Xcode. The sandbox ships with no signing team set, so pick your own
+  under Signing & Capabilities on first build (leave that change out of your
+  PR). **Android**: the Android NDK and `cargo install cargo-ndk`.
 
 ## Layout
 
@@ -32,7 +34,7 @@ a verifying command instead.
 ```bash
 cd packages/reconcile-engine/rust
 cargo test
-cargo clippy --all-targets    # zero errors — the FFI layer is held to this
+cargo clippy --all-targets -- -D warnings   # zero warnings — CI gates on this
 
 cd ..                          # packages/reconcile-engine
 yarn test

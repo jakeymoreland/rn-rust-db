@@ -14,7 +14,10 @@ public/production release.
       drift-check — heavy, so scheduled/opt-in rather than per-PR. Pairs with the
       artifact-distribution decision below.
 - [x] `CONTRIBUTING.md`.
-- [ ] Issue/PR templates (`.github/`).
+- [x] Issue/PR templates (`.github/`).
+- [x] `SECURITY.md` — private reporting via GitHub advisories. **Requires
+      "Private vulnerability reporting" to be enabled in repo settings**;
+      until it is, the advisory link 404s and reporters fall back to email.
 - [ ] Decide artifact distribution: commit prebuilt `.a`/xcframework via git-lfs,
       or a published-package build flow. They are gitignored today and built
       locally by `scripts/build-*.sh`.

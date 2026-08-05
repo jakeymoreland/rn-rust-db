@@ -3,6 +3,10 @@ name = "reconcile_engine"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.81"  # audit S26: floor for the FFI panic=abort-on-unwind behavior
+description = "Offline-first reconcile engine: SQLite-backed store with field-level last-writer-wins merge, redis-style kv cache, and glob pub/sub, behind a C ABI."
+license = "MIT"
+repository = "https://github.com/jakeymoreland/rn-rust-db"
+publish = false  # consumed via the RN package, not published to crates.io
 
 [lib]
 crate-type = ["staticlib", "lib"]

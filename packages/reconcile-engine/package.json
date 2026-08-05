@@ -1,6 +1,16 @@
 {
   "name": "@rn-experiments/reconcile-engine",
   "version": "0.1.0",
+  "description": "React Native TurboModule wrapping a Rust reconcile engine: SQLite-backed store with field-level merge, redis-style kv, pub/sub, and zero-copy JSI queries.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jakeymoreland/rn-rust-db.git",
+    "directory": "packages/reconcile-engine"
+  },
+  "homepage": "https://github.com/jakeymoreland/rn-rust-db#readme",
+  "bugs": "https://github.com/jakeymoreland/rn-rust-db/issues",
+  "//private": "Stays private until the native-artifact distribution question in ROADMAP.md is settled — publishing today would ship a package with no prebuilt binaries.",
   "private": true,
   "main": "src/index.ts",
   "files": [
