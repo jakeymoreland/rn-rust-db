@@ -94,7 +94,15 @@ const styles = StyleSheet.create({
   tabBar: {
     flexDirection: 'row',
     justifyContent: 'space-around',
-    paddingVertical: 8,
+    paddingTop: 8,
+    // Android builds run edge-to-edge (gradle.properties edgeToEdgeEnabled=true),
+    // so this bar draws *behind* the system nav bar and its buttons swallow the
+    // taps. A blunt 80 clears both the 3-button bar (48dp) and the gesture pill
+    // (~24dp) on every device we test on. The correct fix is
+    // react-native-safe-area-context's useSafeAreaInsets, but that is a native
+    // module — this is a benchmark sandbox, not shipping UI, and a constant
+    // keeps it to a Fast Refresh instead of a rebuild-and-reinstall.
+    paddingBottom: 80,
     borderTopWidth: 1,
     borderTopColor: '#ccc',
   },

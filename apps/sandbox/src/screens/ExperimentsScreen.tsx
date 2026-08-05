@@ -46,7 +46,13 @@ export function ExperimentsScreen() {
     setProgress([]);
     setOutput(null);
     try {
-      setOutput(await runAll((m) => setProgress((p) => [...p, m]), { includeHeavy }));
+      const out = await runAll((m) => setProgress((p) => [...p, m]), { includeHeavy });
+      setOutput(out);
+      // Also emit the markdown to the Metro log. "Copy as markdown" needs a
+      // human with the device in hand; this is the same text, capturable from
+      // a terminal — which is what BENCHMARKS.md's paste-per-platform workflow
+      // actually needs, especially on an emulator or a tethered device.
+      if (__DEV__) console.log(toMarkdown(Platform.OS, out));
     } finally {
       setRunning(false);
     }
@@ -57,7 +63,9 @@ export function ExperimentsScreen() {
     setProgress([]);
     setRealApp(null);
     try {
-      setRealApp(await runRealApp((m) => setProgress((p) => [...p, m])));
+      const result = await runRealApp((m) => setProgress((p) => [...p, m]));
+      setRealApp(result);
+      if (__DEV__) console.log(`real-app list (${Platform.OS})\n${renderRealApp(result)}`);
     } catch (e) {
       setProgress((p) => [...p, `failed: ${e}`]);
     } finally {
