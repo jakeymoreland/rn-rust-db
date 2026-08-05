@@ -98,6 +98,17 @@ export const redis = {
   hset: (key: string, field: string, value: string) => call<'OK'>('hset', [key, field, value]),
   hgetall: (key: string) => call<Record<string, string>>('hgetall', [key]),
   /**
+   * Batch `hgetall`: one call for many keys, results in the order given, with
+   * an empty object for a miss so callers can zip positionally.
+   *
+   * Prefer this over looping `hgetall`. Each single call is a separate JSI
+   * crossing, and 100 sequential ones measured ~5 s under concurrent write
+   * load on both iOS and Android — enough to consume an entire 5-second
+   * benchmark window on its own. `entry:` keys are grouped per collection into
+   * one query engine-side.
+   */
+  hmgetall: (...keys: string[]) => call<Array<Record<string, string>>>('hmgetall', keys),
+  /**
    * Sets a TTL in MILLISECONDS (not seconds like Redis EXPIRE). `ttlMs` must be
    * positive. Rejects with an {@link EngineError} (code 4) if the key does not
    * exist — unlike Redis EXPIRE, which returns 0. Wrap in try/catch for

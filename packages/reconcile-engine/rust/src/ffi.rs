@@ -250,6 +250,19 @@ pub extern "C" fn engine_execute(handle: *mut c_void, request_json: *const c_cha
             let Some(req) = (unsafe { cstr(request_json) }) else {
                 return to_c_string("{\"ok\":false,\"code\":4,\"message\":\"null request\"}".into());
             };
+            // Pure store reads (hget/hgetall/hmgetall) go to the read-only
+            // connection and never touch the engine mutex, so they no longer
+            // queue behind an in-flight ingest. `engine_open` always installs
+            // real_clock, so using it here matches what the engine would have
+            // reported. Falls through for every other command, and for
+            // :memory: databases, which have no second connection.
+            if ffi.reader.is_some() {
+                if let Some(response) = with_read_conn(ffi, |conn| {
+                    crate::dispatch::execute_read_only(conn, req, real_clock())
+                }) {
+                    return to_c_string(response);
+                }
+            }
             let (response, events) = {
                 let mut engine = lock_engine(&ffi.inner);
                 let response = execute(&mut engine, req);

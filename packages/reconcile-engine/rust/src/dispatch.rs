@@ -18,6 +18,51 @@ pub fn execute(engine: &mut Engine, request_json: &str) -> String {
     }
 }
 
+/// Serves the commands that are pure store reads against a bare connection,
+/// so the FFI can run them on the read-only connection instead of taking the
+/// engine mutex. Returns `None` for everything else, and the caller falls
+/// through to `execute`.
+///
+/// Only `hget`/`hgetall`/`hmgetall` qualify: they read the `hash` and `entries`
+/// tables, both of which are written through synchronously. `get`/`mget`/`scan`
+/// deliberately do NOT qualify — they read the write-behind kv cache, whose
+/// pending sets are not yet in SQLite, so serving them from a second connection
+/// would return stale values.
+///
+/// Reads observe expiry without purging it; see `commands::hget_conn`.
+pub fn execute_read_only(
+    conn: &rusqlite::Connection,
+    request_json: &str,
+    now_ms: i64,
+) -> Option<String> {
+    let req: Value = serde_json::from_str(request_json).ok()?;
+    let cmd = req["cmd"].as_str()?;
+    if !matches!(cmd, "hget" | "hgetall" | "hmgetall") {
+        return None;
+    }
+    let args: Vec<String> = req["args"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let result = match cmd {
+        "hget" => (|| {
+            Ok(json!(commands::hget_conn(conn, arg(&args, 0)?, arg(&args, 1)?, now_ms)?))
+        })(),
+        "hgetall" => {
+            (|| Ok(json!(commands::hgetall_conn(conn, arg(&args, 0)?, now_ms)?)))()
+        }
+        _ => (|| Ok(json!(commands::hmgetall_conn(conn, &args, now_ms)?)))(),
+    };
+    Some(match result {
+        Ok(v) => ok(v),
+        Err(e) => err(&e),
+    })
+}
+
 fn arg(args: &[String], i: usize) -> Result<&str, EngineError> {
     args.get(i)
         .map(|s| s.as_str())
@@ -63,6 +108,10 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
             Ok(json!("OK"))
         }
         "hgetall" => Ok(json!(commands::hgetall(&engine.store, arg(&args, 0)?, now)?)),
+        // Batch hgetall: one call instead of N. Also served off the read-only
+        // connection by the FFI layer (see `execute_read_only`); this arm is the
+        // fallback for in-memory databases, which have no second connection.
+        "hmgetall" => Ok(json!(commands::hmgetall_conn(&engine.store.conn, &args, now)?)),
         "expire" => {
             let ttl_ms: i64 = arg(&args, 1)?
                 .parse()

@@ -179,18 +179,61 @@ pub fn hget(store: &Store, key: &str, field: &str, now_ms: i64) -> Result<Option
     if purge_if_expired(store, key, now_ms)? {
         return Ok(None);
     }
-    Ok(store
-        .conn
+    hget_conn(&store.conn, key, field, now_ms)
+}
+
+/// Expiry check for the read-only path: observes an expired key without
+/// purging it. `purge_if_expired` deletes, which a read-only connection cannot
+/// do; reclaiming the row is left to the next command that takes the writer.
+/// The observable result is identical — an expired key reads as absent.
+fn is_expired(conn: &rusqlite::Connection, key: &str, now_ms: i64) -> Result<bool, EngineError> {
+    let expires: Option<i64> = conn
+        .prepare_cached("SELECT expires_at FROM key_ttl WHERE key = ?1")?
+        .query_row(params![key], |r| r.get(0))
+        .optional()?;
+    Ok(matches!(expires, Some(at) if now_ms >= at))
+}
+
+/// `hget` against a bare connection, so it can run on the read-only connection
+/// instead of taking the engine mutex. Touches no write-behind state: the hash
+/// table is written through synchronously by `hset`, never cached.
+pub fn hget_conn(
+    conn: &rusqlite::Connection,
+    key: &str,
+    field: &str,
+    now_ms: i64,
+) -> Result<Option<String>, EngineError> {
+    if is_expired(conn, key, now_ms)? {
+        return Ok(None);
+    }
+    Ok(conn
         .prepare_cached("SELECT value FROM hash WHERE key = ?1 AND field = ?2")?
         .query_row(params![key, field], |r| r.get(0))
         .optional()?)
 }
 
 pub fn hgetall(store: &Store, key: &str, now_ms: i64) -> Result<BTreeMap<String, String>, EngineError> {
+    // entry: keys never carry a TTL, so the purge is irrelevant to them and the
+    // conn path handles them identically.
+    if key.starts_with("entry:") {
+        return hgetall_conn(&store.conn, key, now_ms);
+    }
+    if purge_if_expired(store, key, now_ms)? {
+        return Ok(BTreeMap::new());
+    }
+    hgetall_conn(&store.conn, key, now_ms)
+}
+
+/// `hgetall` against a bare connection, so it can run on the read-only
+/// connection instead of taking the engine mutex. See `hget_conn`.
+pub fn hgetall_conn(
+    conn: &rusqlite::Connection,
+    key: &str,
+    now_ms: i64,
+) -> Result<BTreeMap<String, String>, EngineError> {
     if let Some(rest) = key.strip_prefix("entry:") {
         if let Some((collection, natural_key)) = rest.split_once(':') {
-            let row: Option<(String, i64)> = store
-                .conn
+            let row: Option<(String, i64)> = conn
                 .prepare_cached(
                     "SELECT fields, updated_at FROM entries WHERE collection = ?1 AND natural_key = ?2",
                 )?
@@ -207,17 +250,81 @@ pub fn hgetall(store: &Store, key: &str, now_ms: i64) -> Result<BTreeMap<String,
             });
         }
     }
-    if purge_if_expired(store, key, now_ms)? {
+    if is_expired(conn, key, now_ms)? {
         return Ok(BTreeMap::new());
     }
-    let mut stmt = store
-        .conn
-        .prepare_cached("SELECT field, value FROM hash WHERE key = ?1")?;
+    let mut stmt = conn.prepare_cached("SELECT field, value FROM hash WHERE key = ?1")?;
     let rows = stmt.query_map(params![key], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     let mut out = BTreeMap::new();
     for row in rows {
         let (f, v) = row?;
         out.insert(f, v);
+    }
+    Ok(out)
+}
+
+/// Batch `hgetall` (P1): one call instead of N JSI crossings and N lock
+/// acquisitions. `entry:` keys are grouped per collection into a single
+/// `IN (...)` query, which is the shape a list-backed UI actually asks for —
+/// the benchmark's 100 sequential hgetalls cost ~5 s under load purely in
+/// round trips. Results are returned in the order the keys were given, with an
+/// empty map for a miss so the caller can zip them positionally.
+pub fn hmgetall_conn(
+    conn: &rusqlite::Connection,
+    keys: &[String],
+    now_ms: i64,
+) -> Result<Vec<BTreeMap<String, String>>, EngineError> {
+    let mut out: Vec<BTreeMap<String, String>> = vec![BTreeMap::new(); keys.len()];
+
+    // Group entry: keys by collection so each collection costs one query.
+    let mut by_collection: BTreeMap<&str, Vec<(usize, &str)>> = BTreeMap::new();
+    let mut leftovers: Vec<usize> = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        match key.strip_prefix("entry:").and_then(|r| r.split_once(':')) {
+            Some((collection, natural_key)) => {
+                by_collection.entry(collection).or_default().push((i, natural_key))
+            }
+            None => leftovers.push(i),
+        }
+    }
+
+    for (collection, wanted) in by_collection {
+        // Chunked to stay under SQLITE_MAX_VARIABLE_NUMBER (999 on older builds),
+        // leaving one slot for the collection parameter.
+        for chunk in wanted.chunks(900) {
+            let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT natural_key, fields, updated_at FROM entries \
+                 WHERE collection = ?1 AND natural_key IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+            params.push(&collection);
+            for (_, nk) in chunk {
+                params.push(nk);
+            }
+            let rows = stmt.query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            let mut found: BTreeMap<String, (String, i64)> = BTreeMap::new();
+            for row in rows {
+                let (nk, fields_json, updated_at) = row?;
+                found.insert(nk, (fields_json, updated_at));
+            }
+            for (i, nk) in chunk {
+                if let Some((fields_json, updated_at)) = found.get(*nk) {
+                    let mut m: BTreeMap<String, String> = serde_json::from_str(fields_json)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    m.insert("_updated_at".into(), updated_at.to_string());
+                    out[*i] = m;
+                }
+            }
+        }
+    }
+
+    // Anything that isn't an entry: key falls back to the per-key path.
+    for i in leftovers {
+        out[i] = hgetall_conn(conn, &keys[i], now_ms)?;
     }
     Ok(out)
 }
