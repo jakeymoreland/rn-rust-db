@@ -712,7 +712,14 @@ export async function runAll(onProgress: (msg: string) => void, opts: RunOptions
       const rejected = async (payload: string): Promise<boolean> => {
         try {
           const summary = await ingest('bench_rel', payload);
-          return (summary.dead_lettered ?? 0) > 0;
+          // A skipped batch is the whole-payload hash short-circuit: this exact
+          // payload was seen before, so there are no NEW dead letters — but
+          // nothing was accepted either, and the record is still absent.
+          // Reading dead_lettered alone scores that skip as an ACCEPT, which is
+          // what produced a spurious "wrong shape ACCEPTED" reliability failure
+          // on a database that was not freshly wiped.
+          if (summary.skipped) return true;
+          return (summary.dead_lettered ?? 0) > 0 && (summary.inserted ?? 0) === 0;
         } catch {
           return true;
         }
