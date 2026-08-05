@@ -14,6 +14,7 @@ import { BenchList } from '../bench/BenchList';
 import { registerListVisibility } from '../bench/listBridge';
 import { RealAppList, registerRealListVisibility } from '../bench/RealAppList';
 import { renderRealApp, runRealApp, type RealAppResult } from '../bench/realAppRun';
+import { renderFeeds, runFeeds, type FeedResult } from '../bench/feedsRun';
 
 if (__DEV__) {
   // Expose the harness so benchmarks can be driven over the Hermes inspector.
@@ -31,6 +32,7 @@ export function ExperimentsScreen() {
   const [listVisible, setListVisible] = useState(false);
   const [realListVisible, setRealListVisible] = useState(false);
   const [realApp, setRealApp] = useState<RealAppResult[] | null>(null);
+  const [feeds, setFeeds] = useState<FeedResult[] | null>(null);
 
   useEffect(() => {
     registerListVisibility(setListVisible);
@@ -73,6 +75,21 @@ export function ExperimentsScreen() {
     }
   };
 
+  const runFeedScenarios = async () => {
+    setRunning(true);
+    setProgress([]);
+    setFeeds(null);
+    try {
+      const result = await runFeeds((m) => setProgress((p) => [...p, m]));
+      setFeeds(result);
+      if (__DEV__) console.log(`betting feeds (${Platform.OS})\n${renderFeeds(result)}`);
+    } catch (e) {
+      setProgress((p) => [...p, `failed: ${e}`]);
+    } finally {
+      setRunning(false);
+    }
+  };
+
   // The list phases swap the whole screen to a list route: a virtualized
   // list must not be nested inside this ScrollView.
   if (listVisible) {
@@ -99,6 +116,19 @@ export function ExperimentsScreen() {
         disabled={running}
         onPress={() => void runReal()}
       />
+      <Button
+        title={running ? 'Running…' : 'Run betting-feed scenarios'}
+        disabled={running}
+        onPress={() => void runFeedScenarios()}
+      />
+      {feeds && (
+        <>
+          <Text style={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 'bold', marginTop: 8 }}>
+            Betting feeds (multi-source price book)
+          </Text>
+          <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderFeeds(feeds)}</Text>
+        </>
+      )}
       {realApp && (
         <>
           <Text style={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 'bold', marginTop: 8 }}>
