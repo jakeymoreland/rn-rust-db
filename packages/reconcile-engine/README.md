@@ -39,29 +39,29 @@ fails the app build if they diverge, so stale native code can't ship silently.
 | Mac Catalyst | ❌ | no `ios-arm64-macabi` slice; `:mac_catalyst_enabled => false` |
 | Android arm64-v8a / armeabi-v7a / x86_64 / x86 | ✅ | all four RN-default ABIs are built |
 
-## Android: consumer integration is not automatic
+## Android: autolinked, no app-side wiring
 
-The package has no `android/` gradle library project, so Android autolinking
-contributes nothing — a consumer app must wire four things itself (this is
-what `apps/sandbox/android` does; see those files as the reference):
+The package ships an `android/` gradle library, so a consumer app needs no
+CMake, no `OnLoad.cpp`, and no codegen task of its own — `yarn add` plus a
+native rebuild is the whole integration (audit S29). `apps/sandbox/android` is
+the proof: its `app/build.gradle` has no `externalNativeBuild` block at all.
 
-1. **`jni/CMakeLists.txt`** — compile `cpp/NativeReconcileEngine.cpp` and import
-   `android-rust/${ANDROID_ABI}/libreconcile_engine.a`. Resolve the package dir
-   via `node --print require.resolve(...)` (not a fixed relative path) so it
-   works from `node_modules`.
-2. **`jni/OnLoad.cpp`** — an edited copy of RN's `default-app-setup/OnLoad.cpp`
-   that registers `NativeReconcileEngine` in `cxxModuleProvider`. This tracks RN
-   internals; on an RN upgrade, diff it against
-   `node_modules/react-native/ReactAndroid/cmake-utils/default-app-setup/OnLoad.cpp`
-   to catch upstream drift (audit F56).
-3. **`app/build.gradle`** — a `generateAppLevelCodegen` task invoking RN's
-   `scripts/generate-codegen-artifacts.js`, since a package with no `android/`
-   project never gets library-level codegen run for it.
-4. **`gradle.properties`** — `reactNativeArchitectures` may be narrowed for
-   faster local builds, but all four ABIs are available.
+How the pieces fit, since C++ TurboModules autolink differently from Java ones:
 
-Giving the package a real `android/` gradle library (so autolinking handles all
-of the above) is tracked as a follow-up — see the audit report, finding S29.
+| Piece | What it does |
+|---|---|
+| `android/build.gradle` | Applies `com.facebook.react` to a library project, which runs library-level codegen into `android/build/generated/source/codegen/` (the `ReconcileEngineSpec` JSI header and the `react_codegen_ReconcileEngineSpec` CMake target). |
+| `android/src/main/jni/CMakeLists.txt` | Compiles `cpp/NativeReconcileEngine.cpp` and links `android-rust/${ANDROID_ABI}/libreconcile_engine.a` into the target `reconcile_engine_cxx`. |
+| `react-native.config.js` | Points autolinking at that CMakeLists (`cxxModuleCMakeListsPath`) and at the header (`cxxModuleHeaderName`), so the generated `autolinking.cpp` constructs the module in `autolinking_cxxModuleProvider`. |
+| `ReconcileEnginePackage.kt` | Empty by design. The autolinking resolver drops a library's whole Android config unless it finds a `ReactPackage` class, so this exists purely to be found. |
+
+Nothing is built into a `.so` of the library's own: autolinking `add_subdirectory`s
+both CMake projects into the app's `libappmodules.so`, which is also where the
+generated `autolinking.cpp` lands — the module and its registration end up in
+one binary.
+
+`reactNativeArchitectures` in the app's `gradle.properties` may be narrowed for
+faster local builds; all four RN-default ABIs are available.
 
 ## C ABI header
 

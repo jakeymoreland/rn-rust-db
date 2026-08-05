@@ -8,9 +8,10 @@ It's the on-device replica layer of a local-first app: it owns local storage,
 field-level conflict resolution, change events, and a redis-style key–value
 cache — and deliberately does **no networking**, so it drops into any backend.
 
-> **Status: experimental.** The engine is tested, benchmarked, and audited, but
-> the API is pre-1.0 and Android packaging is not yet turnkey (see
-> [Roadmap](./ROADMAP.md)). Not yet recommended for production.
+> **Status: experimental.** The engine is tested, benchmarked, and audited, and
+> both platforms autolink from an install — but the API is pre-1.0 and the
+> prebuilt native artifacts are still built locally rather than distributed
+> (see [Roadmap](./ROADMAP.md)). Not yet recommended for production.
 
 ## What it is
 

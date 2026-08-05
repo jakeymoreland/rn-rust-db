@@ -5,8 +5,10 @@
 > cheap noted items (F8, F10, F11, F23, F24, F27, F28, F29, F30, F31, F41, F52,
 > F54, F55, F56) are fixed too. **Deferred (documented instead):** F32 event-ctx
 > weak_ptr shim (currently sound; `close()` now detaches the callback first as
-> partial hardening), S29 Android gradle-library project, Mac Catalyst support,
-> and full Redis glob `?`/`[...]` classes. F26 was **refuted** during
+> partial hardening), Mac Catalyst support,
+> and full Redis glob `?`/`[...]` classes. **S29 was deferred here and fixed
+> later** — the package now ships an `android/` gradle library (see the
+> finding). F26 was **refuted** during
 > verification. Fixes span commits `e88c5b6`…`051e611`. Verified end to end:
 > 91 Rust lib + 8 integration tests, 30 jest tests, `cargo clippy` zero errors
 > (was 19), all 7 native targets cross-compile, `pod install` hooks succeed, and
@@ -354,6 +356,8 @@ Result: **4 critical, 29 should-fix, 22 noted, 1 refuted.** Verifiers re-graded 
 
 **Fix sketch:** Give the package an android/ project (gradle library with its own CMakeLists and a ReactPackage/TurboReactPackage or cxxModuleProvider registration via the library-level codegen), so autolinking handles it; failing that, ship a consumer-setup doc listing exactly these four required app-side changes and derive PKG from node --print require.resolve(...) instead of a fixed relative path.
 
+**Status:** fixed (deferred at audit time, done in `817d899`) — the fix sketch's first option. `packages/reconcile-engine/android/` is a `com.android.library` project with the `com.facebook.react` plugin (library-level codegen), `src/main/jni/CMakeLists.txt` (C++ module + Rust `.a`), an intentionally empty `ReconcileEnginePackage.kt` (the autolinking resolver drops a dependency's Android config without a `ReactPackage` class), and a root `react-native.config.js` declaring the C++ module so `autolinking_cxxModuleProvider` constructs it. All four app-side pieces are gone from `apps/sandbox/android`, which now has no `externalNativeBuild` block at all. The RN-internals coupling called out here and in F56 goes with them: the copied `OnLoad.cpp` is deleted in favour of RN's own `default-app-setup/OnLoad.cpp`, and the `generate-codegen-artifacts.js` shell-out in favour of the gradle plugin's own library codegen.
+
 
 ## Noted
 
@@ -378,7 +382,7 @@ Result: **4 critical, 29 should-fix, 22 noted, 1 refuted.** Verifiers re-graded 
 - **N19 (F53).** build-android.sh does rm -rf "$OUT" before running cargo, so a failed build (missing NDK, missing target, compile error) leaves android-rust/ deleted with no libs at all; build-ios.sh gets this right by building first and removing the old xcframework only after cargo succeeds. — `packages/reconcile-engine/scripts/build-android.sh:6`
 - **N20 (F54).** engine.h is a hand-maintained mirror of rust/src/ffi.rs (no cbindgen config or generation step anywhere). Today the 14 declarations match the 14 #[no_mangle] pub extern "C" exports, but nothing enforces it. This header is also duplicated into both xcframework Headers/ dirs at build time, adding a second copy that can go stale independently. — `packages/reconcile-engine/cpp/include/engine.h:1`
 - **N21 (F55).** Publishing hygiene: no private: true and no files field. npm only honors a .gitignore inside the package directory (there is none) — the ignore rules for ios-rust/, android-rust/, and target/ live in the repo-root .gitignore, which npm pack does not read. Also codegenConfig has an ios.modulesProvider entry but no android section (works today only because the sandbox runs app-level codegen with defaults), and main points at TS source src/index.ts (fine for Metro, broken for any non-Metro consumer). — `packages/reconcile-engine/package.json:2`
-- **N22 (F56).** OnLoad.cpp is a copied-and-edited RN 0.86 internal file (self-documented at the top), and app/build.gradle's generateAppLevelCodegen shells into react-native's internal scripts/generate-codegen-artifacts.js. Both couple the app to RN 0.86 internals; the Cargo.lock is committed (good) but these RN-side pins are implicit only (react-native 0.86.0 / expo ~57.0.6 in apps/sandbox/package.json — the package itself declares just react-native: *). — `apps/sandbox/android/app/src/main/jni/OnLoad.cpp:8`
+- **N22 (F56).** OnLoad.cpp is a copied-and-edited RN 0.86 internal file (self-documented at the top), and app/build.gradle's generateAppLevelCodegen shells into react-native's internal scripts/generate-codegen-artifacts.js. Both couple the app to RN 0.86 internals; the Cargo.lock is committed (good) but these RN-side pins are implicit only (react-native 0.86.0 / expo ~57.0.6 in apps/sandbox/package.json — the package itself declares just react-native: *). — `apps/sandbox/android/app/src/main/jni/OnLoad.cpp:8` — **resolved by the S29 fix (`817d899`):** both files are deleted; the app uses RN's own `default-app-setup/OnLoad.cpp` and the gradle plugin's library codegen, so nothing is copied from RN internals any more.
 
 ## Refuted during verification
 

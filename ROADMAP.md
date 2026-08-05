@@ -24,14 +24,18 @@ public/production release.
 
 ## Packaging & DX
 
-- [ ] **blocker — Android self-containment (audit S29).** The package has no
-      `android/` gradle library, so a consumer must hand-wire CMake, `OnLoad.cpp`,
-      app-level codegen, and ABI config themselves. Give it a real gradle library
-      so autolinking works from `npm install`. This is the main thing stopping
-      someone else from just using it.
+- [x] **Android self-containment (audit S29).** The package now ships an
+      `android/` gradle library plus a `react-native.config.js` declaring the C++
+      module, so autolinking compiles the TurboModule and links the Rust static
+      lib into the app's `libappmodules.so` on its own. Consumer apps need no
+      CMake, no `OnLoad.cpp`, and no codegen task — `apps/sandbox/android` has
+      none of them any more. See the package README.
 - [ ] Mac Catalyst slice in the xcframework (currently unsupported; documented).
-- [ ] Track `OnLoad.cpp` / codegen against React Native internals on RN upgrades
-      (audit F56) — add the divergence-check the README describes.
+- [x] Track `OnLoad.cpp` / codegen against React Native internals on RN upgrades
+      (audit F56) — moot: the copied `OnLoad.cpp` and the `generate-codegen-artifacts.js`
+      shell-out are gone, replaced by RN's own default app setup and the gradle
+      plugin's library codegen. The remaining RN-shaped surface is the three
+      autolinking keys in `react-native.config.js`, which are public API.
 
 ## Engine semantics (known gaps)
 
