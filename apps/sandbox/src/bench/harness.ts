@@ -25,6 +25,53 @@ export type BenchResult = {
   note?: string;
 };
 
+/**
+ * Times a *synchronous* op by running the whole batch in one tight loop.
+ *
+ * `time()` below brackets every single iteration with `performance.now()` and
+ * an `await`, which is right for millisecond-scale work but swamps anything
+ * sub-millisecond: the `await` costs a microtask hop *inside* the measured
+ * window. The same `executeRawSync` no-op measured 0.404 ms/op through `time()`
+ * and 0.0116 ms/op through the Industry tab's tight loop on one device — a 35x
+ * gap that is entirely harness overhead, and it was feeding the scored
+ * `nativeSyncCallMs` metric.
+ *
+ * No yielding between iterations, so keep the batch short enough not to stall
+ * the UI (a 1000-iteration no-op is ~12 ms).
+ */
+export async function timeTight(
+  name: string,
+  iterations: number,
+  fn: () => void,
+): Promise<BenchResult> {
+  for (let i = 0; i < Math.min(100, iterations); i++) fn();
+  await sleep(0);
+  const t0 = performance.now();
+  for (let i = 0; i < iterations; i++) fn();
+  const totalMs = performance.now() - t0;
+  return { name, iterations, totalMs, perOpMs: totalMs / iterations };
+}
+
+/**
+ * Times an *async* op across the whole batch rather than per iteration, for the
+ * same reason as `timeTight`: at sub-millisecond scale the per-iteration
+ * `performance.now()` pair is a material share of the result. The promise hop
+ * stays inside the window here because for an async call it is the thing being
+ * measured.
+ */
+export async function timeTightAsync(
+  name: string,
+  iterations: number,
+  fn: () => Promise<void>,
+): Promise<BenchResult> {
+  for (let i = 0; i < Math.min(20, iterations); i++) await fn();
+  await sleep(0);
+  const t0 = performance.now();
+  for (let i = 0; i < iterations; i++) await fn();
+  const totalMs = performance.now() - t0;
+  return { name, iterations, totalMs, perOpMs: totalMs / iterations };
+}
+
 export async function time(
   name: string,
   iterations: number,

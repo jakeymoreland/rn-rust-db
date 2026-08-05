@@ -24,6 +24,8 @@ import {
   sleep,
   startFrameMonitor,
   time,
+  timeTight,
+  timeTightAsync,
 } from './harness';
 import { REALISTIC_FIELDS_CSV, REALISTIC_SIZES, realisticRows, realisticRowsChunked, toyRows } from './data';
 import { type BenchMetrics, score } from './score';
@@ -83,8 +85,15 @@ export async function runAll(onProgress: (msg: string) => void, opts: RunOptions
   // 1. call overhead
   await phase('call overhead', async () => {
     const ping = JSON.stringify({ cmd: 'get', args: ['__bench_missing__'] });
-    const sync = await push(time('call-overhead sync', 1000, () => void executeRawSync(ping)));
-    const async_ = await push(time('call-overhead async', 1000, async () => void (await executeRaw(ping))));
+    // Tight-loop timing: these are sub-millisecond ops, and time()'s
+    // per-iteration `await` + performance.now() pair costs more than the call
+    // being measured (see timeTight). Measured 0.404 vs 0.0116 ms/op for the
+    // same sync no-op on one device — the scored nativeSyncCallMs was mostly
+    // harness overhead.
+    const sync = await push(timeTight('call-overhead sync', 1000, () => void executeRawSync(ping)));
+    const async_ = await push(
+      timeTightAsync('call-overhead async', 1000, async () => void (await executeRaw(ping))),
+    );
     metrics.nativeSyncCallMs = sync.perOpMs;
     metrics.nativeAsyncCallMs = async_.perOpMs;
     asyncOverheadMs = async_.perOpMs;
