@@ -70,4 +70,5 @@ yarn test
 
 `ROADMAP.md` lists the open work by theme. Good first areas: the testing/
 benchmark items (sustained-load, memory, thermal) are additive and self-
-contained; the Android gradle-library packaging is the highest-impact blocker.
+contained; deciding how the prebuilt native artifacts get distributed is the
+highest-impact blocker left.

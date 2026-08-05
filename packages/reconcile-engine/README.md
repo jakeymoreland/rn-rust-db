@@ -60,6 +60,9 @@ both CMake projects into the app's `libappmodules.so`, which is also where the
 generated `autolinking.cpp` lands — the module and its registration end up in
 one binary.
 
+Because nothing lives in the app's own native project any more, a regenerating
+`expo prebuild` has nothing of ours to clobber.
+
 `reactNativeArchitectures` in the app's `gradle.properties` may be narrowed for
 faster local builds; all four RN-default ABIs are available.
 
