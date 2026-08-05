@@ -3,8 +3,10 @@
 // Unlike the CRM phases, these are shaped like a real price feed — a large
 // collection of selections, a small slice moving per tick, several sources with
 // meaningful priorities, and a market that closes by ceasing to arrive.
-import { ingest, redis, registerSource } from '@rn-experiments/reconcile-engine';
+import { closeEngine, ingest, openEngine, redis, registerSource } from '@rn-experiments/reconcile-engine';
+import { File } from 'expo-file-system';
 import { FEED_SOURCES, selectionRows, suspensionRows, tickRows } from './feeds';
+import { getEnginePath } from '../enginePath';
 import { median, p95, sleep } from './harness';
 
 export type FeedResult = { name: string; detail: string; pass?: boolean };
@@ -15,6 +17,20 @@ const TICKS = 40;
 
 export async function runFeeds(onProgress: (m: string) => void): Promise<FeedResult[]> {
   const out: FeedResult[] = [];
+
+  // Fresh DB, same as runAll. Without this every scenario here is valid only on
+  // the first run: the second finds the book already seeded (snapshot reports
+  // `inserted 0`), the ticks already applied at those revs (`changed_keys` names
+  // nothing, because nothing actually moved), and the whole-payload hash skip
+  // firing on payloads it has seen before. All of which reads as a failure when
+  // it is really a dirty database.
+  onProgress('wiping engine DB for a fresh run...');
+  closeEngine();
+  for (const suffix of ['', '-wal', '-shm']) {
+    const f = new File(`file://${getEnginePath()}${suffix}`);
+    if (f.exists) f.delete();
+  }
+  await openEngine(getEnginePath());
   for (const cfg of FEED_SOURCES) {
     await registerSource(cfg);
   }
