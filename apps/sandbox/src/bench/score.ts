@@ -33,6 +33,17 @@ export const ANCHORS = {
   storageTickIngestMs: third(5, 16, 50, 150),
   storageHydrateMs: third(50, 200, 1000, 5000),
   storageMaxGapMs: third(17, 50, 200, 1000),
+  // Same per-row budget as the 100k rung below (0.2 / 0.5 / 1.0 / 2.5 µs/row),
+  // scaled to 10k. Exists so the category is measurable in a quick run — and,
+  // more importantly, on memory-constrained devices, where the 100k block is
+  // exactly the thing that gets the app OOM-killed. A 20-point category that
+  // only scores on the run that dies is a blind spot where it matters most.
+  queryBuffer10kMs: [
+    { edge: 2, frac: 1 },
+    { edge: 5, frac: 0.75 },
+    { edge: 10, frac: 0.5 },
+    { edge: 25, frac: 0.25 },
+  ] as Anchor[], // >=25 -> 0 via the >=-last-edge rule
   queryBuffer100kMs: [
     { edge: 20, frac: 1 },
     { edge: 50, frac: 0.75 },
@@ -83,7 +94,9 @@ export const BANDED_CATEGORIES = {
     max: 20,
     metrics: ['storageIngestUsPerRow', 'storageTickIngestMs', 'storageHydrateMs', 'storageMaxGapMs'],
   },
-  query: { max: 20, metrics: ['queryBuffer100kMs'] },
+  // Averages whatever was measured: a quick run scores on 10k alone, a full
+  // run averages 10k and 100k.
+  query: { max: 20, metrics: ['queryBuffer10kMs', 'queryBuffer100kMs'] },
   interop: { max: 10, metrics: ['interopObjectsVsBufferRatio', 'interopListCommitMs'] },
   sync: {
     max: 25,

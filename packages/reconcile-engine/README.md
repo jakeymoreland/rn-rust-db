@@ -66,6 +66,24 @@ Because nothing lives in the app's own native project any more, a regenerating
 `reactNativeArchitectures` in the app's `gradle.properties` may be narrowed for
 faster local builds; all four RN-default ABIs are available.
 
+## Reading rows: use the windowed path
+
+`installFastPath()` installs synchronous JSI query functions on the JS thread.
+Synchronous means each call occupies the JS thread for its full duration, so
+anything past the ~16.7 ms frame budget drops frames regardless of how fast the
+engine is. Measured on an iPhone 16 Pro over a 10,000-row collection:
+
+| call | ms | |
+|---|---:|---|
+| `queryEntriesSchemaBufferRange` (50-row page) | **3.6** | cost tracks the page, not the collection |
+| `queryEntriesBuffer` + lazy view | 7.2 | one zero-copy buffer, rows materialize on touch |
+| `queryEntriesObjects` (all rows) | 39.8 | deprecated — a JS object per row |
+| `queryEntriesSchemaBuffer` (all rows) | **245.2** | deprecated — 67x the windowed page |
+
+The windowed call is roughly flat as the collection grows; the two deprecated
+ones are linear in collection size. Reach for a page, or for the lazy buffer
+when you genuinely need the whole set.
+
 ## Never run Expo/CLI commands inside this package
 
 `npx expo run:ios` (or any `expo prebuild`) executed with this directory as the

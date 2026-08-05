@@ -57,6 +57,39 @@ export async function runFeeds(onProgress: (m: string) => void): Promise<FeedRes
     pass: median(keyCounts) > 0 && median(keyCounts) <= MOVED_PER_TICK,
   });
 
+  // ── 2b. Same-size insert vs update: does the blob rewrite actually cost? ───
+  // The tick wave above looks ~5x more expensive per row than the cold
+  // snapshot, but that comparison is confounded: 50 rows amortise per-batch
+  // fixed cost (transaction, statement prep) over 100x fewer rows than 5000 do.
+  //
+  // This is the clean version — identical batch size, identical row shape, the
+  // only difference being insert-vs-update. An update must read the stored row,
+  // parse `fields` + `field_meta`, merge per field, re-serialise both and
+  // write; an insert just serialises and writes. The gap between these two
+  // numbers IS the read-modify-write cost of the JSON blob, and it is what
+  // decides whether binary field storage is worth a schema migration.
+  const SAME = 500;
+  onProgress(`same-size compare: ${SAME} inserts vs ${SAME} updates...`);
+  const fresh = selectionRows(SAME, 900_000); // keys nothing has seen
+  const tInsert = performance.now();
+  const insertSummary = await ingest('feed_primary', fresh);
+  const insertMs = performance.now() - tInsert;
+
+  const updates = tickRows(SAME, SAME, TICKS + 20); // same count, all existing keys
+  const tUpdate = performance.now();
+  const updateSummary = await ingest('feed_primary', updates);
+  const updateMs = performance.now() - tUpdate;
+
+  const usPerRow = (ms: number) => ((ms * 1000) / SAME).toFixed(0);
+  const ratio = insertMs > 0 ? (updateMs / insertMs).toFixed(2) : '—';
+  out.push({
+    name: 'insert vs update, same batch size',
+    detail:
+      `${SAME} inserts ${insertMs.toFixed(1)} ms (${usPerRow(insertMs)} µs/row, inserted ${insertSummary.inserted}) · ` +
+      `${SAME} 7-field updates ${updateMs.toFixed(1)} ms (${usPerRow(updateMs)} µs/row, updated ${updateSummary.updated}) · ` +
+      `update/insert ${ratio}x — the gap is the read-modify-write of the fields blob`,
+  });
+
   // ── 3. Priority: a desk suspension must beat a concurrent price tick ───────
   // The thing no single-backend sync engine can express. The desk publishes
   // only `status`; the feed keeps publishing prices. Per-field merge means the

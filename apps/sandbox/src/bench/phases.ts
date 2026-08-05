@@ -148,7 +148,7 @@ export async function runAll(onProgress: (msg: string) => void, opts: RunOptions
       priority: 1,
     });
     const sizes = includeHeavy ? REALISTIC_SIZES : REALISTIC_SIZES.filter((n) => n < 100_000);
-    if (!includeHeavy) onProgress('quick run: skipping the 100k block (query/max-gap metrics will show --)');
+    if (!includeHeavy) onProgress('quick run: skipping the 100k block (max-gap metric will show --; query scores on the 10k rung)');
     for (const n of sizes) {
       onProgress(`building ${n} realistic rows...`);
       const payload = await realisticRowsChunked(n);
@@ -207,6 +207,7 @@ export async function runAll(onProgress: (msg: string) => void, opts: RunOptions
         }),
       );
       if (n === 10000) metrics.interopObjectsVsBufferRatio = objects.perOpMs / buffer.perOpMs;
+      if (n === 10000) metrics.queryBuffer10kMs = buffer.perOpMs;
       if (n === 100000) metrics.queryBuffer100kMs = buffer.perOpMs;
     }
   });

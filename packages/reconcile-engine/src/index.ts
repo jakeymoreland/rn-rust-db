@@ -235,3 +235,64 @@ export function executeRawSync(requestJson: string): string {
 export function installFastPath(): boolean {
   return NativeReconcileEngine.installFastPath();
 }
+
+/**
+ * Synchronous JSI query functions, installed by {@link installFastPath}.
+ *
+ * **Read `queryPage` first.** It is the only query here whose cost is roughly
+ * independent of collection size, and it is what a list UI should use. Measured
+ * on an iPhone 16 Pro over a 10,000-row collection:
+ *
+ * | call | ms |
+ * |---|---|
+ * | `queryPage` (50 rows) | **3.6** |
+ * | `queryBuffer` + lazy view | 7.2 |
+ * | `queryObjects` (all rows) | 39.8 |
+ * | `querySchemaObjects` (all rows) | **245.2** |
+ *
+ * Every one of these runs on the JS thread for its full duration, so anything
+ * above the ~16.7 ms frame budget drops frames no matter how fast the engine is.
+ */
+export type FastPathQueries = {
+  /**
+   * One page of rows as a packed buffer — the windowed path. Cost tracks the
+   * page size, not the collection size, so this stays in frame budget whether
+   * the collection holds a thousand rows or a hundred thousand.
+   */
+  queryEntriesSchemaBufferRange(
+    collection: string,
+    fieldsCsv: string,
+    limit: number,
+    offset: number,
+  ): ArrayBuffer;
+  /**
+   * The whole collection as one zero-copy buffer, to be read lazily so only the
+   * rows actually touched become JS objects. Reasonable for a list that
+   * materialises a visible window; see `queryEntriesSchemaBufferRange` when you
+   * only ever need a page.
+   */
+  queryEntriesBuffer(collection: string): ArrayBuffer;
+  /**
+   * @deprecated Materialises **every row** of the collection into JS objects on
+   * the JS thread — 245 ms for 10,000 rows, ~67x the windowed page, and it grows
+   * linearly from there. Use `queryEntriesSchemaBufferRange` for a page, or
+   * `queryEntriesBuffer` with a lazy view if you genuinely need the whole set.
+   */
+  queryEntriesSchemaBuffer(collection: string, fieldsCsv: string): ArrayBuffer;
+  /**
+   * @deprecated Builds a JS object per row for the entire collection — 39.8 ms
+   * for 10,000 rows against 7.2 ms for the buffer path, and the gap widens with
+   * size. Prefer `queryEntriesBuffer`.
+   */
+  queryEntriesObjects(collection: string): unknown[];
+  kvGet(key: string): string | null;
+  kvSet(key: string, value: string): void;
+};
+
+/**
+ * The installed fast-path functions, or `null` when {@link installFastPath} has
+ * not been called (or returned false).
+ */
+export function fastPath(): FastPathQueries | null {
+  return (globalThis as { __reconcileEngine?: FastPathQueries }).__reconcileEngine ?? null;
+}
