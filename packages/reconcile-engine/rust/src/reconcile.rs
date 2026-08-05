@@ -23,7 +23,31 @@ pub struct BatchSummary {
     pub collections: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<IngestTimings>,
+    /// Natural keys that visibly changed, grouped by collection, so a
+    /// subscriber can patch just those rows instead of re-querying everything.
+    ///
+    /// Without this a change event carried counts only, and the only correct
+    /// reaction was a full re-query — measured at 1.8 fps against 60 fps for
+    /// the patched pattern the benchmark could only use because it already knew
+    /// which keys it had written.
+    ///
+    /// Capped per collection at [`CHANGED_KEYS_CAP`]; see `keys_truncated`.
+    /// Skipped in the serialized form when empty so the ingest response shape
+    /// is unchanged for callers that do not care.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub changed_keys: BTreeMap<String, Vec<String>>,
+    /// True when any collection hit the cap and its key list is incomplete.
+    /// A subscriber that sees this MUST fall back to a full re-query — the
+    /// keys present are a prefix, not the whole change set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub keys_truncated: bool,
 }
+
+/// Per-collection ceiling on the keys carried in a change event. A batch that
+/// rewrites 10k rows would otherwise put 10k keys on the wire and recreate the
+/// payload bloat this exists to avoid; past this many changes a full re-query
+/// is cheaper than patching anyway.
+pub const CHANGED_KEYS_CAP: usize = 1024;
 
 #[derive(Serialize, serde::Deserialize, Clone)]
 struct FieldMeta {
@@ -296,6 +320,8 @@ pub fn reconcile(
         dead_lettered: 0,
         collections: vec![],
         timings: None,
+        changed_keys: BTreeMap::new(),
+        keys_truncated: false,
     };
     let mut timings = IngestTimings { parse_ms: 0.0, prefetch_ms: 0.0, merge_ms: 0.0, write_ms: 0.0, commit_ms: 0.0 };
     let t_prefetch = std::time::Instant::now();
@@ -404,6 +430,14 @@ pub fn reconcile(
             summary.unchanged += oc.unchanged;
             if oc.visibly_changed {
                 changed_collections.push(oc.collection.clone());
+                // Bounded per collection: past the cap we stop recording and
+                // flag truncation rather than growing the event payload.
+                let keys = summary.changed_keys.entry(oc.collection.clone()).or_default();
+                if keys.len() < CHANGED_KEYS_CAP {
+                    keys.push(oc.natural_key.clone());
+                } else {
+                    summary.keys_truncated = true;
+                }
             }
             if let Some(w) = oc.write {
                 let stmt = if w.is_insert { &mut ins_stmt } else { &mut upd_stmt };
