@@ -63,6 +63,67 @@ pub struct EngineFfi {
     /// be invoked after `inner` is unlocked (audit S7/F14). Its own short-lived
     /// lock is never held while `inner` is locked.
     sink: Mutex<Option<crate::pubsub::Sink>>,
+    /// Read-only connection for entry queries, also deliberately OUTSIDE the
+    /// engine mutex. WAL lets it read the last committed snapshot while a write
+    /// is in flight, so a query no longer queues behind an ingest. `None` for
+    /// `:memory:` databases (see `Store::open_read_only`), where reads fall back
+    /// to the engine's own connection and the old blocking behaviour.
+    reader: Option<Mutex<rusqlite::Connection>>,
+}
+
+/// Runs `f` against the read-only connection when there is one, so the query
+/// proceeds concurrently with an in-flight write. Falls back to the engine's
+/// connection (taking the engine mutex) for in-memory databases.
+///
+/// Only safe for statements that read committed state. Anything that must
+/// observe uncommitted work, or that touches the kv write-behind cache, has to
+/// keep going through the engine mutex.
+fn with_read_conn<T>(ffi: &EngineFfi, f: impl FnOnce(&rusqlite::Connection) -> T) -> T {
+    match &ffi.reader {
+        Some(reader) => {
+            let guard = reader.lock().unwrap_or_else(|p| p.into_inner());
+            f(&guard)
+        }
+        None => {
+            let guard = lock_engine(&ffi.inner);
+            f(&guard.store.conn)
+        }
+    }
+}
+
+/// Loads `(natural_key, fields)` for a collection, ordered by key, optionally
+/// windowed to `(limit, offset)`. Shared by all three buffer query entry points,
+/// which differ only in how they encode the rows afterwards.
+fn read_entry_rows(
+    ffi: &EngineFfi,
+    collection: &str,
+    window: Option<(i64, i64)>,
+) -> Result<Vec<(String, String)>, rusqlite::Error> {
+    with_read_conn(ffi, |conn| {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let row = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?));
+        match window {
+            Some((limit, offset)) => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT natural_key, fields FROM entries WHERE collection = ?1 \
+                     ORDER BY natural_key LIMIT ?2 OFFSET ?3",
+                )?;
+                for r in stmt.query_map(params![collection, limit, offset], row)? {
+                    rows.push(r?);
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT natural_key, fields FROM entries WHERE collection = ?1 \
+                     ORDER BY natural_key",
+                )?;
+                for r in stmt.query_map(params![collection], row)? {
+                    rows.push(r?);
+                }
+            }
+        }
+        Ok(rows)
+    })
 }
 
 /// Delivers buffered change events by invoking the sink. MUST be called with
@@ -146,11 +207,15 @@ pub extern "C" fn engine_open(path: *const c_char) -> *mut c_void {
                         engine.sticky_error = Some(e);
                     }
                 });
+                // Opened after Engine::open so the file and its schema already
+                // exist — a read-only connection cannot create either.
+                let reader = crate::store::Store::open_read_only(path).map(Mutex::new);
                 let handle = Box::into_raw(Box::new(EngineFfi {
                     inner,
                     flusher_stop,
                     flusher: Some(flusher),
                     sink: Mutex::new(None),
+                    reader,
                 })) as *mut c_void;
                 if let Ok(mut live) = live_handles().lock() {
                     live.insert(handle as usize);
@@ -214,25 +279,13 @@ pub extern "C" fn engine_query_entries_bin(
         let Some(collection) = (unsafe { cstr(collection) }) else {
             return std::ptr::null_mut();
         };
-        let engine = lock_engine(&ffi.inner);
-        let mut rows: Vec<(String, String)> = vec![];
-        let result = (|| -> Result<(), rusqlite::Error> {
-            let mut stmt = engine
-                .store
-                .conn
-                .prepare("SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key")?;
-            let iter = stmt.query_map(params![collection], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for row in iter {
-                rows.push(row?);
+        let rows = match read_entry_rows(ffi, collection, None) {
+            Ok(rows) => rows,
+            Err(e) => {
+                set_last_error(2, &e.to_string());
+                return std::ptr::null_mut();
             }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            set_last_error(2, &e.to_string());
-            return std::ptr::null_mut();
-        }
+        };
         let buf = encode_entries(&rows);
         let len = buf.len();
         let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
@@ -432,24 +485,13 @@ pub extern "C" fn engine_query_entries_schema_bin_range(
             set_last_error(4, "bad fields/limit/offset");
             return std::ptr::null_mut();
         }
-        let engine = lock_engine(&ffi.inner);
-        let mut rows: Vec<(String, String)> = vec![];
-        let result = (|| -> Result<(), rusqlite::Error> {
-            let mut stmt = engine.store.conn.prepare_cached(
-                "SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key LIMIT ?2 OFFSET ?3",
-            )?;
-            let iter = stmt.query_map(params![collection, limit, offset], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for row in iter {
-                rows.push(row?);
+        let rows = match read_entry_rows(ffi, collection, Some((limit, offset))) {
+            Ok(rows) => rows,
+            Err(e) => {
+                set_last_error(2, &e.to_string());
+                return std::ptr::null_mut();
             }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            set_last_error(2, &e.to_string());
-            return std::ptr::null_mut();
-        }
+        };
         let buf = crate::binenc::encode_entries_schema(&rows, &fields);
         let len = buf.len();
         let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
@@ -482,25 +524,13 @@ pub extern "C" fn engine_query_entries_schema_bin(
             set_last_error(4, "no fields given");
             return std::ptr::null_mut();
         }
-        let engine = lock_engine(&ffi.inner);
-        let mut rows: Vec<(String, String)> = vec![];
-        let result = (|| -> Result<(), rusqlite::Error> {
-            let mut stmt = engine
-                .store
-                .conn
-                .prepare("SELECT natural_key, fields FROM entries WHERE collection = ?1 ORDER BY natural_key")?;
-            let iter = stmt.query_map(params![collection], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for row in iter {
-                rows.push(row?);
+        let rows = match read_entry_rows(ffi, collection, None) {
+            Ok(rows) => rows,
+            Err(e) => {
+                set_last_error(2, &e.to_string());
+                return std::ptr::null_mut();
             }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            set_last_error(2, &e.to_string());
-            return std::ptr::null_mut();
-        }
+        };
         let buf = crate::binenc::encode_entries_schema(&rows, &fields);
         let len = buf.len();
         let ptr = Box::into_raw(buf.into_boxed_slice()) as *mut u8;

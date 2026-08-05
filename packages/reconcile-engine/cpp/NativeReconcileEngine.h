@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <queue>
 #include <string>
 #include <thread>
@@ -37,15 +38,13 @@ class NativeReconcileEngine
   void close(jsi::Runtime& rt);
   AsyncPromise<std::string> execute(jsi::Runtime& rt, std::string requestJson);
   AsyncPromise<std::string> ingestDirect(jsi::Runtime& rt, std::string sourceId, std::string payload);
-  // executeSync blocks the calling (JS) thread for the duration of the
-  // engine call: it takes engineMutex_ directly on the caller's thread
-  // instead of handing the work to the worker thread. If the worker is
-  // mid-way through a long ingest and holding engineMutex_, this call will
-  // block the JS thread until that ingest completes. This is an accepted
-  // trade-off: executeSync exists as a benchmark/instrumentation entry
-  // point, not for real workloads — production call sites should use
-  // execute() instead, which queues onto the worker thread and resolves
-  // asynchronously.
+  // executeSync runs the engine call on the calling (JS) thread rather than
+  // handing it to the worker. It no longer waits on engineMutex_ for an
+  // in-flight ingest — that lock is now a lifecycle guard only (see below) —
+  // but a *write* command still serialises on the Rust engine mutex, so a
+  // sync write issued mid-ingest blocks the JS thread until that ingest
+  // completes. Reads are unaffected: they take the read-only connection.
+  // Prefer execute() for writes, which queues onto the worker thread.
   std::string executeSync(jsi::Runtime& rt, std::string requestJson);
   bool installFastPath(jsi::Runtime& rt);
 
@@ -58,7 +57,18 @@ class NativeReconcileEngine
   // Path the engine is currently open at, so a second open with a DIFFERENT
   // path is rejected instead of silently no-oping (audit F37).
   std::string openPath_;
-  std::mutex engineMutex_;
+  // Lifecycle guard, NOT a work lock. Every engine entry point takes it in
+  // SHARED mode purely to keep `engine_` alive for the duration of the call;
+  // only open/close/teardown take it EXCLUSIVELY, which waits for in-flight
+  // calls to drain before the handle is freed.
+  //
+  // Mutual exclusion of the actual engine work belongs to Rust, which already
+  // owns it: every FFI entry takes either the engine mutex (writes) or the
+  // read-only connection mutex (entry queries). Holding an exclusive lock here
+  // as well made every read queue behind whatever ingest was running — on a
+  // moto g35 that was a 2.1 s JS-thread stall and 1.9 fps, against 65 fps for
+  // the same load without sync readers.
+  std::shared_mutex engineMutex_;
 
   std::thread worker_;
   std::mutex queueMutex_;

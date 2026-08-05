@@ -101,7 +101,9 @@ NativeReconcileEngine::~NativeReconcileEngine() {
   if (worker_.joinable()) {
     worker_.join();
   }
-  std::lock_guard<std::mutex> lock(engineMutex_);
+  // Exclusive: drains any call still holding a shared lock before the handle
+  // is closed, so no in-flight FFI call can touch a freed engine.
+  std::unique_lock<std::shared_mutex> lock(engineMutex_);
   if (engine_ != nullptr) {
     engine_close(engine_);
     engine_ = nullptr;
@@ -153,7 +155,8 @@ void NativeReconcileEngine::eventTrampoline(void* ctx, const char* channel, cons
 }
 
 void NativeReconcileEngine::open(jsi::Runtime& rt, std::string path) {
-  std::lock_guard<std::mutex> lock(engineMutex_);
+  // Exclusive: a lifecycle transition, and the only writer of engine_/openPath_.
+  std::unique_lock<std::shared_mutex> lock(engineMutex_);
   if (engine_ != nullptr) {
     // Audit F37: opening the same path again is a genuine no-op, but opening a
     // DIFFERENT path while already open is a caller error — reporting success
@@ -176,7 +179,8 @@ void NativeReconcileEngine::open(jsi::Runtime& rt, std::string path) {
 }
 
 void NativeReconcileEngine::close(jsi::Runtime& rt) {
-  std::lock_guard<std::mutex> lock(engineMutex_);
+  // Exclusive: waits for in-flight calls to drain, then frees the handle.
+  std::unique_lock<std::shared_mutex> lock(engineMutex_);
   if (engine_ != nullptr) {
     // Detach the callback before close so no event can reference this after.
     engine_set_event_callback(engine_, nullptr, nullptr);
@@ -189,7 +193,7 @@ void NativeReconcileEngine::close(jsi::Runtime& rt) {
 AsyncPromise<std::string> NativeReconcileEngine::execute(jsi::Runtime& rt, std::string requestJson) {
   auto promise = AsyncPromise<std::string>(rt, jsInvoker_);
   post([this, promise, requestJson = std::move(requestJson)]() mutable {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
     if (engine_ == nullptr) {
       // Audit F39: resolve the canonical error envelope so the TS unwrap()
       // throws a typed EngineError, matching every other engine failure —
@@ -209,7 +213,7 @@ AsyncPromise<std::string> NativeReconcileEngine::ingestDirect(
     std::string payload) {
   auto promise = AsyncPromise<std::string>(rt, jsInvoker_);
   post([this, promise, sourceId = std::move(sourceId), payload = std::move(payload)]() mutable {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
     if (engine_ == nullptr) {
       // Audit F39: canonical envelope, not a bare reject (see execute()).
       promise.resolve("{\"ok\":false,\"code\":4,\"message\":\"engine not open\"}");
@@ -222,7 +226,7 @@ AsyncPromise<std::string> NativeReconcileEngine::ingestDirect(
 }
 
 std::string NativeReconcileEngine::executeSync(jsi::Runtime& rt, std::string requestJson) {
-  std::lock_guard<std::mutex> lock(engineMutex_);
+  std::shared_lock<std::shared_mutex> lock(engineMutex_);
   if (engine_ == nullptr) {
     throw jsi::JSError(rt, "engine not open");
   }
@@ -247,7 +251,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         size_t len = 0;
         unsigned char* data = nullptr;
         {
-          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          std::shared_lock<std::shared_mutex> lock(strong->engineMutex_);
           if (strong->engine_ == nullptr) {
             throw jsi::JSError(rt, "engine not open");
           }
@@ -277,7 +281,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         size_t len = 0;
         unsigned char* data = nullptr;
         {
-          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          std::shared_lock<std::shared_mutex> lock(strong->engineMutex_);
           if (strong->engine_ == nullptr) {
             throw jsi::JSError(rt, "engine not open");
           }
@@ -317,7 +321,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         size_t len = 0;
         unsigned char* data = nullptr;
         {
-          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          std::shared_lock<std::shared_mutex> lock(strong->engineMutex_);
           if (strong->engine_ == nullptr) {
             throw jsi::JSError(rt, "engine not open");
           }
@@ -352,7 +356,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         // string path.
         char* resp = nullptr;
         {
-          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          std::shared_lock<std::shared_mutex> lock(strong->engineMutex_);
           if (strong->engine_ == nullptr) {
             throw jsi::JSError(rt, "engine not open");
           }
@@ -377,7 +381,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         char* value = nullptr;
         int err = 0;
         {
-          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          std::shared_lock<std::shared_mutex> lock(strong->engineMutex_);
           if (strong->engine_ == nullptr) {
             throw jsi::JSError(rt, "engine not open");
           }
@@ -411,7 +415,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         std::string value = args[1].asString(rt).utf8(rt);
         bool ok = false;
         {
-          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          std::shared_lock<std::shared_mutex> lock(strong->engineMutex_);
           if (strong->engine_ == nullptr) {
             throw jsi::JSError(rt, "engine not open");
           }
@@ -439,7 +443,7 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         size_t len = 0;
         unsigned char* data = nullptr;
         {
-          std::lock_guard<std::mutex> lock(strong->engineMutex_);
+          std::shared_lock<std::shared_mutex> lock(strong->engineMutex_);
           if (strong->engine_ == nullptr) {
             throw jsi::JSError(rt, "engine not open");
           }
