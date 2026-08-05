@@ -3,32 +3,91 @@
 [![CI](https://github.com/jakeymoreland/rn-rust-db/actions/workflows/ci.yml/badge.svg)](https://github.com/jakeymoreland/rn-rust-db/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-An offline-first **sync engine for React Native, with its core written in Rust**.
-It's the on-device replica layer of a local-first app: it owns local storage,
-field-level conflict resolution, change events, and a redis-style key–value
-cache — and deliberately does **no networking**, so it drops into any backend.
+An **on-device reconciler for multi-source data in React Native**, with its core
+written in Rust. When the same record reaches you from several feeds you don't
+control — in different formats, carrying different fields, at different levels of
+trust — this decides what the record actually *is*, per field, on the device.
 
 > **Status: experimental.** The engine is tested, benchmarked, and audited, and
 > both platforms autolink from an install — but the API is pre-1.0 and the
 > prebuilt native artifacts are still built locally rather than distributed
 > (see [Roadmap](./ROADMAP.md)). Not yet recommended for production.
 
+## The thing it does that a sync engine doesn't
+
+Three feeds describe the same people. They disagree.
+
+```ts
+// JSON from your API, CSV from a partner, JSON from the device itself.
+// Same collection, same natural key, different fields, different freshness.
+await registerSource({ source_id: 'api',     format: 'Json', collection: 'people',
+                       natural_key_field: 'email', timestamp_field: 'updatedAt', priority: 10 });
+await registerSource({ source_id: 'partner', format: 'Csv',  collection: 'people',
+                       natural_key_field: 'email', timestamp_field: 'as_of',     priority: 5  });
+await registerSource({ source_id: 'device',  format: 'Json', collection: 'people',
+                       natural_key_field: 'email', timestamp_field: 'seenAt',    priority: 20 });
+
+await ingest('api',     '[{"email":"ann@x.com","name":"Ann","city":"Sydney",'
+                      + '"updatedAt":"2026-08-05T09:00:00Z"}]');
+await ingest('partner', 'email,name,phone,as_of\n'
+                      + 'ann@x.com,Annie,0400 111 222,2026-08-05T08:00:00Z\n');
+await ingest('device',  '[{"email":"ann@x.com","lastSeen":"2026-08-05T09:05:00Z",'
+                      + '"seenAt":"2026-08-05T09:05:00Z"}]');
+
+// ann@x.com is now one record:
+//   name     "Ann"            — api (09:00) beat partner (08:00) on recency
+//   phone    "0400 111 222"   — partner is older and lowest priority, but it is
+//                               the only feed carrying phone, so it still lands
+//   city     "Sydney"         — only api had it
+//   lastSeen "…T09:05:00Z"    — device
+```
+
+Merge is **per field**, not per record — that's why the oldest, least-trusted
+feed still contributes `phone`. Re-sending an unchanged payload costs nothing
+(whole-payload hash skip plus a per-row content-hash short-circuit), so polling
+the same endpoint on a timer is cheap by construction. Rows that don't parse go
+to a dead-letter queue instead of failing the batch.
+
+**The ordering rule, exactly:** a field is overwritten when the incoming record's
+timestamp is newer; on an exact tie, higher `priority` wins; on a tie at equal
+priority the existing value stays, except from the same source, where the later
+record in the batch is treated as a correction. Timestamp dominates — `priority`
+is a tie-breaker, not a trust override.
+
+> **Configure `timestamp_field` on every feed that carries one.** A source with
+> `timestamp_field: null` is stamped at *ingest* time, which means a stale import
+> will read as "just observed" and outrank a fresher value from a feed that dates
+> itself honestly.
+
 ## What it is
 
 A React Native TurboModule (`@rn-experiments/reconcile-engine`) wrapping a Rust
 core:
 
-- **SQLite-backed store** with a field-level, last-writer-wins merge (timestamp
-  then priority), keyed by a natural key — reconcile batches from any source and
-  re-sending unchanged data is free (whole-payload + per-row content hashing).
+- **SQLite-backed store** with the field-level, last-writer-wins merge above
+  (timestamp then priority), keyed by a natural key.
 - **redis-style kv cache** — memory-first with SQLite write-behind and
   coalescing (~1 µs get/set), for synchronous hot state.
 - **Change events** (glob-matched pub/sub) delivered lock-free, so a subscriber
   can re-enter the engine without deadlocking.
 - **Zero-copy JSI queries** — results cross to JS as an `ArrayBuffer` the JS side
   reads in place, with lazy views that materialize only the rows you touch.
-- **No networking, by design.** Integration is always: `fetch()` → `ingest()` →
-  reconcile → change event → re-query → UI. See [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md).
+- **No networking, by design.** You don't own these feeds, so the engine doesn't
+  pretend to. Integration is always: `fetch()` → `ingest()` → reconcile → change
+  event → re-query → UI. See [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md).
+
+## What it's not for
+
+- **You own the backend and the schema.** Use a real sync engine, or plain
+  SQLite. The reconcile machinery is pure overhead when there's one authority.
+- **Relational queries.** No joins, no aggregates, no query language —
+  collections keyed by natural key, plus kv.
+- **Collaborative editing.** Field-level last-writer-wins discards concurrent
+  edits by design; you want CRDTs.
+- **Time-series and charting.** This stores current state, not history — a merge
+  keeps the newest value and drops the previous one.
+- **Small datasets.** Below a few thousand rows, anything works. The value here
+  is what happens at 100k.
 
 ## Repository layout
 

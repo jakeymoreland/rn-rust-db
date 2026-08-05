@@ -4,7 +4,7 @@ package = JSON.parse(File.read(File.join(__dir__, "package.json")))
 Pod::Spec.new do |s|
   s.name         = "ReconcileEngine"
   s.version      = package["version"]
-  s.summary      = "Redis-esque Rust reconcile engine turbo module"
+  s.summary      = "On-device reconciler for multi-source data in React Native"
   s.homepage     = "https://github.com/jakeymoreland/rn-rust-db"
   s.license      = "MIT"
   s.authors      = { "Initial Studios" => "jake@initialstudios.com.au" }

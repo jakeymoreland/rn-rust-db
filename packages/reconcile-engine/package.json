@@ -1,7 +1,7 @@
 {
   "name": "@rn-experiments/reconcile-engine",
   "version": "0.1.0",
-  "description": "React Native TurboModule wrapping a Rust reconcile engine: SQLite-backed store with field-level merge, redis-style kv, pub/sub, and zero-copy JSI queries.",
+  "description": "On-device reconciler for multi-source data in React Native: merges the same record arriving from several feeds field-by-field (timestamp then priority), over a Rust/SQLite core with a redis-style kv, pub/sub, and zero-copy JSI queries.",
   "license": "MIT",
   "repository": {
     "type": "git",
