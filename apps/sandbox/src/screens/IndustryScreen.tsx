@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Pressable, ScrollView, Text, View, StyleSheet } from 'react-native';
+import { Platform, Pressable, ScrollView, Text, View, StyleSheet } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { runIndustry } from '../bench/industryRun';
 import { renderIndustry, verdict, type IndustryResult } from '../bench/industryRefs';
@@ -78,7 +78,9 @@ export function IndustryScreen() {
         onPress={() =>
           run(async () => {
             setResults(null);
-            setResults(await runIndustry((m) => setProgress((p) => [...p, m])));
+            const r = await runIndustry((m) => setProgress((p) => [...p, m]));
+            setResults(r);
+            if (__DEV__) console.log(`industry (${Platform.OS})\n${renderIndustry(r)}`);
           })
         }
       />
@@ -88,7 +90,9 @@ export function IndustryScreen() {
         onPress={() =>
           run(async () => {
             setHotPath(null);
-            setHotPath(await runHotPath((m) => setProgress((p) => [...p, m])));
+            const r = await runHotPath((m) => setProgress((p) => [...p, m]));
+            setHotPath(r);
+            if (__DEV__) console.log(`hot path (${Platform.OS})\n${renderHotPath(r)}`);
           })
         }
       />
@@ -98,7 +102,9 @@ export function IndustryScreen() {
         onPress={() =>
           run(async () => {
             setPhase2(null);
-            setPhase2(await runPhase2((m) => setProgress((p) => [...p, m])));
+            const r = await runPhase2((m) => setProgress((p) => [...p, m]));
+            setPhase2(r);
+            if (__DEV__) console.log(`phase 2 (${Platform.OS})\n${renderPhase2(r)}`);
           })
         }
       />
@@ -108,7 +114,11 @@ export function IndustryScreen() {
         onPress={() =>
           run(async () => {
             setDurability(null);
-            setDurability(await runDurability((m2) => setProgress((p) => [...p, m2])));
+            const r = await runDurability((m2) => setProgress((p) => [...p, m2]));
+            setDurability(r);
+            // Also to the Metro log: "copy as markdown" needs the device in
+            // hand, and these numbers are the ones that get quoted publicly.
+            if (__DEV__) console.log(`durability (${Platform.OS})\n${renderDurability(r)}`);
           })
         }
       />
