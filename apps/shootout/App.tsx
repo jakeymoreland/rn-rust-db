@@ -5,11 +5,12 @@ import { StatusBar } from 'expo-status-bar';
 import { renderResults, runContender, type ContenderResult } from './src/run';
 import { sqliteRaw } from './src/contenders/sqliteRaw';
 import { reconcileEngine } from './src/contenders/reconcileEngine';
+import { watermelon } from './src/contenders/watermelon';
 import type { Contender } from './src/contender';
 
 // The floor goes first, so every other number reads as "what this library costs
 // above raw SQLite on this device".
-const CONTENDERS: Contender[] = [sqliteRaw, reconcileEngine];
+const CONTENDERS: Contender[] = [sqliteRaw, watermelon, reconcileEngine];
 
 const MUTED = '#6b6b70';
 const HAIR = StyleSheet.hairlineWidth;

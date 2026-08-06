@@ -4,6 +4,7 @@
   "main": "index.ts",
   "//": "Versions are pinned to match apps/sandbox exactly. Two React Native versions hoisted into one yarn workspace break native builds in ways that are painful to diagnose.",
   "dependencies": {
+    "@nozbe/watermelondb": "^0.28.0",
     "@rn-experiments/reconcile-engine": "0.1.0",
     "expo": "~57.0.6",
     "expo-clipboard": "~57.0.1",
@@ -14,7 +15,9 @@
     "react-native": "0.86.0"
   },
   "devDependencies": {
+    "@babel/plugin-proposal-decorators": "^8.0.2",
     "@types/react": "~19.2.2",
+    "babel-preset-expo": "^57.0.5",
     "typescript": "~6.0.3"
   },
   "scripts": {
