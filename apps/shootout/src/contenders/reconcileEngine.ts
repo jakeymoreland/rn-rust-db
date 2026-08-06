@@ -9,7 +9,14 @@
 // That means a loss on raw insert latency is not necessarily a loss — and a
 // win would be a strong result. Either way the report prints the extra work
 // alongside the number so a reader can judge it.
-import { closeEngine, ingest, openEngine, redis, registerSource, fastPath } from '@rn-experiments/reconcile-engine';
+import {
+  closeEngine,
+  fastPath,
+  ingest,
+  installFastPath,
+  openEngine,
+  registerSource,
+} from '@rn-experiments/reconcile-engine';
 import { Paths } from 'expo-file-system';
 import type { Contender, Row } from '../contender';
 
@@ -50,7 +57,11 @@ export const reconcileEngine: Contender = {
       timestamp_field: null,
       priority: 1,
     });
-    fastPath();
+    // The JSI query functions are opt-in — installFastPath() is what puts them
+    // on globalThis. The sandbox app does this once at startup, which is why
+    // this was easy to miss here.
+    if (!installFastPath()) throw new Error('installFastPath() returned false');
+    if (!fastPath()) throw new Error('fast path did not install');
   },
 
   async teardown() {
@@ -92,6 +103,3 @@ export const reconcileEngine: Contender = {
     await ingest('bench', JSON.stringify(rows.map((r) => ({ id: r.id, read: !r.read }))));
   },
 };
-
-// Referenced so the import is not tree-shaken in release builds.
-void redis;
