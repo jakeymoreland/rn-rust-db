@@ -18,7 +18,7 @@ let db: SQLite.SQLiteDatabase | null = null;
 
 export const sqliteRaw: Contender = {
   name: 'expo-sqlite (raw)',
-  configuration: 'SQLite WAL, synchronous=NORMAL, prepared statements',
+  configuration: 'SQLite WAL, synchronous=NORMAL, chunked multi-row INSERT',
   durability: 'app-crash',
   caveats: [
     'no schema validation, no reactivity, no conflict resolution — this is the floor, not a product',
@@ -59,22 +59,36 @@ export const sqliteRaw: Contender = {
   },
 
   async insertMany(rows: Row[]) {
-    // One transaction, one prepared statement — the fastest honest way to do
-    // this in expo-sqlite, which is what the floor should represent.
-    const stmt = await db!.prepareAsync(
-      'INSERT OR REPLACE INTO messages (id, sender, body, sent_at, read) VALUES (?, ?, ?, ?, ?)',
-    );
+    // Chunked multi-row INSERT, not a prepared statement executed per row.
+    //
+    // This matters for fairness. The per-row version is the idiomatic
+    // expo-sqlite shape, but it costs one JS->native round trip per row — 1000
+    // rows means 1000 crossings, and benchmarking that against an engine which
+    // sends one payload across the boundary measures the bridge, not SQLite.
+    // A performance-minded developer writing raw expo-sqlite would batch, so
+    // the floor is represented batching.
+    //
+    // 100 rows x 5 columns = 500 bound parameters, comfortably under SQLite's
+    // 999-variable default limit.
+    const CHUNK = 100;
+    await db!.execAsync('BEGIN');
     try {
-      await db!.execAsync('BEGIN');
-      for (const r of rows) {
-        await stmt.executeAsync([r.id, r.sender, r.body, r.sent_at, r.read ? 1 : 0]);
+      for (let i = 0; i < rows.length; i += CHUNK) {
+        const slice = rows.slice(i, i + CHUNK);
+        const placeholders = slice.map(() => '(?, ?, ?, ?, ?)').join(',');
+        const params: (string | number)[] = [];
+        for (const r of slice) {
+          params.push(r.id, r.sender, r.body, r.sent_at, r.read ? 1 : 0);
+        }
+        await db!.runAsync(
+          `INSERT OR REPLACE INTO messages (id, sender, body, sent_at, read) VALUES ${placeholders}`,
+          params,
+        );
       }
       await db!.execAsync('COMMIT');
     } catch (e) {
       await db!.execAsync('ROLLBACK').catch(() => {});
       throw e;
-    } finally {
-      await stmt.finalizeAsync();
     }
   },
 

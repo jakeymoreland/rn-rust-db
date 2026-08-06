@@ -19,6 +19,7 @@ import {
 } from '@rn-experiments/reconcile-engine';
 import { Paths } from 'expo-file-system';
 import type { Contender, Row } from '../contender';
+import { decodeEntriesBuffer, decodeSchemaBuffer } from '../decode';
 
 const COLLECTION = 'messages';
 let dbPath = '';
@@ -42,7 +43,7 @@ export const reconcileEngine: Contender = {
   durability: 'app-crash',
   caveats: [
     'an insert here also parses, normalizes, content-hashes and field-level merges against stored state — the others do a plain insert',
-    'reads use the zero-copy buffer path, decoded lazily in JS',
+    'reads use the zero-copy buffer path, fully decoded to JS objects so the comparison matches getAllAsync',
   ],
 
   async setup() {
@@ -77,26 +78,24 @@ export const reconcileEngine: Contender = {
   },
 
   async readAll() {
-    // hgetall over every key would be the naive path; the engine's own advice
-    // is one buffer over the boundary, so that is what it is measured on.
+    // MUST decode to usable JS objects. An earlier version of this returned the
+    // row count straight off the buffer header without materializing anything,
+    // and "read all" then measured a u32 read against getAllAsync building
+    // 10,000 objects — a 24x result that was entirely the harness cheating in
+    // our favour. The contract is usable rows, so decode them.
     const fp = fastPath();
     if (!fp) throw new Error('fast path not installed');
-    const buf = fp.queryEntriesBuffer(COLLECTION);
-    const view = new DataView(buf);
-    return view.byteLength > 0 ? view.getUint32(0, true) : 0;
+    const rows = decodeEntriesBuffer(fp.queryEntriesBuffer(COLLECTION));
+    return rows.length;
   },
 
   async readPage(limit: number, offset: number) {
     const fp = fastPath();
     if (!fp) throw new Error('fast path not installed');
-    const buf = fp.queryEntriesSchemaBufferRange(
-      COLLECTION,
-      'id,sender,body,sent_at,read',
-      limit,
-      offset,
+    const rows = decodeSchemaBuffer(
+      fp.queryEntriesSchemaBufferRange(COLLECTION, 'id,sender,body,sent_at,read', limit, offset),
     );
-    const view = new DataView(buf);
-    return view.byteLength > 0 ? view.getUint32(0, true) : 0;
+    return rows.length;
   },
 
   async updateSome(rows: Row[]) {
