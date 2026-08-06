@@ -6,11 +6,12 @@ import { renderResults, runContender, type ContenderResult } from './src/run';
 import { sqliteRaw } from './src/contenders/sqliteRaw';
 import { reconcileEngine } from './src/contenders/reconcileEngine';
 import { watermelon } from './src/contenders/watermelon';
+import { rxdbMemory } from './src/contenders/rxdbMemory';
 import type { Contender } from './src/contender';
 
 // The floor goes first, so every other number reads as "what this library costs
 // above raw SQLite on this device".
-const CONTENDERS: Contender[] = [sqliteRaw, watermelon, reconcileEngine];
+const CONTENDERS: Contender[] = [sqliteRaw, watermelon, rxdbMemory, reconcileEngine];
 
 const MUTED = '#6b6b70';
 const HAIR = StyleSheet.hairlineWidth;

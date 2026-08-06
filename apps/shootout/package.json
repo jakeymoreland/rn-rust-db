@@ -12,7 +12,8 @@
     "expo-sqlite": "~57.0.1",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
-    "react-native": "0.86.0"
+    "react-native": "0.86.0",
+    "rxdb": "^17.4.0"
   },
   "devDependencies": {
     "@babel/plugin-proposal-decorators": "^7.25.9",
