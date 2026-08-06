@@ -256,6 +256,91 @@ Three findings here matter more than the timings:
 These scenarios wipe the database first. Without that, a second run finds the
 book already seeded and reads as failure when it is really a dirty DB.
 
+## Durability: what a single insert actually survives (2026-08-05, iPhone 16 Pro)
+
+Published because a claim made from this repo — "0.32 ms single insert against
+a 5-16 ms band for offline-first JS databases" — drew the correct objection
+that memory-first is not persistence and that fsync cannot be wished away.
+
+Half of that objection was a misread: the number is not the memory-first kv
+cache, it is `ingest()` — parse, normalize, content-hash, field-level merge
+against stored state, and a SQLite transaction commit. The other half landed.
+The engine defaults to `synchronous = NORMAL`, so a commit does not fsync: it
+survives an app crash, not power loss. And on Apple platforms a plain `fsync()`
+returns once the write reaches the drive cache — `F_FULLFSYNC` is the real
+barrier, and it is where the cost lives.
+
+Median of 50 single-row inserts after warmup, fresh key each time, so every one
+is a genuine insert through the whole pipeline. Two independent device runs:
+
+| `PRAGMA` | run 1 | run 2 | tax | survives |
+|---|---:|---:|---:|---|
+| `synchronous=NORMAL` (default) | 0.2929 ms | 0.2841 ms | 1.00x | app crash |
+| `synchronous=FULL` | 0.4126 ms | 0.4126 ms | ~1.4x | app crash; reaches drive cache |
+| `FULL` + `fullfsync=ON` | 4.3035 ms | 4.2047 ms | **~14.8x** | **power loss** |
+
+A host-machine run (Mac SSD, release) independently gave 3.97 ms for the
+barrier case — within 8% of the device, on completely different storage.
+
+So: a genuinely power-loss-durable single insert costs about 4.3 ms, which is
+the same order as the band the original claim said it beat by 15-50x. **The
+claim was wrong as stated.** What is defensible is narrower and more useful —
+the trade-off itself is a knob, it is 14.8x wide, and it is measurable by
+anyone: `setDurability`, or the `RECONCILE_SYNCHRONOUS` / `RECONCILE_FULLFSYNC`
+environment variables.
+
+An `OFF` row was measured too and is deliberately omitted: it ran first, into an
+empty table, and came out slower than `NORMAL`. That is warm-up, not a result.
+
+Defaults are unchanged and match SQLite's own: WAL, `synchronous=NORMAL`,
+`fullfsync` off. Every other mobile stack we know of does the same, which is
+also why a cross-database comparison has to state what each side was configured
+for before any number means anything.
+
+## Head-to-head against raw SQLite (2026-08-06, iPhone 16 Pro)
+
+`apps/shootout` runs several on-device databases through identical scenarios on
+one device in one run: same rows, same batch sizes, same durability pragma,
+same timing harness. The engine is one contender and gets no special treatment.
+
+The most informative comparator is bare `expo-sqlite` configured with the same
+pragmas — the floor. The gap between it and anything else is exactly what that
+library's abstraction costs.
+
+| scenario | expo-sqlite (raw) | reconcile engine | |
+|---|---:|---:|---|
+| insert one | 0.8540 ms | **0.4397 ms** | 1.9x faster |
+| insert 1000 | 0.0376 ms/row | **0.0162 ms/row** | 2.3x faster |
+| **read all 10000** | **60.86 ms** | **61.71 ms** | **parity, 1.4% behind** |
+| read page (50 @ mid) | 2.84 ms | **1.29 ms** | 2.2x faster |
+
+Both sides are SQLite WAL at `synchronous=NORMAL`. The engine's inserts also
+parse, normalize, content-hash and field-level merge against stored state,
+which a plain `INSERT` does not — so a narrow win there is a wider win than it
+looks, and the losing row is a real loss.
+
+The read-parity row is the most useful line in the table. Materializing every
+row is dominated by Hermes building 10,000 objects, and the zero-copy buffer
+saves nothing there — it saves the rows you *never* materialize, which is what
+the windowed number measures and what a read-everything scenario deliberately
+defeats.
+
+Two corrections were needed before these numbers meant anything, both of which
+flattered this engine and both found in-house:
+
+- `read all` originally reported **24x** because the engine's implementation
+  read the row count off the buffer header — four bytes — while `getAllAsync`
+  built ten thousand objects. It now decodes to usable JS objects.
+- `insert 1000` originally reported **7.3x** because the SQLite side executed a
+  prepared statement per row: 1000 bridge crossings. Batched into chunked
+  multi-row `INSERT`s, more than half the gap disappeared.
+
+Still outstanding: `update 500` was measured before the same batching fix
+reached the update path, so its 4.2x is inflated. WatermelonDB and RxDB are not
+yet in the harness — until they are, this repo makes no claim about them, and
+the 5-16 ms figure quoted in earlier material is RxDB's published *browser*
+suite, not React Native native SQLite.
+
 ## Industry-comparison findings (2026-07-17, iPhone 16 Pro dev build)
 
 > **Superseded in part.** Re-run on the same device 2026-08-05: 10 of 10
@@ -416,7 +501,12 @@ where they do, the reason is stated.
    `dead_lettered > 0` scored a whole-payload *skip* as an accepted bad payload,
    producing a spurious reliability failure. Both are fixed; the reliability
    contract is now pinned by Rust tests rather than only by the benchmark.
-8. **Low-end Android is a different product.** On a moto g35 (Unisoc T760,
+8. **Durability is a 14.8x knob, and any cross-database number is meaningless
+   without it.** A single insert costs 0.29 ms app-crash durable and 4.30 ms
+   power-loss durable on the same device, one pragma apart. A comparison that
+   does not state what each side was configured for is not a comparison. See
+   the durability section above; the claim that prompted it was wrong.
+9. **Low-end Android is a different product.** On a moto g35 (Unisoc T760,
    3.4 GB) the same code marshals 10k objects in 150 ms where an iPhone 16 Pro
    does 42 ms, and the idle scroll baseline drops 34% of frames with no engine
    work at all. Guidance that is merely advisable on flagship hardware
