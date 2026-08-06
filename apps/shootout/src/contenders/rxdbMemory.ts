@@ -59,8 +59,12 @@ export const rxdbMemory: Contender = {
       name: `shootout_rxdb_${dbSeq++}`,
       storage: getRxStorageMemory(),
       multiInstance: false,
-      ignoreDuplicate: true,
       eventReduce: false,
+      // No `ignoreDuplicate: true`: RxDB only permits it in dev mode and
+      // otherwise throws DB9, whose stored message is stale PouchDB-era advice
+      // ("Adapter not added. Use addPouchPlugin(...)") that has nothing to do
+      // with the actual check. A unique database name per scenario makes the
+      // flag unnecessary anyway.
     });
     const cols = await db.addCollections({ messages: { schema: messageSchema } });
     messages = cols.messages;
