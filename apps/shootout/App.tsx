@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { StatusBar } from 'expo-status-bar';
@@ -40,6 +40,18 @@ export default function App() {
       setRunning(false);
     }
   };
+
+  // Dev-only: run once on mount so the shootout can be driven from a terminal
+  // (relaunch the app, read Metro) rather than requiring someone to tap. The
+  // ref guards against Fast Refresh re-triggering it mid-run.
+  const autoRan = useRef(false);
+  useEffect(() => {
+    if (__DEV__ && !autoRan.current) {
+      autoRan.current = true;
+      void run();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const scenarios = Array.from(
     new Set((results ?? []).flatMap((r) => r.timings.map((t) => t.scenario))),

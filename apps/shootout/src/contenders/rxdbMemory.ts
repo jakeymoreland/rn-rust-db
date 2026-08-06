@@ -17,6 +17,34 @@ import { getRxStorageMemory } from 'rxdb/plugins/storage-memory';
 import { RxDBQueryBuilderPlugin } from 'rxdb/plugins/query-builder';
 import type { Contender, Row } from '../contender';
 
+/**
+ * Hermes has no `crypto`, and RxDB needs `getRandomValues` for document
+ * revisions and instance tokens — without it, createRxDatabase throws
+ * `ReferenceError: Property 'crypto' doesn't exist`.
+ *
+ * This is a Math.random shim, NOT a secure source of randomness. That is
+ * acceptable here and nowhere else: the benchmark needs distinct ids, not
+ * unpredictable ones. A real app would install react-native-get-random-values,
+ * which is a native module and would require a rebuild — deliberately avoided
+ * so this contender needs nothing beyond a JS reload.
+ */
+function ensureCrypto() {
+  const g = globalThis as { crypto?: { getRandomValues?: unknown } };
+  if (g.crypto?.getRandomValues) return;
+  const getRandomValues = <T extends ArrayBufferView | null>(array: T): T => {
+    if (array && ArrayBuffer.isView(array)) {
+      const bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+      for (let i = 0; i < bytes.length; i++) bytes[i] = (Math.random() * 256) | 0;
+    }
+    return array;
+  };
+  if (g.crypto) {
+    (g.crypto as { getRandomValues: typeof getRandomValues }).getRandomValues = getRandomValues;
+  } else {
+    g.crypto = { getRandomValues };
+  }
+}
+
 let pluginsAdded = false;
 
 const messageSchema = {
@@ -45,9 +73,11 @@ export const rxdbMemory: Contender = {
     'NOT a persistence comparison: memory storage survives nothing, so its write numbers are not comparable to the SQLite-backed contenders',
     'RxDB’s SQLite RxStorage is a paid Premium plugin; the bundled free build is capped at 500 documents, which cannot complete the 1k/10k scenarios here',
     'documents are schema-validated JSON, not SQL rows',
+    'Hermes has no crypto.getRandomValues; a Math.random shim is installed for it (benchmark-only, not secure)',
   ],
 
   async setup() {
+    ensureCrypto();
     if (!pluginsAdded) {
       addRxPlugin(RxDBQueryBuilderPlugin);
       pluginsAdded = true;
