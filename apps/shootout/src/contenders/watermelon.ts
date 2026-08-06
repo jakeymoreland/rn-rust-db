@@ -10,16 +10,31 @@
 // benchmarking a handicap we chose for it.
 import { Database, Model, appSchema, tableSchema } from '@nozbe/watermelondb';
 import SQLiteAdapter from '@nozbe/watermelondb/adapters/sqlite';
-import { field, text } from '@nozbe/watermelondb/decorators';
 import type { Contender, Row } from '../contender';
 
+// Deliberately no @field/@text decorators.
+//
+// They are a typing and ergonomics convenience in WatermelonDB — the storage
+// and query work underneath is identical either way — and getting them through
+// Babel cost three separate build failures: a plugin/core major-version
+// mismatch, a plugin-ordering trap that broke every `declare` field in
+// node_modules, and finally `!` definite-assignment clashing with the decorator
+// transform. Raw accessors avoid all of it, need no babel plugin, and if
+// anything favour WatermelonDB slightly by skipping the accessor indirection.
 class Message extends Model {
   static table = 'messages';
+}
 
-  @text('sender') sender!: string;
-  @text('body') body!: string;
-  @text('sent_at') sentAt!: string;
-  @field('read') read!: boolean;
+type RawSettable = Model & { _setRaw(field: string, value: string | number | boolean | null): void };
+type RawGettable = Model & { _getRaw(field: string): unknown };
+
+function setRow(m: Model, row: Row) {
+  const r = m as RawSettable;
+  m._raw.id = row.id;
+  r._setRaw('sender', row.sender);
+  r._setRaw('body', row.body);
+  r._setRaw('sent_at', row.sent_at);
+  r._setRaw('read', row.read);
 }
 
 const schema = appSchema({
@@ -116,13 +131,7 @@ export const watermelon: Contender = {
 
   async insertOne(row: Row) {
     await db!.write(async () => {
-      await messages().create((m) => {
-        m._raw.id = row.id;
-        m.sender = row.sender;
-        m.body = row.body;
-        m.sentAt = row.sent_at;
-        m.read = row.read;
-      });
+      await messages().create((m) => setRow(m, row));
     });
   },
 
@@ -132,13 +141,7 @@ export const watermelon: Contender = {
     await db!.write(async () => {
       await db!.batch(
         rows.map((row) =>
-          messages().prepareCreate((m) => {
-            m._raw.id = row.id;
-            m.sender = row.sender;
-            m.body = row.body;
-            m.sentAt = row.sent_at;
-            m.read = row.read;
-          }),
+          messages().prepareCreate((m) => setRow(m, row)),
         ),
       );
     });
@@ -149,7 +152,7 @@ export const watermelon: Contender = {
     // Touch a field so the comparison includes materializing usable values,
     // matching what the other contenders are made to do.
     let seen = 0;
-    for (const m of all) if (m.sender) seen++;
+    for (const m of all) if ((m as RawGettable)._getRaw('sender')) seen++;
     return seen;
   },
 
@@ -159,7 +162,7 @@ export const watermelon: Contender = {
       .query(Q.skip(offset), Q.take(limit))
       .fetch();
     let seen = 0;
-    for (const m of page) if (m.sender) seen++;
+    for (const m of page) if ((m as RawGettable)._getRaw('sender')) seen++;
     return seen;
   },
 
@@ -176,7 +179,12 @@ export const watermelon: Contender = {
       const updates = rows
         .map((r) => byId.get(r.id))
         .filter((m): m is Message => !!m)
-        .map((m) => m.prepareUpdate((rec) => { rec.read = !rec.read; }));
+        .map((m) =>
+          m.prepareUpdate((rec) => {
+            const r = rec as RawSettable & RawGettable;
+            r._setRaw('read', !r._getRaw('read'));
+          }),
+        );
       await db!.batch(updates);
     });
   },
