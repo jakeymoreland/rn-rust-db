@@ -151,10 +151,27 @@ impl Store {
             // per-transaction fsync (the WAL is synced at checkpoints), which
             // is durable against app crashes; only power loss can drop the
             // most recent commits, never corrupt the DB.
-            conn.execute_batch(
-                "PRAGMA synchronous = NORMAL;
+            // Overridable so the durability/latency trade-off can be measured
+            // rather than asserted. NORMAL is the default and the standard
+            // mobile setting; FULL fsyncs the WAL on every commit, which is what
+            // you want if a single insert must survive power loss, not just an
+            // app crash. Anything else SQLite accepts (OFF, EXTRA) is passed
+            // through unvalidated — this is a benchmarking knob, not API.
+            let sync_mode = std::env::var("RECONCILE_SYNCHRONOUS")
+                .ok()
+                .filter(|v| v.chars().all(|c| c.is_ascii_alphabetic()))
+                .unwrap_or_else(|| "NORMAL".to_string());
+            // On Apple platforms a plain fsync() returns once the write reaches
+            // the drive's cache, not the platter; F_FULLFSYNC is the real
+            // barrier and SQLite exposes it as `PRAGMA fullfsync`. Off by
+            // default (matching SQLite), overridable so the true power-loss
+            // cost can be measured rather than assumed.
+            let fullfsync = if std::env::var("RECONCILE_FULLFSYNC").is_ok() { "ON" } else { "OFF" };
+            conn.execute_batch(&format!(
+                "PRAGMA synchronous = {sync_mode};
+                 PRAGMA fullfsync = {fullfsync};
                  PRAGMA temp_store = MEMORY;",
-            )?;
+            ))?;
             // Default autocheckpoint (1000 pages = 4 MB) fires mid-benchmark on
             // multi-MB batches, adding run-to-run variance. Checkpoint less
             // often; close runs an explicit truncating checkpoint.
