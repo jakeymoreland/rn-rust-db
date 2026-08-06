@@ -106,15 +106,29 @@ export const sqliteRaw: Contender = {
   },
 
   async updateSome(rows: Row[]) {
-    const stmt = await db!.prepareAsync('UPDATE messages SET read = ? WHERE id = ?');
+    // Batched like insertMany, and for the same reason: a prepared statement
+    // executed per row costs one bridge crossing per row, which measures the
+    // boundary rather than SQLite. A VALUES list joined against the table does
+    // the whole chunk in one statement.
+    const CHUNK = 100;
+    await db!.execAsync('BEGIN');
     try {
-      await db!.execAsync('BEGIN');
-      for (const r of rows) {
-        await stmt.executeAsync([r.read ? 0 : 1, r.id]);
+      for (let i = 0; i < rows.length; i += CHUNK) {
+        const slice = rows.slice(i, i + CHUNK);
+        const values = slice.map(() => '(?, ?)').join(',');
+        const params: (string | number)[] = [];
+        for (const r of slice) params.push(r.id, r.read ? 0 : 1);
+        await db!.runAsync(
+          `WITH v(id, read) AS (VALUES ${values})
+           UPDATE messages SET read = (SELECT v.read FROM v WHERE v.id = messages.id)
+           WHERE id IN (SELECT id FROM v)`,
+          params,
+        );
       }
       await db!.execAsync('COMMIT');
-    } finally {
-      await stmt.finalizeAsync();
+    } catch (e) {
+      await db!.execAsync('ROLLBACK').catch(() => {});
+      throw e;
     }
   },
 };
