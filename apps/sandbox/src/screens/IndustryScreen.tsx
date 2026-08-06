@@ -65,6 +65,9 @@ export function IndustryScreen() {
       await fn();
     } catch (e) {
       setProgress((p) => [...p, `failed: ${e}`]);
+      // Also to Metro — otherwise a failure is visible only on the device,
+      // which is how the first durability run vanished without a trace.
+      if (__DEV__) console.log(`industry screen run failed: ${e}`);
     } finally {
       setRunning(false);
     }

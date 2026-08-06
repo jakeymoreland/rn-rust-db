@@ -31,10 +31,10 @@ const MODES: Array<{ sync: string; fullfsync: boolean; label: string; survives: 
 ];
 
 /** One message-shaped row, the sort an offline-first DB comparison inserts. */
-function row(i: number): string {
+function row(runId: string, i: number): string {
   return JSON.stringify([
     {
-      id: `m${i}`,
+      id: `m-${runId}-${i}`,
       sender: `user${i}`,
       body: 'hello there, this is a chat message body '.repeat(3),
       sent_at: '2026-08-06T00:00:00Z',
@@ -60,6 +60,10 @@ export async function runDurability(onProgress: (m: string) => void): Promise<Du
     priority: 1,
   });
 
+  // Keys must be unique per RUN, not just per row: a second run reusing m0..mN
+  // would be measuring updates, not inserts, and silently report the wrong
+  // thing (or, as first written, throw and lose the whole run).
+  const runId = `${Date.now().toString(36)}`;
   const raw: Array<{ label: string; survives: string; ms: number }> = [];
   let seq = 0;
   for (const mode of MODES) {
@@ -67,13 +71,22 @@ export async function runDurability(onProgress: (m: string) => void): Promise<Du
     await setDurability(mode.sync, mode.fullfsync);
     const times: number[] = [];
     for (let i = 0; i < INSERTS; i++) {
-      const payload = row(seq++); // fresh key every time — always a real insert
+      const payload = row(runId, seq++); // fresh key every time — a real insert
       const t = performance.now();
       const s = await ingest('dur', payload);
       const ms = performance.now() - t;
-      if (s.inserted !== 1) throw new Error(`expected an insert, got ${JSON.stringify(s)}`);
-      if (i >= WARMUP) times.push(ms);
+      if (s.inserted !== 1) {
+        // Never fatal: losing the whole run to one odd row is worse than a
+        // noted anomaly, and this measurement gets quoted publicly.
+        onProgress(`warning: ${mode.label} row ${i} was not an insert (${JSON.stringify(s)})`);
+      } else if (i >= WARMUP) {
+        times.push(ms);
+      }
       await sleep(0);
+    }
+    if (times.length === 0) {
+      onProgress(`warning: ${mode.label} recorded no usable inserts`);
+      continue;
     }
     raw.push({ label: mode.label, survives: mode.survives, ms: median(times) });
   }
@@ -81,6 +94,7 @@ export async function runDurability(onProgress: (m: string) => void): Promise<Du
   // Leave the engine as we found it.
   await setDurability('NORMAL', false);
 
+  if (raw.length === 0) throw new Error('no durability modes produced a measurement');
   const baseline = raw.find((r) => r.label.startsWith('NORMAL'))?.ms ?? raw[0].ms;
   return raw.map((r) => ({
     mode: r.label,
