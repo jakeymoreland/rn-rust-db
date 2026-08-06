@@ -45,6 +45,38 @@ function ensureCrypto() {
   }
 }
 
+/**
+ * RxDB hashes document revisions with `crypto.subtle.digest` (SHA-256), which
+ * Hermes does not provide either — it throws UT8. RxDB documents the escape
+ * hatch: "If your JavaScript runtime does not support crypto.subtle.digest,
+ * provide your own hash function when calling createRxDatabase()."
+ *
+ * This is a 64-bit FNV-1a, not SHA-256. Note this is *generous* to RxDB rather
+ * than a handicap: a pure-JS SHA-256 would be considerably slower per document
+ * than this is, so its write numbers here are better than a real Hermes app
+ * without a native crypto module would see. Collision risk over 10k documents
+ * with a 64-bit digest is negligible for a benchmark.
+ */
+async function fnv1a64(input: string | ArrayBuffer | Blob): Promise<string> {
+  // RxDB may hand this a string, an ArrayBuffer, or a Blob. Only strings occur
+  // in these scenarios; the others fall back to their string form so the
+  // function is total rather than silently wrong for an input we never hit.
+  const text =
+    typeof input === 'string'
+      ? input
+      : input instanceof ArrayBuffer
+        ? String.fromCharCode(...new Uint8Array(input))
+        : String(input);
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ c, 0x85ebca6b) >>> 0;
+  }
+  return (h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0'));
+}
+
 let pluginsAdded = false;
 
 const messageSchema = {
@@ -73,7 +105,7 @@ export const rxdbMemory: Contender = {
     'NOT a persistence comparison: memory storage survives nothing, so its write numbers are not comparable to the SQLite-backed contenders',
     'RxDB’s SQLite RxStorage is a paid Premium plugin; the bundled free build is capped at 500 documents, which cannot complete the 1k/10k scenarios here',
     'documents are schema-validated JSON, not SQL rows',
-    'Hermes has no crypto.getRandomValues; a Math.random shim is installed for it (benchmark-only, not secure)',
+    'Hermes provides neither crypto.getRandomValues nor crypto.subtle.digest; a Math.random shim and an FNV-1a hashFunction stand in. Both are benchmark-only and not secure — and the hash is faster than the SHA-256 RxDB would normally use, so this favours RxDB slightly',
   ],
 
   async setup() {
@@ -88,6 +120,7 @@ export const rxdbMemory: Contender = {
     db = await createRxDatabase({
       name: `shootout_rxdb_${dbSeq++}`,
       storage: getRxStorageMemory(),
+      hashFunction: fnv1a64,
       multiInstance: false,
       eventReduce: false,
       // No `ignoreDuplicate: true`: RxDB only permits it in dev mode and

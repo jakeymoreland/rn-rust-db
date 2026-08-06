@@ -73,12 +73,11 @@ all confirmed the *linking* was fine while never testing a cold start.
 If you hit this, cold-start the app before concluding anything about the
 library.
 
-**Caveat on its read numbers.** WatermelonDB keeps an in-memory record cache.
-The read scenarios run in the same session that inserted the rows, so its
-`read all` is served largely from that cache rather than from SQLite — which is
-why it comes back several times faster than every other contender. That is a
-real advantage in a long-lived app and a misleading one for a cold read, so it
-is called out rather than presented as a like-for-like storage read.
+**It is also intermittent.** Across runs on the same build it has both produced
+a full set of numbers and failed with the `WMDatabaseBridge` error, with no
+change in between. That is consistent with the native-module registration
+problem above rather than anything about the library's speed, but it means its
+numbers here should be treated as provisional until it runs reliably.
 
 ### RxDB: memory storage, because that is the only free option that fits
 
@@ -102,6 +101,24 @@ Including the "5–16 ms single insert" figure quoted in this project's earlier
 material, which is RxDB's published **browser** suite (LokiJS/PouchDB/Dexie) and
 was never a React Native measurement. It should not have been presented as a
 head-to-head; this app exists partly to replace it with one.
+
+## Two known unfairnesses, both against the SQLite-backed contenders
+
+Stated here rather than buried, because they change how the read column reads.
+
+**Reads are cache-warm for the object-cache databases.** WatermelonDB keeps an
+in-memory record cache and RxDB's memory storage *is* memory. The read
+scenarios run in the same session that inserted the rows, so both serve
+`read all` largely from RAM while `expo-sqlite` and the reconcile engine
+genuinely go to SQLite. A ~60 ms versus ~4 ms gap is mostly that, not storage
+throughput. A cold-read scenario — reopen, then read — would be the honest
+version and is not implemented yet.
+
+**Memory storage is not persistence.** RxDB's numbers come from a store that
+writes nothing to disk and reports `survives: none`. It leads most scenarios
+for exactly that reason. Set against the 14.8x measured below for a genuine
+power-loss barrier, this is the clearest illustration in the repo of why a
+throughput number without a durability level attached means nothing.
 
 ## Durability
 
