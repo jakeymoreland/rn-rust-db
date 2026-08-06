@@ -1,0 +1,26 @@
+{
+  "name": "shootout",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "//": "Versions are pinned to match apps/sandbox exactly. Two React Native versions hoisted into one yarn workspace break native builds in ways that are painful to diagnose.",
+  "dependencies": {
+    "@rn-experiments/reconcile-engine": "0.1.0",
+    "expo": "~57.0.6",
+    "expo-clipboard": "~57.0.1",
+    "expo-dev-client": "~57.0.6",
+    "expo-sqlite": "~57.0.1",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.2",
+    "typescript": "~6.0.3"
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios"
+  },
+  "private": true
+}

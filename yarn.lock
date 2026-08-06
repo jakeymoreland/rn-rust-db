@@ -1609,6 +1609,11 @@ asap@~2.0.6:
   resolved "https://registry.npmjs.org/asap/-/asap-2.0.6.tgz"
   integrity sha512-BSHWgDSAiKs50o2Re8ppvp3seVHXSRM44cdSsT9FfNEUUZLOGWVCsiWaRPWM1Znn+mqZ1OfVZ3z3DWEzSp7hRA==
 
+await-lock@^2.2.2:
+  version "2.2.2"
+  resolved "https://registry.yarnpkg.com/await-lock/-/await-lock-2.2.2.tgz#a95a9b269bfd2f69d22b17a321686f551152bcef"
+  integrity sha512-aDczADvlvTGajTDjcjpJMqRkOF6Qdz3YbPZm/PyW6tKPkx2hlYBzxMhEywM/tU72HrVZjgl5VCdRuMlA7pZ8Gw==
+
 babel-jest@^29.7.0:
   version "29.7.0"
   resolved "https://registry.npmjs.org/babel-jest/-/babel-jest-29.7.0.tgz"
@@ -2404,6 +2409,13 @@ expo-server@^57.0.1:
   version "57.0.1"
   resolved "https://registry.npmjs.org/expo-server/-/expo-server-57.0.1.tgz"
   integrity sha512-sBfVDH6dmKVHZxqUxbfkzS00PZELMZt1IpnHKxcOTMZtR/t7CtRAFrbXcisG+EyzeqHSVDacZT+1tbYfZt5D8w==
+
+expo-sqlite@~57.0.1:
+  version "57.0.1"
+  resolved "https://registry.yarnpkg.com/expo-sqlite/-/expo-sqlite-57.0.1.tgz#81a3afedf5e825ecd6d982b4671a7621af82bb40"
+  integrity sha512-I6KoUvfGIiROTKxr5D3H+jRIGA/iEvWEtqHK4XMukAA7tVTinz/YdS8zOz6/DdG6vgrNmvF7gyOcbhLinlfxzQ==
+  dependencies:
+    await-lock "^2.2.2"
 
 expo-status-bar@~57.0.1:
   version "57.0.1"
