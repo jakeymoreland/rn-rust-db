@@ -126,6 +126,36 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
             Ok(json!("OK"))
         }
         "hgetall" => Ok(json!(commands::hgetall(&engine.store, arg(&args, 0)?, now)?)),
+        // Durability knob, so the latency/safety trade-off can be measured on a
+        // real device instead of asserted. Both pragmas are settable on a live
+        // connection. Values are whitelisted — they interpolate into SQL.
+        //
+        // synchronous: OFF | NORMAL (default) | FULL | EXTRA
+        // fullfsync:   0 | 1 — on Apple platforms a plain fsync() only reaches
+        //              the drive cache; F_FULLFSYNC is the real barrier, and it
+        //              is the difference between "survives an app crash" and
+        //              "survives power loss".
+        "setDurability" => {
+            let sync = arg(&args, 0)?.to_ascii_uppercase();
+            if !matches!(sync.as_str(), "OFF" | "NORMAL" | "FULL" | "EXTRA") {
+                return Err(EngineError::Command(format!(
+                    "synchronous must be OFF|NORMAL|FULL|EXTRA, got '{sync}'"
+                )));
+            }
+            let full = matches!(arg(&args, 1).unwrap_or("0"), "1" | "on" | "ON" | "true");
+            engine.store.conn.execute_batch(&format!(
+                "PRAGMA synchronous = {sync}; PRAGMA fullfsync = {};",
+                if full { "ON" } else { "OFF" }
+            ))?;
+            let applied: i64 = engine
+                .store
+                .conn
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+            // Echo what SQLite actually applied (0=OFF 1=NORMAL 2=FULL 3=EXTRA),
+            // so a caller can't report a mode the database never entered.
+            Ok(json!({ "synchronous": applied, "fullfsync": full }))
+        }
         // Batch hgetall: one call instead of N. Also served off the read-only
         // connection by the FFI layer (see `execute_read_only`); this arm is the
         // fallback for in-memory databases, which have no second connection.

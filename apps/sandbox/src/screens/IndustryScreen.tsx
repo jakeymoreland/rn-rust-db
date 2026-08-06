@@ -3,6 +3,7 @@ import { Pressable, ScrollView, Text, View, StyleSheet } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { runIndustry } from '../bench/industryRun';
 import { renderIndustry, verdict, type IndustryResult } from '../bench/industryRefs';
+import { renderDurability, runDurability, type DurabilityResult } from '../bench/durabilityRun';
 import { renderHotPath, runHotPath, type HotPathResult } from '../bench/hotPathRun';
 import { renderPhase2, runPhase2, type Phase2Result } from '../bench/phase2Run';
 
@@ -52,6 +53,7 @@ function CopyButton({ onPress, label = 'Copy as markdown' }: { onPress: () => vo
 export function IndustryScreen() {
   const [progress, setProgress] = useState<string[]>([]);
   const [results, setResults] = useState<IndustryResult[] | null>(null);
+  const [durability, setDurability] = useState<DurabilityResult[] | null>(null);
   const [hotPath, setHotPath] = useState<HotPathResult[] | null>(null);
   const [phase2, setPhase2] = useState<Phase2Result[] | null>(null);
   const [running, setRunning] = useState(false);
@@ -100,6 +102,16 @@ export function IndustryScreen() {
           })
         }
       />
+      <ActionButton
+        label="Durability comparison (fsync cost)"
+        busy={running}
+        onPress={() =>
+          run(async () => {
+            setDurability(null);
+            setDurability(await runDurability((m2) => setProgress((p) => [...p, m2])));
+          })
+        }
+      />
       {(results || hotPath || phase2) && (
         <CopyButton
           onPress={() => {
@@ -126,6 +138,38 @@ export function IndustryScreen() {
           </Text>
           <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{renderHotPath(hotPath)}</Text>
         </>
+      )}
+      {durability && (
+        <View style={{ marginTop: 12 }}>
+          <Text style={{ fontSize: 12, fontWeight: '600', color: '#6b6b70', letterSpacing: 0.6, marginBottom: 4 }}>
+            DURABILITY · COST OF A SINGLE INSERT
+          </Text>
+          {durability.map((r) => (
+            <View
+              key={r.mode}
+              style={{
+                paddingVertical: 9,
+                borderBottomWidth: StyleSheet.hairlineWidth,
+                borderBottomColor: '#e3e3e6',
+              }}
+            >
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                <Text style={{ fontSize: 14, color: '#111', flexShrink: 1 }}>{r.mode}</Text>
+                <Text style={{ fontFamily: 'monospace', fontSize: 13, fontWeight: '600' }}>
+                  {r.msPerInsert.toFixed(4)} ms
+                </Text>
+              </View>
+              <Text style={{ fontFamily: 'monospace', fontSize: 11, color: '#6b6b70', marginTop: 2 }}>
+                {r.tax} vs default · survives: {r.survives}
+              </Text>
+            </View>
+          ))}
+          <CopyButton
+            onPress={() =>
+              void Clipboard.setStringAsync('```\n' + renderDurability(durability) + '\n```')
+            }
+          />
+        </View>
       )}
       {results && (
         <View style={{ marginTop: 8 }}>
