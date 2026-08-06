@@ -38,6 +38,8 @@ const schema = appSchema({
 });
 
 let db: Database | null = null;
+/** Which adapter path actually initialised, reported in the results. */
+let adapterMode = 'unknown';
 
 function messages() {
   return db!.get<Message>('messages');
@@ -54,18 +56,49 @@ export const watermelon: Contender = {
 
   async setup() {
     await this.teardown();
-    const adapter = new SQLiteAdapter({
-      schema,
-      dbName: 'shootout_wmdb',
-      jsi: true,
-      onSetUpError: (e) => {
-        throw e;
-      },
-    });
+    // Prefer JSI — synchronous native calls, WatermelonDB at its fastest. It is
+    // not available on every platform/version combination (iOS reported
+    // "Cannot read property 'initializeJSI' of null" here), so fall back to the
+    // async bridge adapter rather than scoring the library as a failure. Which
+    // path was used is reported alongside the numbers, because it materially
+    // changes them.
+    const make = (jsi: boolean) =>
+      new SQLiteAdapter({
+        schema,
+        dbName: 'shootout_wmdb',
+        jsi,
+        onSetUpError: (e) => {
+          throw e;
+        },
+      });
+
+    let adapter;
+    try {
+      adapter = make(true);
+      adapterMode = 'JSI';
+    } catch {
+      adapter = make(false);
+      adapterMode = 'async bridge (JSI unavailable)';
+    }
+
     db = new Database({ adapter, modelClasses: [Message] });
-    await db.write(async () => {
-      await db!.unsafeResetDatabase();
-    });
+    try {
+      await db.write(async () => {
+        await db!.unsafeResetDatabase();
+      });
+    } catch (e) {
+      // A JSI adapter that constructs but cannot actually run shows up here.
+      if (adapterMode === 'JSI') {
+        adapterMode = 'async bridge (JSI failed at first write)';
+        db = new Database({ adapter: make(false), modelClasses: [Message] });
+        await db.write(async () => {
+          await db!.unsafeResetDatabase();
+        });
+      } else {
+        throw e;
+      }
+    }
+    this.configuration = `SQLite via ${adapterMode}, schema-validated models`;
   },
 
   async teardown() {
@@ -131,9 +164,13 @@ export const watermelon: Contender = {
   },
 
   async updateSome(rows: Row[]) {
+    const { Q } = await import('@nozbe/watermelondb');
     await db!.write(async () => {
+      // Fetch only the records being updated. Fetching the whole table to build
+      // the id map would fold a full read into this contender's update number,
+      // which nothing else here does.
       const found = await messages()
-        .query()
+        .query(Q.where('id', Q.oneOf(rows.map((r) => r.id))))
         .fetch();
       const byId = new Map(found.map((m) => [m.id, m]));
       const updates = rows
