@@ -105,11 +105,15 @@ fine below ~1 MB (5.4 ms/MB JS cost); when the response is already bytes,
 pass them through (0.7 ms/MB); for very large pulls write the response to a
 file and `ingestFile` (~zero JS cost).
 
-**Deletes — current limitation.** The engine reconciles upserts only; it has no
-tombstone handling yet. Until it does, use soft deletes end to end: the
-server sets `deleted: "true"` + bumps `updated_at`, the row syncs like any
-update, and queries/UI filter it out. Hard-purge locally on a schedule if
-storage matters.
+**Deletes.** Send `"_deleted": true` on the record (and a newer `updated_at`).
+The engine stores a tombstone, queries and `scan` hide the row, and a later
+update with a higher version brings it back. An equal version keeps the
+tombstone. For a feed that sends a full snapshot, register the source with
+`snapshot: true`: keys missing from the batch become tombstones at the batch's
+version and lose to any newer write from another source. Tombstones are
+compacted after seven days (`RECONCILE_TOMBSTONE_TTL_MS`), never inside the
+five-minute skew window. A soft `deleted` field that you filter in the UI still
+works, but it is ordinary data — it does not hide the row.
 
 ## 3. Local writes (device → server): the outbox
 
@@ -210,11 +214,9 @@ turns D1 writes into the tick pattern the benchmarks already validated.
 
 ## Known gaps to design around
 
-- **No tombstones** — soft-delete pattern above until delete reconciliation
-  exists.
-- **Change events carry counts, not keys** — subscribers re-query the
-  collection (cheap via the lazy zero-copy view, but the changed-keys event
-  is the roadmap item that makes patching free).
+- **Change events carry the changed keys** (capped at 1024 per collection).
+  A tombstone shows up there as a key to drop. When `keys_truncated` is set,
+  re-query.
 - **No built-in scheduler** — pulls/drains are app-driven (foreground events,
   push nudges, or a timer). The whole-payload hash skip makes over-eager
   polling nearly free on the engine side.

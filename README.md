@@ -48,16 +48,33 @@ feed still contributes `phone`. Re-sending an unchanged payload costs nothing
 the same endpoint on a timer is cheap by construction. Rows that don't parse go
 to a dead-letter queue instead of failing the batch.
 
-**The ordering rule, exactly:** a field is overwritten when the incoming record's
-timestamp is newer; on an exact tie, higher `priority` wins; on a tie at equal
-priority the existing value stays, except from the same source, where the later
-record in the batch is treated as a correction. Timestamp dominates — `priority`
-is a tie-breaker, not a trust override.
+**The ordering rule, exactly:** higher physical time wins, then the logical
+counter, then `priority`, then `source_id` (bytewise), then the field value
+(bytewise). A tombstone wins an equal version against an update. The order is a
+total order, so the same updates converge whichever batch arrives first. Within
+one batch, a later row at the same physical time gets a higher logical counter,
+so a correction later in the payload still wins. `priority` is a tie-break, not
+a trust override.
 
-> **Configure `timestamp_field` on every feed that carries one.** A source with
-> `timestamp_field: null` is stamped at *ingest* time, which means a stale import
-> will read as "just observed" and outrank a fresher value from a feed that dates
-> itself honestly.
+A source timestamp more than five minutes ahead of the local clock (once that
+clock is past 2020) is clamped to that bound. A feed whose clock is a day fast
+can no longer sit in the future and win forever. Rows with no timestamp are
+stamped from a hybrid logical clock that does not move backwards when the wall
+clock does.
+
+> **`timestamp_field: null` is a local stamp, not a source time.** Those rows
+> are ordered by when this device accepted them. A stale import with no
+> timestamp still reads as "just observed" relative to other untimestamped
+> rows. Feeds that carry a real time should set `timestamp_field`.
+
+**Deletes.** A record with `"_deleted": true` is a tombstone. It hides the row
+when its version wins, and a later higher version brings the row back. Set
+`snapshot: true` on a source whose payload is the full set of keys; keys it
+stops sending become tombstones at the batch version, which is how a market
+that closes by disappearing actually leaves the book. Tombstones older than
+seven days (and never inside the skew window) are compacted. After compaction
+an older update can insert the row again, so compact only once feeds have
+caught up. `compactTombstones` does it on demand.
 
 ## What it is
 

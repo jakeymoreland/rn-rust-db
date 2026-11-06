@@ -66,6 +66,39 @@ Because nothing lives in the app's own native project any more, a regenerating
 `reactNativeArchitectures` in the app's `gradle.properties` may be narrowed for
 faster local builds; all four RN-default ABIs are available.
 
+## Ingest off the JS thread
+
+`installFastPath()` installs `ingestAppend` and `queryPageAsync`. After that,
+`ingest()` slices the payload into 256 KB pieces, copies one piece per turn,
+and lets the native worker concatenate and reconcile when the last piece
+arrives. `ingestChunked(sourceId, bytes)` does the same for a `Uint8Array`
+that is already bytes (a `fetch` `arrayBuffer`). `forEachPage` walks a
+collection one zero-copy schema-buffer page at a time; the query runs on the
+reader worker.
+
+`ingestBufferSync` is still installed. It runs the whole ingest on the JS
+thread and exists so the boundary bench can time that path. Do not call it
+from a screen.
+
+## Tombstones and the clock
+
+A record with `"_deleted": true` is a tombstone. It hides the row when its
+version wins, and a newer update brings the row back. `snapshot: true` on a
+source treats each batch as the full key set and tombstones omissions.
+
+Versions compare `(physical, logical, priority, source_id, value)`. A source
+timestamp more than `RECONCILE_MAX_SKEW_MS` (default 5 minutes) ahead of a
+real local clock is clamped. Rows with no timestamp take a hybrid-clock tick
+that does not go backwards. Tombstones older than `RECONCILE_TOMBSTONE_TTL_MS`
+(default 7 days) are compacted, and never inside the skew window.
+`compactTombstones` runs it on demand.
+
+This tie-break is a total order. Two batches that carry the same timestamps
+converge whichever arrives first. Previously a cross-source tie kept whichever
+row was already stored, and a second ingest from the same source at the same
+timestamp won because it arrived later. Callers who need last-arrival-wins
+across separate requests have to send a strictly greater timestamp.
+
 ## Reading rows: use the windowed path
 
 `installFastPath()` installs synchronous JSI query functions on the JS thread.
