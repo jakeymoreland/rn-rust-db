@@ -1,7 +1,8 @@
+use crate::clock::{stamp_records, HybridClock};
 use crate::error::EngineError;
 use crate::normalize::{normalize, SourceConfig};
 use crate::pubsub::PubSub;
-use crate::reconcile::{reconcile, BatchSummary};
+use crate::reconcile::{reconcile_with, BatchSummary};
 use crate::store::Store;
 use rusqlite::params;
 use std::collections::HashMap;
@@ -30,6 +31,7 @@ pub struct Engine {
     pub sources: HashMap<String, SourceConfig>,
     pub pubsub: PubSub,
     pub clock: Box<dyn Fn() -> i64 + Send>,
+    pub hlc: HybridClock,
     pub kv: KvCache,
     /// Change events buffered during a command, drained and delivered by the
     /// FFI layer AFTER the engine mutex is released (audit S7) so a subscriber
@@ -43,11 +45,14 @@ pub struct Engine {
 
 impl Engine {
     pub fn open(path: &str, clock: Box<dyn Fn() -> i64 + Send>) -> Result<Engine, EngineError> {
+        let store = Store::open(path)?;
+        let hlc = HybridClock::load(&store.conn)?;
         Ok(Engine {
-            store: Store::open(path)?,
+            store,
             sources: HashMap::new(),
             pubsub: PubSub::new(),
             clock,
+            hlc,
             kv: KvCache {
                 map: HashMap::new(),
                 ttl: HashMap::new(),
@@ -154,18 +159,25 @@ impl Engine {
                     // patch and nothing was truncated.
                     changed_keys: std::collections::BTreeMap::new(),
                     keys_truncated: false,
+                    deleted: 0,
+                    clock_clamped: 0,
                 },
                 true,
             ));
         }
 
         let t_parse = std::time::Instant::now();
-        let outcome = normalize(&cfg, payload, now)?;
+        let mut outcome = normalize(&cfg, payload, now)?;
         let parse_ms = t_parse.elapsed().as_secs_f64() * 1000.0;
-        // Audit S6: content_hash is written inside reconcile's transaction, so
-        // a committed batch always has its skip fingerprint (and no post-commit
-        // step can fail and swallow the change events).
-        let mut summary = reconcile(&mut self.store, &cfg, outcome, now, &content_hash)?;
+        // Stamp after parse so a missing timestamp becomes a monotonic hybrid
+        // clock tick, and a source clock that runs ahead of us is clamped.
+        // The clock is only committed inside reconcile's transaction: a failed
+        // batch leaves both the rows and the persisted clock where they were.
+        let mut hlc = self.hlc.clone();
+        let clamped = stamp_records(&mut hlc, &mut outcome.records, now);
+        let mut summary = reconcile_with(&mut self.store, &cfg, outcome, now, &content_hash, Some(&hlc))?;
+        summary.clock_clamped = clamped;
+        self.hlc = hlc;
         if let Some(t) = summary.timings.as_mut() {
             t.parse_ms = parse_ms;
         }
@@ -182,11 +194,16 @@ impl Engine {
                 // the keys that changed in `people`, not every key in the batch.
                 // `changed_keys` is what lets it patch those rows instead of
                 // re-querying the collection (1.8 fps -> 60 fps in the bench).
-                let mut event = serde_json::to_value(&summary).unwrap();
+                let Ok(mut event) = serde_json::to_value(&summary) else {
+                    continue;
+                };
                 let keys = summary.changed_keys.get(c);
                 if let Some(obj) = event.as_object_mut() {
                     obj.insert("collection".into(), serde_json::json!(c));
-                    obj.insert("changed_keys".into(), serde_json::json!(keys.unwrap_or(&vec![])));
+                    obj.insert(
+                        "changed_keys".into(),
+                        serde_json::json!(keys.unwrap_or(&vec![])),
+                    );
                 }
                 self.pending_events.push((channel, event.to_string()));
             }

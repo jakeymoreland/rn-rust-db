@@ -218,15 +218,25 @@ fn run(engine: &mut Engine, request_json: &str) -> Result<Value, EngineError> {
         }
         "ingest" => {
             let (summary, skipped) = engine.ingest(arg(&args, 0)?, arg(&args, 1)?)?;
-            let mut v = serde_json::to_value(&summary).unwrap();
+            let mut v = serde_json::to_value(&summary)
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
             v["skipped"] = json!(skipped);
             Ok(v)
         }
         "ingestFile" => {
             let (summary, skipped) = engine.ingest_file(arg(&args, 0)?, arg(&args, 1)?)?;
-            let mut v = serde_json::to_value(&summary).unwrap();
+            let mut v = serde_json::to_value(&summary)
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
             v["skipped"] = json!(skipped);
             Ok(v)
+        }
+        // Drop tombstones older than an absolute physical timestamp. With no
+        // argument the horizon is now minus the retention window, and never
+        // inside the skew bound.
+        "compactTombstones" => {
+            let cutoff = args.first().and_then(|s| s.parse::<i64>().ok());
+            let n = commands::compact_tombstones(&engine.store, now, cutoff)?;
+            Ok(json!(n))
         }
         "deadLetterCount" => {
             let n: i64 = engine

@@ -11,6 +11,8 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "include/engine.h"
 
@@ -87,6 +89,14 @@ class NativeReconcileEngine
   std::condition_variable readerQueueCv_;
   std::queue<std::function<void()>> readerQueue_;
   std::queue<std::function<void()>> queue_;
+
+  // Chunked ingest assembly. The JS thread copies one slice and returns;
+  // the worker appends it here and only calls into Rust when the final
+  // slice arrives. Never hold this lock together with engineMutex_.
+  static constexpr size_t kMaxIngestStream = 256u * 1024u * 1024u;
+  std::mutex streamsMutex_;
+  std::unordered_map<std::string, std::vector<uint8_t>> streams_;
+
   // Atomic because two loops now observe it under two different mutexes:
   // the destructor sets it while holding queueMutex_, and readerLoop reads it
   // under readerQueueMutex_. A plain bool would be a data race.

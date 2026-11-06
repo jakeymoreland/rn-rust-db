@@ -16,6 +16,11 @@ pub struct SourceConfig {
     pub natural_key_field: String,
     pub timestamp_field: Option<String>,
     pub priority: u32,
+    /// When true, each batch is this source's full picture of `collection`.
+    /// Keys absent from the batch become tombstones at the batch clock and
+    /// compete with other sources through the same version order as an update.
+    #[serde(default)]
+    pub snapshot: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +30,16 @@ pub struct CanonicalRecord {
     pub source: String,
     pub fields: BTreeMap<String, String>,
     pub updated_at: i64,
+    /// Hybrid-clock logical component. Zero on source-timestamped rows until
+    /// the merge assigns a within-batch index; set by [`crate::clock::stamp_records`]
+    /// for rows that had no timestamp.
+    pub logical: u64,
+    /// True when `updated_at` came from the record. False means the engine
+    /// must replace it with a hybrid-clock tick (the value here is only the
+    /// normalize-time placeholder).
+    pub timestamped: bool,
+    /// Row-level removal. Wins against an update on an equal version.
+    pub deleted: bool,
 }
 
 #[derive(Debug)]
@@ -161,7 +176,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 fn build_record(
     cfg: &SourceConfig,
-    fields: BTreeMap<String, String>,
+    mut fields: BTreeMap<String, String>,
     fragment: &str,
     now_ms: i64,
 ) -> Result<CanonicalRecord, (String, String)> {
@@ -184,11 +199,13 @@ fn build_record(
     }
     // Audit C1: a configured timestamp field that is present but unparseable
     // dead-letters the record — silently substituting ingest time corrupts
-    // last-writer-wins ordering. now_ms only applies when no timestamp field
-    // is configured or the record simply lacks it.
-    let updated_at = match cfg.timestamp_field.as_ref().and_then(|tf| fields.get(tf)) {
+    // last-writer-wins ordering. A missing timestamp is NOT stamped with the
+    // wall clock here. `timestamped` stays false and the engine replaces the
+    // placeholder with a hybrid-clock tick so a backwards wall clock cannot
+    // reorder rows.
+    let (updated_at, timestamped) = match cfg.timestamp_field.as_ref().and_then(|tf| fields.get(tf)) {
         Some(v) => match parse_timestamp_ms(v) {
-            Some(ms) => ms,
+            Some(ms) => (ms, true),
             None => {
                 return Err((
                     fragment.to_string(),
@@ -196,14 +213,35 @@ fn build_record(
                 ))
             }
         },
-        None => now_ms,
+        None => (now_ms, false),
     };
+    // `_deleted` is reserved. A truthy value is a tombstone for this key;
+    // anything else is a bad payload rather than a field that would round-trip
+    // as ordinary data and hide the removal.
+    let mut deleted = false;
+    if let Some(flag) = fields.get("_deleted").cloned() {
+        match flag.as_str() {
+            "true" | "1" | "TRUE" | "True" => {
+                fields.remove("_deleted");
+                deleted = true;
+            }
+            _ => {
+                return Err((
+                    fragment.to_string(),
+                    "invalid _deleted value (expected true or 1)".into(),
+                ))
+            }
+        }
+    }
     Ok(CanonicalRecord {
         collection: cfg.collection.clone(),
         natural_key,
         source: cfg.source_id.clone(),
         fields,
         updated_at,
+        logical: 0,
+        timestamped,
+        deleted,
     })
 }
 
@@ -364,6 +402,7 @@ mod tests {
             natural_key_field: "email".into(),
             timestamp_field: Some("updatedAt".into()),
             priority: 10,
+            snapshot: false,
         }
     }
 
@@ -375,6 +414,7 @@ mod tests {
             natural_key_field: "email".into(),
             timestamp_field: None,
             priority: 5,
+            snapshot: false,
         }
     }
 
@@ -455,10 +495,33 @@ mod tests {
     }
 
     #[test]
-    fn absent_timestamp_field_still_falls_back_to_now() {
+    fn absent_timestamp_field_is_not_a_source_timestamp() {
+        // The placeholder is still `now_ms` so a caller that inspects the
+        // normalize output can see it, but `timestamped` is false: the engine
+        // replaces it with a hybrid-clock tick before merge. Treating this as
+        // a real source timestamp is what made ingest order win over data.
         let payload = r#"[{"email":"a@x.com","name":"A"}]"#;
         let out = normalize(&json_cfg(), payload, 42).unwrap();
         assert_eq!(out.records[0].updated_at, 42);
+        assert!(!out.records[0].timestamped);
+    }
+
+    #[test]
+    fn deleted_flag_becomes_a_tombstone_record() {
+        let payload = r#"[{"email":"a@x.com","name":"A","_deleted":true,"updatedAt":100}]"#;
+        let out = normalize(&json_cfg(), payload, 0).unwrap();
+        assert!(out.records[0].deleted);
+        assert!(!out.records[0].fields.contains_key("_deleted"));
+        assert!(out.records[0].timestamped);
+        assert_eq!(out.records[0].updated_at, 100);
+    }
+
+    #[test]
+    fn bogus_deleted_flag_is_rejected() {
+        let payload = r#"[{"email":"a@x.com","name":"A","_deleted":"maybe","updatedAt":100}]"#;
+        let out = normalize(&json_cfg(), payload, 0).unwrap();
+        assert!(out.records.is_empty());
+        assert!(out.rejects[0].1.contains("invalid _deleted"));
     }
 
     #[test]

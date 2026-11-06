@@ -195,6 +195,29 @@ impl Store {
             tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
         }
+        // v4: row tombstones (deleted + the version that hid the row) and the
+        // hybrid-clock floor columns the short-circuit needs. clock_state is
+        // the persisted hybrid logical clock so a restart cannot reissue a
+        // stamp that sorts before one already handed out.
+        if version <= 3 {
+            let tx = conn.transaction()?;
+            add_column_if_missing(&tx, "entries", "deleted", "INTEGER NOT NULL DEFAULT 0")?;
+            add_column_if_missing(&tx, "entries", "tombstone_physical", "INTEGER")?;
+            add_column_if_missing(&tx, "entries", "tombstone_logical", "INTEGER")?;
+            add_column_if_missing(&tx, "entries", "tombstone_priority", "INTEGER")?;
+            add_column_if_missing(&tx, "entries", "tombstone_source", "TEXT")?;
+            add_column_if_missing(&tx, "entries", "meta_floor_logical", "INTEGER")?;
+            add_column_if_missing(&tx, "entries", "meta_floor_source", "TEXT")?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS clock_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    physical INTEGER NOT NULL,
+                    logical INTEGER NOT NULL
+                );",
+            )?;
+            tx.pragma_update(None, "user_version", 4)?;
+            tx.commit()?;
+        }
         Ok(Store { conn, open_path })
     }
 
@@ -253,7 +276,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 6);
-        assert_eq!(store.user_version().unwrap(), 3);
+        assert_eq!(store.user_version().unwrap(), 4);
         // v2 + v3 columns exist
         let cols: i64 = store
             .conn
@@ -298,7 +321,7 @@ mod tests {
         }
         // Must not panic/err on the duplicate column; must reach the latest version.
         let store = Store::open(p).unwrap();
-        assert_eq!(store.user_version().unwrap(), 3);
+        assert_eq!(store.user_version().unwrap(), 4);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -41,6 +41,41 @@ Notes on method for these runs:
   sections are physical devices; the older sections below are simulator or
   emulator and say so in their headings.
 
+## Host boundary bench (2026-11-06, release, Linux VM)
+
+This is the off-device stand-in for the JS-thread gap. There is no Hermes here,
+so it does not replay the on-device 388 ms. That 388 ms is the longest a 16 ms
+timer failed to fire while `ingest()` turned a ~95 MB JS string into a
+`std::string` on the JS thread (`ingestWithGapMonitor` in
+`apps/sandbox/src/bench/harness.ts`). What this run measures is the same split:
+how long the caller is blocked before it can return, and how long the engine
+then spends inside `engine_ingest_bytes`.
+
+`cargo bench --bench boundary` from `packages/reconcile-engine/rust`. 100k rows,
+42.2 MB JSON, release. One ingest, so the sync row and the engine column are
+the same call.
+
+| path | caller-thread max gap | engine time |
+|---|---:|---:|
+| sync ingest (`engine_ingest_bytes` on the caller; the `ingestBufferSync` shape) | **744.8 ms** | included |
+| full-buffer copy (argument marshal only) | 21.04 ms | 744.8 ms, after the caller returns |
+| chunked 256 KB (max slice copy) | **0.113 ms** | 744.8 ms, on the worker |
+
+Engine split for that ingest: parse 288.4 ms, merge 188.8 ms, write 163.4 ms,
+prefetch 73.6 ms, commit 0.9 ms.
+
+The sync path's gap is the whole ingest, because `ingestBufferSync` runs it on
+the JS thread. The chunked path's gap is one 256 KB copy. 0.113 ms is under a
+frame. The 21 ms full copy is what an async handoff of the entire buffer still
+pays on the caller before the worker starts; slicing removes that too. The
+744.8 ms of parse/merge/write does not sit on the caller once `ingest()` is
+going through `ingestAppend` (`installFastPath()` required).
+
+The on-device 388 ms stays the published before for the string path on an
+iPhone. It is a different machine and a different cost (Hermes UTF-16 to UTF-8,
+not a memcpy). Do not read 0.113 ms as "the phone now does 100k in a tenth of
+a millisecond." It is the caller-thread ceiling of one slice on this host.
+
 ## Scoring
 
 Each run prints a scorecard: 100 points across six categories, scored against
@@ -247,11 +282,13 @@ Three findings here matter more than the timings:
    migration is not justified by this data.** The remaining write-path lever is
    inbound JSON parse, which is ~48% of a full wave and ~70% of a realistic
    one-row-changed poll, and needs no schema change.
-3. **`market close` fails by design.** A market that closes stops arriving from
-   the feed; deletes are soft-delete + filter only with no tombstone
-   reconciliation, so it stays in the book forever. Feeds signal removal by
-   omission and the engine has no way to express it — the top functional gap for
-   every feed-driven use case.
+3. **`market close` failed in this run.** The row was still there after it
+   stopped appearing in a tick. That tick is a delta, not a full book, so
+   omission cannot mean delete or the other 4,950 selections would go with it.
+   The approach since then: a delta feed sends `"_deleted": true` for the
+   selections that left; a feed that always sends the whole book registers
+   `snapshot: true`, and omission is the tombstone. The harness scenario was
+   updated to the delta form.
 
 These scenarios wipe the database first. Without that, a second run finds the
 book already seeded and reads as failure when it is really a dirty DB.

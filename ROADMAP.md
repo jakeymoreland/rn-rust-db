@@ -10,17 +10,19 @@ public/production release.
 - [x] Root README and this roadmap.
 - [x] **CI** (`.github/workflows/ci.yml`): `cargo test` + `cargo clippy`, engine
       `yarn test`, sandbox `tsc` + `yarn test`. Headless only (audit S47 closed).
-- [ ] Native build job (macOS/Xcode + Android NDK) running the artifact
-      drift-check — heavy, so scheduled/opt-in rather than per-PR. Pairs with the
-      artifact-distribution decision below.
+- [x] Native build job. CI builds all four Android ABIs and the iOS
+      xcframework on every pull request and uploads them as workflow artifacts.
+      Rust tests, clippy, and the boundary bench run in the same workflow.
 - [x] `CONTRIBUTING.md`.
 - [x] Issue/PR templates (`.github/`).
 - [x] `SECURITY.md` — private reporting via GitHub advisories. **Requires
       "Private vulnerability reporting" to be enabled in repo settings**;
       until it is, the advisory link 404s and reporters fall back to email.
-- [ ] Decide artifact distribution: commit prebuilt `.a`/xcframework via git-lfs,
-      or a published-package build flow. They are gitignored today and built
-      locally by `scripts/build-*.sh`.
+- [ ] Decide artifact distribution for consumers who are not on CI: commit
+      prebuilt `.a`/xcframework via git-lfs, or publish them from the workflow
+      artifacts. They are still gitignored and built locally by
+      `scripts/build-*.sh`. CI proves they build; it does not yet attach them
+      to a release.
 
 ## Packaging & DX
 
@@ -39,10 +41,14 @@ public/production release.
 
 ## Engine semantics (known gaps)
 
-- [ ] **Delete / tombstone reconciliation.** Today deletes are soft-delete +
-      filter only. Real tombstone handling would remove the app-level workaround.
-- [ ] **Changed-keys in change events.** Events carry counts, not keys, so
-      subscribers re-query. Emitting the changed keys makes patching free.
+- [x] **Delete / tombstone reconciliation.** `"_deleted": true` and opt-in
+      `snapshot: true` both write a tombstone that competes with updates on the
+      same version order. Queries hide the row. Compaction drops tombstones
+      older than the retention window.
+- [x] **Changed-keys in change events.** A `changes:{collection}` payload
+      carries the natural keys that moved (capped at 1024 per collection, with
+      `keys_truncated` when the list is a prefix). A subscriber patches those
+      rows instead of re-querying the collection.
 - [ ] **Atomic `INCR`/`DECR` kv commands.** Counters are whole-value `set` today
       (compute in JS). An atomic increment primitive would suit high-frequency
       counter workloads (e.g. reaction counters).
@@ -53,10 +59,13 @@ public/production release.
 
 ## Performance
 
-- [ ] **Reduce max JS-thread gap on very large ingests.** A single ~95 MB / 100k
-      ingest blocks the JS thread ~388 ms. Chunked/streamed ingest guidance
-      exists (batches of 1–5k), but engine-side chunking or a background-thread
-      ingest option would remove the footgun.
+- [x] **Reduce max JS-thread gap on very large ingests.** `ingest()` slices the
+      payload (256 KB) once `installFastPath()` has run, and the engine runs on
+      the native worker. `queryPageAsync` / `forEachPage` do the same for
+      reads and keep the zero-copy buffer. The synchronous `ingestBufferSync`
+      hook remains for measurement. The on-device 388 ms figure is the old
+      string path; the host boundary bench is in `BENCHMARKS.md`. A fresh
+      device pass of the chunked path is still worth taking.
 - [ ] **Cold-start hydrate.** ~2.5 s to make 100k rows queryable after reopen;
       worth profiling for a faster warm path.
 - [ ] Evaluate columnar / FlatBuffers-style storage for known schemas. The

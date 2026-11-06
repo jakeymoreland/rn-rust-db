@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod error;
 pub mod store;
 pub mod commands;

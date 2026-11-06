@@ -1,4 +1,10 @@
-// --- Betting-feed shape: the workload this engine is actually for. ---
+// --- Live price book: the workload this engine is for. ---
+//
+// A selection is one row. Several feeds own different fields of it. The
+// product is the current row, not the history of prices. Crypto last-price
+// across venues is the same shape. An order book, a trade tape, or a balance
+// ledger is not: those need depth or history, and this store keeps one value
+// per field.
 //
 // The CRM shape in data.ts rewrites EVERY field of EVERY row on each update
 // wave, which is a worst case that hides two things: the per-row content-hash

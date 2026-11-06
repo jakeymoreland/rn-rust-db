@@ -105,7 +105,7 @@ fn read_entry_rows(
         match window {
             Some((limit, offset)) => {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT natural_key, fields FROM entries WHERE collection = ?1 \
+                    "SELECT natural_key, fields FROM entries WHERE collection = ?1 AND deleted = 0 \
                      ORDER BY natural_key LIMIT ?2 OFFSET ?3",
                 )?;
                 for r in stmt.query_map(params![collection, limit, offset], row)? {
@@ -114,7 +114,7 @@ fn read_entry_rows(
             }
             None => {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT natural_key, fields FROM entries WHERE collection = ?1 \
+                    "SELECT natural_key, fields FROM entries WHERE collection = ?1 AND deleted = 0 \
                      ORDER BY natural_key",
                 )?;
                 for r in stmt.query_map(params![collection], row)? {
@@ -200,11 +200,24 @@ pub extern "C" fn engine_open(path: *const c_char) -> *mut c_void {
                     if stop2.load(Ordering::Relaxed) {
                         return;
                     }
-                    let mut engine = lock_engine(&inner2);
-                    // Audit S12: record a flush failure so the next command can
-                    // surface it, instead of silently retrying forever.
-                    if let Err(e) = engine.flush_kv() {
-                        engine.sticky_error = Some(e);
+                    // A panic on this thread used to kill the flusher for the
+                    // rest of the process and poison the engine mutex. Contain
+                    // it the same way the extern boundary does. The next loop
+                    // iteration still runs, and a flush error is recorded as a
+                    // sticky error when flush_kv returns Err rather than panics.
+                    let inner = Arc::clone(&inner2);
+                    if catch_unwind(AssertUnwindSafe(|| {
+                        let mut engine = lock_engine(&inner);
+                        if let Err(e) = engine.flush_kv() {
+                            engine.sticky_error = Some(e);
+                        }
+                    }))
+                    .is_err()
+                    {
+                        let mut engine = lock_engine(&inner2);
+                        engine.sticky_error = Some(crate::error::EngineError::Storage(
+                            "kv flush panicked; retrying on the next tick".into(),
+                        ));
                     }
                 });
                 // Opened after Engine::open so the file and its schema already

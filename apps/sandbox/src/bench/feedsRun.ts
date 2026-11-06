@@ -149,26 +149,31 @@ export async function runFeeds(onProgress: (m: string) => void): Promise<FeedRes
       `updated ${repoll.updated}, unchanged ${repoll.unchanged}`,
   });
 
-  // ── 6. Market close: the row simply stops arriving ────────────────────────
-  // Expected to FAIL today. Deletes are soft-delete + filter only, with no
-  // tombstone reconciliation, so a market that closes by disappearing from the
-  // feed stays in the book forever. This is the top functional gap for every
-  // feed-driven use case and it is better demonstrated than described.
-  onProgress('market close (row stops arriving)...');
+  // ── 6. Market close on a delta feed ───────────────────────────────────────
+  // A tick is not a full book, so absence from a tick must not delete the
+  // other 4,950 selections. A delta feed says a market left by sending
+  // `_deleted: true` on those selections. A feed that always sends the whole
+  // book would register `snapshot: true` instead, and omission would be the
+  // tombstone.
+  onProgress('market close (delta feed sends _deleted)...');
   const closedKey = '1.2000000-TOTAL_GOALS-47000';
-  const before = await redis.hgetall(`entry:selections:${closedKey}`);
-  await ingest('feed_primary', tickRows(SNAPSHOT, MOVED_PER_TICK, TICKS + 10));
+  const closeRev = TICKS + 10;
+  const closedAt = new Date(1785000000000 + closeRev * 250).toISOString();
+  const closed = [47000, 47001, 47002].map((runner) => ({
+    selection_id: `1.2000000-TOTAL_GOALS-${runner}`,
+    _deleted: true,
+    updated_at: closedAt,
+  }));
+  await ingest('feed_primary', JSON.stringify(closed));
   const after = await redis.hgetall(`entry:selections:${closedKey}`);
   const stillThere = Object.keys(after).length > 0;
   out.push({
-    name: 'market close (no tombstones)',
+    name: 'market close',
     detail: stillThere
-      ? `row still present after ceasing to arrive (status=${after.status ?? '?'}) — ` +
-        `feeds signal removal by omission and the engine has no way to express it`
-      : `row removed (unexpected — tombstones may have landed)`,
+      ? `row still present after _deleted (status=${after.status ?? '?'})`
+      : 'selection removed; the rest of the book was a delta and stayed',
     pass: !stillThere,
   });
-  void before;
 
   return out;
 }

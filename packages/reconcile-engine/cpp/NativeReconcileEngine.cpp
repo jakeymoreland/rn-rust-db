@@ -86,6 +86,67 @@ class RustOwnedBuffer : public facebook::jsi::MutableBuffer {
   unsigned char* data_;
   size_t len_;
 };
+
+// Promise constructor runs the executor synchronously, so the resolve/reject
+// functions are populated before this returns. Call them only on the JS
+// thread (via the CallInvoker); dropping the last shared_ptr there is what
+// keeps the JSI function destructor on that runtime.
+jsi::Value createPromise(
+    jsi::Runtime& rt,
+    std::shared_ptr<jsi::Function>& resolveOut,
+    std::shared_ptr<jsi::Function>& rejectOut) {
+  auto resolveSlot = std::make_shared<std::shared_ptr<jsi::Function>>();
+  auto rejectSlot = std::make_shared<std::shared_ptr<jsi::Function>>();
+  auto executor = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "executor"),
+      2,
+      [resolveSlot, rejectSlot](
+          jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        if (count >= 2 && args[0].isObject() && args[1].isObject()) {
+          *resolveSlot = std::make_shared<jsi::Function>(args[0].asObject(rt).asFunction(rt));
+          *rejectSlot = std::make_shared<jsi::Function>(args[1].asObject(rt).asFunction(rt));
+        }
+        return jsi::Value::undefined();
+      });
+  jsi::Function promiseCtor = rt.global().getPropertyAsFunction(rt, "Promise");
+  jsi::Value promise = promiseCtor.callAsConstructor(rt, executor);
+  resolveOut = *resolveSlot;
+  rejectOut = *rejectSlot;
+  return promise;
+}
+
+void resolveString(
+    const std::shared_ptr<facebook::react::CallInvoker>& invoker,
+    jsi::Runtime* rt,
+    std::shared_ptr<jsi::Function> resolve,
+    std::string value) {
+  if (!invoker || !resolve) {
+    return;
+  }
+  invoker->invokeAsync([rt, resolve = std::move(resolve), value = std::move(value)]() {
+    if (rt == nullptr || !resolve) {
+      return;
+    }
+    resolve->call(*rt, jsi::String::createFromUtf8(*rt, value));
+  });
+}
+
+void rejectString(
+    const std::shared_ptr<facebook::react::CallInvoker>& invoker,
+    jsi::Runtime* rt,
+    std::shared_ptr<jsi::Function> reject,
+    std::string message) {
+  if (!invoker || !reject) {
+    return;
+  }
+  invoker->invokeAsync([rt, reject = std::move(reject), message = std::move(message)]() {
+    if (rt == nullptr || !reject) {
+      return;
+    }
+    reject->call(*rt, jsi::String::createFromUtf8(*rt, message));
+  });
+}
 } // namespace
 
 NativeReconcileEngine::NativeReconcileEngine(std::shared_ptr<CallInvoker> jsInvoker)
@@ -106,6 +167,7 @@ NativeReconcileEngine::~NativeReconcileEngine() {
   if (readerWorker_.joinable()) {
     readerWorker_.join();
   }
+  streams_.clear();
   // Exclusive: drains any call still holding a shared lock before the handle
   // is closed, so no in-flight FFI call can touch a freed engine.
   std::unique_lock<std::shared_mutex> lock(engineMutex_);
@@ -193,6 +255,10 @@ void NativeReconcileEngine::open(jsi::Runtime& rt, std::string path) {
     // DIFFERENT path while already open is a caller error — reporting success
     // would silently keep operations pointed at the old database.
     if (path == openPath_) {
+      lock.unlock();
+      // Same path is a no-op for the database, but the host functions have to
+      // be on global or ingest() falls back to the JS-thread string path.
+      installFastPath(rt);
       return;
     }
     throw jsi::JSError(
@@ -207,9 +273,20 @@ void NativeReconcileEngine::open(jsi::Runtime& rt, std::string path) {
   }
   openPath_ = path;
   engine_set_event_callback(engine_, this, &NativeReconcileEngine::eventTrampoline);
+  lock.unlock();
+  // Chunked ingest and paged queries live on these host functions. Installing
+  // them here means open() is enough: a caller cannot forget and then block
+  // the JS thread on the string path.
+  installFastPath(rt);
 }
 
 void NativeReconcileEngine::close(jsi::Runtime& rt) {
+  {
+    // Drop any half-assembled ingest before taking the engine lock. Tasks
+    // never hold streamsMutex_ and engineMutex_ at the same time.
+    std::lock_guard<std::mutex> streams(streamsMutex_);
+    streams_.clear();
+  }
   // Exclusive: waits for in-flight calls to drain, then frees the handle.
   std::unique_lock<std::shared_mutex> lock(engineMutex_);
   if (engine_ != nullptr) {
@@ -392,11 +469,10 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         }
         std::string sourceId = args[0].asString(rt).utf8(rt);
         jsi::ArrayBuffer buf = args[1].asObject(rt).getArrayBuffer(rt);
-        // SYNCHRONOUS: blocks the JS thread for the whole ingest. This exists
-        // to measure the byte-transport boundary (no UTF-8 string
-        // materialization — the payload bytes are read in place); production
-        // callers with large payloads should prefer ingestFile or the async
-        // string path.
+        // SYNCHRONOUS measurement hook. It blocks the JS thread for the whole
+        // ingest, which is the "before" number in the boundary bench. Production
+        // ingest goes through ingestAppend: one slice is copied on this thread,
+        // and the engine runs on the worker.
         char* resp = nullptr;
         {
           std::shared_lock<std::shared_mutex> lock(strong->engineMutex_);
@@ -543,8 +619,171 @@ bool NativeReconcileEngine::installFastPath(jsi::Runtime& rt) {
         return out;
       });
 
+  auto ingestAppend = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "ingestAppend"),
+      4,
+      [weak](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        auto strong = weak.lock();
+        if (!strong) {
+          throw jsi::JSError(rt, "reconcile engine module destroyed");
+        }
+        if (count < 4 || !args[0].isString() || !args[1].isString() || !args[2].isObject() ||
+            !args[2].asObject(rt).isArrayBuffer(rt) || !args[3].isBool()) {
+          throw jsi::JSError(rt, "ingestAppend(streamId, sourceId, chunk: ArrayBuffer, final: boolean)");
+        }
+        std::string streamId = args[0].asString(rt).utf8(rt);
+        std::string sourceId = args[1].asString(rt).utf8(rt);
+        jsi::ArrayBuffer chunkBuf = args[2].asObject(rt).getArrayBuffer(rt);
+        bool finalChunk = args[3].getBool();
+        // Copy only this slice. The ArrayBuffer is not valid after we return,
+        // and the copy is what used to be a 95 MB string conversion.
+        std::vector<uint8_t> chunk(chunkBuf.data(rt), chunkBuf.data(rt) + chunkBuf.size(rt));
+        std::shared_ptr<jsi::Function> resolve;
+        std::shared_ptr<jsi::Function> reject;
+        jsi::Value promise = createPromise(rt, resolve, reject);
+        jsi::Runtime* rtp = &rt;
+        auto invoker = strong->jsInvoker_;
+        strong->post([weak,
+                      chunk = std::move(chunk),
+                      streamId = std::move(streamId),
+                      sourceId = std::move(sourceId),
+                      finalChunk,
+                      resolve,
+                      reject,
+                      rtp,
+                      invoker]() mutable {
+          auto self = weak.lock();
+          if (!self) {
+            return;
+          }
+          std::string error;
+          std::vector<uint8_t> ready;
+          bool run = false;
+          {
+            std::lock_guard<std::mutex> lock(self->streamsMutex_);
+            auto& acc = self->streams_[streamId];
+            if (acc.size() + chunk.size() > NativeReconcileEngine::kMaxIngestStream) {
+              self->streams_.erase(streamId);
+              error = "ingest stream exceeds 256MB";
+            } else {
+              acc.insert(acc.end(), chunk.begin(), chunk.end());
+              if (finalChunk) {
+                ready = std::move(acc);
+                self->streams_.erase(streamId);
+                run = true;
+              }
+            }
+          }
+          if (!error.empty()) {
+            rejectString(invoker, rtp, std::move(reject), std::move(error));
+            return;
+          }
+          if (!run) {
+            resolveString(invoker, rtp, std::move(resolve), "null");
+            return;
+          }
+          const unsigned char* ptr = ready.empty() ? reinterpret_cast<const unsigned char*>("") : ready.data();
+          std::string response;
+          {
+            std::shared_lock<std::shared_mutex> lock(self->engineMutex_);
+            if (self->engine_ == nullptr) {
+              response = "{\"ok\":false,\"code\":4,\"message\":\"engine not open\"}";
+            } else {
+              char* resp = engine_ingest_bytes(self->engine_, sourceId.c_str(), ptr, ready.size());
+              response = takeRustString(resp);
+            }
+          }
+          resolveString(invoker, rtp, std::move(resolve), std::move(response));
+        });
+        return promise;
+      });
+
+  auto queryPageAsync = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "queryPageAsync"),
+      4,
+      [weak](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t count) -> jsi::Value {
+        auto strong = weak.lock();
+        if (!strong) {
+          throw jsi::JSError(rt, "reconcile engine module destroyed");
+        }
+        if (count < 4 || !args[0].isString() || !args[1].isString() || !args[2].isNumber() || !args[3].isNumber()) {
+          throw jsi::JSError(rt, "queryPageAsync(collection, fieldsCsv, limit, offset)");
+        }
+        std::string collection = args[0].asString(rt).utf8(rt);
+        std::string fieldsCsv = args[1].asString(rt).utf8(rt);
+        double limitD = args[2].asNumber();
+        double offsetD = args[3].asNumber();
+        if (!std::isfinite(limitD) || !std::isfinite(offsetD)) {
+          throw jsi::JSError(rt, "limit/offset must be finite numbers");
+        }
+        constexpr double kMaxRange = 9007199254740992.0;
+        auto limit = static_cast<long long>(std::clamp(limitD, 0.0, kMaxRange));
+        auto offset = static_cast<long long>(std::clamp(offsetD, 0.0, kMaxRange));
+        std::shared_ptr<jsi::Function> resolve;
+        std::shared_ptr<jsi::Function> reject;
+        jsi::Value promise = createPromise(rt, resolve, reject);
+        jsi::Runtime* rtp = &rt;
+        auto invoker = strong->jsInvoker_;
+        strong->postRead([weak,
+                          collection = std::move(collection),
+                          fieldsCsv = std::move(fieldsCsv),
+                          limit,
+                          offset,
+                          resolve,
+                          reject,
+                          rtp,
+                          invoker]() mutable {
+          auto self = weak.lock();
+          if (!self) {
+            return;
+          }
+          unsigned char* data = nullptr;
+          size_t len = 0;
+          std::string error;
+          {
+            std::shared_lock<std::shared_mutex> lock(self->engineMutex_);
+            if (self->engine_ == nullptr) {
+              error = "engine not open";
+            } else {
+              data = engine_query_entries_schema_bin_range(
+                  self->engine_, collection.c_str(), fieldsCsv.c_str(), limit, offset, &len);
+              if (data == nullptr) {
+                error = "queryPageAsync failed: " + takeRustString(engine_last_error());
+              }
+            }
+          }
+          if (!error.empty()) {
+            rejectString(invoker, rtp, std::move(reject), std::move(error));
+            return;
+          }
+          if (!invoker || !resolve) {
+            if (data != nullptr) {
+              engine_free_bytes(data, len);
+            }
+            return;
+          }
+          invoker->invokeAsync([rtp, resolve = std::move(resolve), data, len]() {
+            if (rtp == nullptr || !resolve) {
+              if (data != nullptr) {
+                engine_free_bytes(data, len);
+              }
+              return;
+            }
+            // Zero-copy: the ArrayBuffer adopts the Rust allocation. SQLite
+            // and the encode already ran on the reader worker.
+            jsi::ArrayBuffer ab(*rtp, std::make_shared<RustOwnedBuffer>(data, len));
+            resolve->call(*rtp, std::move(ab));
+          });
+        });
+        return promise;
+      });
+
   jsi::Object ns(rt);
   ns.setProperty(rt, "queryEntriesBuffer", queryBuffer);
+  ns.setProperty(rt, "ingestAppend", ingestAppend);
+  ns.setProperty(rt, "queryPageAsync", queryPageAsync);
   ns.setProperty(rt, "queryEntriesSchemaBuffer", querySchemaBuffer);
   ns.setProperty(rt, "queryEntriesSchemaBufferRange", querySchemaBufferRange);
   ns.setProperty(rt, "queryEntriesObjects", queryObjects);

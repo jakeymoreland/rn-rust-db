@@ -235,7 +235,7 @@ pub fn hgetall_conn(
         if let Some((collection, natural_key)) = rest.split_once(':') {
             let row: Option<(String, i64)> = conn
                 .prepare_cached(
-                    "SELECT fields, updated_at FROM entries WHERE collection = ?1 AND natural_key = ?2",
+                    "SELECT fields, updated_at FROM entries WHERE collection = ?1 AND natural_key = ?2 AND deleted = 0",
                 )?
                 .query_row(params![collection, natural_key], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
@@ -295,7 +295,7 @@ pub fn hmgetall_conn(
             let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT natural_key, fields, updated_at FROM entries \
-                 WHERE collection = ?1 AND natural_key IN ({placeholders})"
+                 WHERE collection = ?1 AND deleted = 0 AND natural_key IN ({placeholders})"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
             let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
@@ -342,7 +342,7 @@ pub fn scan(engine: &mut Engine, pattern: &str, now_ms: i64) -> Result<Vec<Strin
     }
     let mut stmt2 = store
         .conn
-        .prepare("SELECT collection, natural_key FROM entries")?;
+        .prepare("SELECT collection, natural_key FROM entries WHERE deleted = 0")?;
     let rows2 = stmt2.query_map([], |r| {
         Ok(format!("entry:{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })?;
@@ -407,6 +407,24 @@ pub fn ttl(engine: &mut Engine, key: &str, now_ms: i64) -> Result<Option<i64>, E
         )
         .optional()?;
     Ok(expires.map(|at| at - now_ms))
+}
+
+/// Drop tombstones older than `cutoff`. When `cutoff` is `None`, the horizon
+/// is `now - max(ttl, skew)` so a late update inside the skew window still
+/// sees the tombstone and cannot resurrect the row.
+pub fn compact_tombstones(store: &Store, now_ms: i64, cutoff: Option<i64>) -> Result<usize, EngineError> {
+    let mut clock = crate::clock::HybridClock::default();
+    clock.apply_env();
+    let skew_floor = now_ms.saturating_sub(clock.skew_bound_ms);
+    let horizon = match cutoff {
+        Some(requested) => requested.min(skew_floor),
+        None => clock.compaction_cutoff(now_ms).unwrap_or(i64::MIN),
+    };
+    let n = store.conn.execute(
+        "DELETE FROM entries WHERE deleted = 1 AND tombstone_physical IS NOT NULL AND tombstone_physical < ?1",
+        params![horizon],
+    )?;
+    Ok(n)
 }
 
 #[cfg(test)]
