@@ -45,8 +45,10 @@ public/production release.
       `snapshot: true` both write a tombstone that competes with updates on the
       same version order. Queries hide the row. Compaction drops tombstones
       older than the retention window.
-- [ ] **Changed-keys in change events.** Events carry counts, not keys, so
-      subscribers re-query. Emitting the changed keys makes patching free.
+- [x] **Changed-keys in change events.** A `changes:{collection}` payload
+      carries the natural keys that moved (capped at 1024 per collection, with
+      `keys_truncated` when the list is a prefix). A subscriber patches those
+      rows instead of re-querying the collection.
 - [ ] **Atomic `INCR`/`DECR` kv commands.** Counters are whole-value `set` today
       (compute in JS). An atomic increment primitive would suit high-frequency
       counter workloads (e.g. reaction counters).

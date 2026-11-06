@@ -3,15 +3,42 @@
 [![CI](https://github.com/jakeymoreland/rn-rust-db/actions/workflows/ci.yml/badge.svg)](https://github.com/jakeymoreland/rn-rust-db/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-An **on-device reconciler for multi-source data in React Native**, with its core
-written in Rust. When the same record reaches you from several feeds you don't
-control — in different formats, carrying different fields, at different levels of
-trust — this decides what the record actually *is*, per field, on the device.
+## What it is
 
-> **Status: experimental.** The engine is tested, benchmarked, and audited, and
-> both platforms autolink from an install — but the API is pre-1.0 and the
-> prebuilt native artifacts are still built locally rather than distributed
-> (see [Roadmap](./ROADMAP.md)). Not yet recommended for production.
+An on-device reconciler for React Native. You register each feed, hand it
+payloads, and read one row per natural key. The core is Rust and SQLite.
+JavaScript does the networking. The engine merges.
+
+It merges **per field**, not per record. A partner feed can be older and still
+be the only one carrying `phone`, so `phone` lands and the newer name from your
+API does not get wiped. A record with `"_deleted": true`, or a key missing from
+a source registered with `snapshot: true`, is a tombstone: the row leaves the
+book when that version wins, and a later higher version brings it back.
+
+It does not talk to a server, and it does not own your schema. The loop is
+`fetch` → `ingest` → change event → read the merged row.
+
+> **Status: experimental.** Tested, benchmarked, and audited. API is pre-1.0.
+> The native static libraries are built locally (or by CI as workflow
+> artifacts); they are not in the git tree. See [Roadmap](./ROADMAP.md).
+
+## Why it was built
+
+A real offline app had records arriving from a backend, from the device, from
+files, and from partners. The feeds disagree, and the app does not own them, so
+it cannot tell them to agree upstream.
+
+The libraries that already exist solve a different problem. PowerSync and Turso
+replicate one backend you control. `expo-sqlite` and `op-sqlite` store the rows
+you insert and leave the merge to application code. WatermelonDB and RxDB are
+local databases with one schema. None of them take several untrusted payloads
+and produce one field-level row on the device.
+
+This repo is that missing piece, built as a sandbox first: a Rust store behind
+a hand-rolled JSI TurboModule, so the merge, the SQLite write, and the change
+event stay off the JavaScript thread, and so the cost of that bridge could be
+measured on iOS and Android instead of assumed. The module is
+`@rn-experiments/reconcile-engine`.
 
 ## The thing it does that a sync engine doesn't
 
@@ -76,15 +103,15 @@ seven days (and never inside the skew window) are compacted. After compaction
 an older update can insert the row again, so compact only once feeds have
 caught up. `compactTombstones` does it on demand.
 
-## What it is
+## What is in the box
 
-A React Native TurboModule (`@rn-experiments/reconcile-engine`) wrapping a Rust
-core:
+`@rn-experiments/reconcile-engine` is the TurboModule. Under it:
 
-- **SQLite-backed store** with the field-level, last-writer-wins merge above
-  (timestamp then priority), keyed by a natural key.
-- **redis-style kv cache** — memory-first with SQLite write-behind and
-  coalescing (~1 µs get/set), for synchronous hot state.
+- **SQLite-backed store** with the field-level merge above, keyed by a natural
+  key. Higher physical time wins, then the logical counter, then priority, then
+  source id, then the field value. A tombstone wins a tie against an update.
+- **redis-style kv cache** — memory-first, SQLite write-behind, for hot state
+  that is not a reconciled row.
 - **Change events** (glob-matched pub/sub) delivered lock-free, so a subscriber
   can re-enter the engine without deadlocking.
 - **Zero-copy JSI queries** — results cross to JS as an `ArrayBuffer` the JS side
@@ -134,18 +161,28 @@ cd packages/reconcile-engine
 cd ../../apps/sandbox && yarn ios   # or yarn android
 ```
 
-## Performance
+## Where it is faster, and where it is not
 
-Indicative simulator numbers (see `BENCHMARKS.md` for method; ratios are the
-signal, absolute numbers are indicative):
+Same phone, same run, same WAL and `synchronous=NORMAL` as bare `expo-sqlite`.
+iPhone 16 Pro, debug dev-client, 2026-08-06. The engine's inserts also parse,
+normalize, and field-merge. Full table and method: [BENCHMARKS.md](./BENCHMARKS.md).
+`apps/shootout` is the harness; the engine is one contender in it.
 
-- kv get / set: **~0.0007 / 0.0009 ms** — faster than the redis-style reference.
-- Reaction/tick → change event: **~2 ms median**.
-- 10k-row query as a zero-copy buffer + lazy view (materialize 20): **~0.58 ms**
-  of pure marshaling (matches the industry reference); loading 10k rows to a
-  usable, queryable view beats AsyncStorage/Realm/SQLite by 3–12×.
-- Reliability suite (interrupted transaction, corrupted-payload recovery, retry
-  idempotency, reopen integrity): **all passing**.
+| scenario | expo-sqlite | this engine |
+|---|---:|---:|
+| insert one | 0.854 ms | **0.440 ms** |
+| insert 1000 | 0.0376 ms/row | **0.0162 ms/row** |
+| read all 10,000 rows into JS objects | **60.9 ms** | 61.7 ms |
+| read a 50-row page | 2.84 ms | **1.29 ms** |
+
+Reading every row into objects is Hermes building the objects. The buffer does
+not help there. It helps the page you actually paint. A 50-row window over a
+10,000-row collection was **3.6 ms** on that phone. Materialising every row was
+**245 ms**.
+
+Older numbers in this file claimed a 3–12× win over AsyncStorage, Realm, and
+SQLite, and a sub-millisecond kv figure from a simulator. Those were the wrong
+comparison or the wrong build. The table above is the one to use.
 
 ## Provenance
 

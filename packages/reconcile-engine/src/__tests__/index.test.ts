@@ -20,9 +20,10 @@ beforeEach(() => {
   mockNative.onChange.listeners = [];
 });
 
-test('openEngine calls native open', async () => {
+test('openEngine opens the database and installs the host functions', async () => {
   await openEngine('/tmp/db.sqlite');
   expect(mockNative.open).toHaveBeenCalledWith('/tmp/db.sqlite');
+  expect(mockNative.installFastPath).toHaveBeenCalled();
 });
 
 test('redis.get sends envelope and unwraps value', async () => {

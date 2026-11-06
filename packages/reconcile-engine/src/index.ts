@@ -84,17 +84,21 @@ async function call<T>(cmd: string, args: string[]): Promise<T> {
 }
 
 /**
- * Opens the engine at `path`.
+ * Opens the engine at `path` and installs the host functions (`ingestAppend`,
+ * paged query, the sync measurement hook).
  *
- * NOTE: despite the async signature, the underlying native `open` is
- * synchronous and runs the SQLite open + WAL setup on the JS thread before this
- * resolves (~tens of ms cold). It is `async` only so open errors surface as a
- * rejection. Open failures reject with an {@link EngineError} carrying the
- * native code and message.
+ * The native `open` itself is synchronous: SQLite open and WAL setup run on
+ * the JS thread before this resolves. It is `async` only so open errors
+ * surface as a rejection. Open failures reject with an {@link EngineError}.
+ *
+ * Installing the host functions is part of open, not a second step. Without
+ * them `ingest()` has to pass the whole payload through as a string, which is
+ * the path that blocked the JS thread for hundreds of milliseconds.
  */
 export async function openEngine(path: string): Promise<void> {
   try {
     NativeReconcileEngine.open(path);
+    NativeReconcileEngine.installFastPath();
   } catch (e) {
     throw toEngineError(e);
   }

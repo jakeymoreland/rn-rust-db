@@ -255,6 +255,10 @@ void NativeReconcileEngine::open(jsi::Runtime& rt, std::string path) {
     // DIFFERENT path while already open is a caller error — reporting success
     // would silently keep operations pointed at the old database.
     if (path == openPath_) {
+      lock.unlock();
+      // Same path is a no-op for the database, but the host functions have to
+      // be on global or ingest() falls back to the JS-thread string path.
+      installFastPath(rt);
       return;
     }
     throw jsi::JSError(
@@ -269,6 +273,11 @@ void NativeReconcileEngine::open(jsi::Runtime& rt, std::string path) {
   }
   openPath_ = path;
   engine_set_event_callback(engine_, this, &NativeReconcileEngine::eventTrampoline);
+  lock.unlock();
+  // Chunked ingest and paged queries live on these host functions. Installing
+  // them here means open() is enough: a caller cannot forget and then block
+  // the JS thread on the string path.
+  installFastPath(rt);
 }
 
 void NativeReconcileEngine::close(jsi::Runtime& rt) {

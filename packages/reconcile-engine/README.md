@@ -1,7 +1,20 @@
 # @rn-experiments/reconcile-engine
 
-A React Native TurboModule wrapping a Rust reconcile engine (SQLite-backed store,
-redis-style kv, field-level merge, pub/sub, zero-copy JSI queries).
+The React Native module in this repo. Register a feed, ingest its payload, read
+the merged row. Rust owns SQLite. The merge is per field. A tombstone removes a
+row when its version wins.
+
+It was built for an app whose records arrive from more than one place and
+cannot be reconciled upstream. Sync engines replicate a single backend.
+SQLite wrappers store what you insert. This is the step between those: several
+payloads in, one local row out, with the work off the JavaScript thread. The
+root [README](../../README.md) is the full account of that, and the numbers
+against raw SQLite.
+
+`openEngine()` installs the host functions. `ingest()` then copies the payload
+in 256 KB slices and the native worker reconciles on the last slice. You do
+not call `installFastPath()` yourself unless you are driving the TurboModule
+`open` directly.
 
 ## Prebuilt native artifacts are NOT committed
 
