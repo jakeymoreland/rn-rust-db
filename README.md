@@ -9,14 +9,17 @@ An on-device reconciler for React Native. You register each feed, hand it
 payloads, and read one row per natural key. The core is Rust and SQLite.
 JavaScript does the networking. The engine merges.
 
-It merges **per field**, not per record. A partner feed can be older and still
-be the only one carrying `phone`, so `phone` lands and the newer name from your
-API does not get wiped. A record with `"_deleted": true`, or a key missing from
-a source registered with `snapshot: true`, is a tombstone: the row leaves the
-book when that version wins, and a later higher version brings it back.
+The shape it is for is a **live book**: thousands of rows, a few fields moving
+on each tick, more than one feed, and the screen showing the current row. A
+price on a selection is the reference case. The trading desk can suspend a
+market without taking the price away from the feed that owns it, because the
+merge is per field. A market that closes leaves the book: a delta feed sends
+`"_deleted": true`, and a feed that always sends the whole book is registered
+with `snapshot: true` so omission is the delete. A tick is not a whole book.
+Absence from a tick does not delete the other rows.
 
-It does not talk to a server, and it does not own your schema. The loop is
-`fetch` → `ingest` → change event → read the merged row.
+It does not talk to a server. The loop is `fetch` → `ingest` → change event →
+read the merged row.
 
 > **Status: experimental.** Tested, benchmarked, and audited. API is pre-1.0.
 > The native static libraries are built locally (or by CI as workflow
@@ -40,40 +43,54 @@ event stay off the JavaScript thread, and so the cost of that bridge could be
 measured on iOS and Android instead of assumed. The module is
 `@rn-experiments/reconcile-engine`.
 
-## The thing it does that a sync engine doesn't
+## The approach
 
-Three feeds describe the same people. They disagree.
+A live book, not a ledger and not a chart.
+
+Betting odds are the case the engine was measured on: about 5,000 selections,
+about 1% of them moving per tick, a primary feed, a slower secondary, and a
+trading desk that publishes `status` only. On an iPhone 16 Pro that cold
+snapshot landed in 52 ms (10 µs/row) and a 50-row tick in 2.5 ms. The desk's
+suspension stayed `SUSPENDED` while the feed kept the price. That split is the
+product.
+
+Crypto **last price** across a handful of venues is the same shape: one row
+per pair, each venue a source, the screen showing the current price. An order
+book is not. A book is many levels deep, and this store keeps one value per
+field. A trade tape and a balance are not either. The tape is history, and a
+merge here drops the previous value. A balance that two writers touch has to
+add, not pick a winner. Use a ledger for that.
+
+Contacts from an API and a CSV are the same mechanism with none of the tick
+rate. Fine for a demo. Not why the bridge is Rust.
 
 ```ts
-// JSON from your API, CSV from a partner, JSON from the device itself.
-// Same collection, same natural key, different fields, different freshness.
-await registerSource({ source_id: 'api',     format: 'Json', collection: 'people',
-                       natural_key_field: 'email', timestamp_field: 'updatedAt', priority: 10 });
-await registerSource({ source_id: 'partner', format: 'Csv',  collection: 'people',
-                       natural_key_field: 'email', timestamp_field: 'as_of',     priority: 5  });
-await registerSource({ source_id: 'device',  format: 'Json', collection: 'people',
-                       natural_key_field: 'email', timestamp_field: 'seenAt',    priority: 20 });
+await registerSource({
+  source_id: 'feed_primary', format: 'Json', collection: 'selections',
+  natural_key_field: 'selection_id', timestamp_field: 'updated_at', priority: 10,
+});
+await registerSource({
+  source_id: 'trading_desk', format: 'Json', collection: 'selections',
+  natural_key_field: 'selection_id', timestamp_field: 'updated_at', priority: 20,
+});
 
-await ingest('api',     '[{"email":"ann@x.com","name":"Ann","city":"Sydney",'
-                      + '"updatedAt":"2026-08-05T09:00:00Z"}]');
-await ingest('partner', 'email,name,phone,as_of\n'
-                      + 'ann@x.com,Annie,0400 111 222,2026-08-05T08:00:00Z\n');
-await ingest('device',  '[{"email":"ann@x.com","lastSeen":"2026-08-05T09:05:00Z",'
-                      + '"seenAt":"2026-08-05T09:05:00Z"}]');
-
-// ann@x.com is now one record:
-//   name     "Ann"            — api (09:00) beat partner (08:00) on recency
-//   phone    "0400 111 222"   — partner is older and lowest priority, but it is
-//                               the only feed carrying phone, so it still lands
-//   city     "Sydney"         — only api had it
-//   lastSeen "…T09:05:00Z"    — device
+await ingest('feed_primary', JSON.stringify([{
+  selection_id: '1.2000000-MATCH_ODDS-47000',
+  runner_name: 'Arsenal', back_price: 1.92, status: 'ACTIVE',
+  updated_at: '2026-08-05T09:00:00Z',
+}]));
+await ingest('trading_desk', JSON.stringify([{
+  selection_id: '1.2000000-MATCH_ODDS-47000',
+  status: 'SUSPENDED',
+  updated_at: '2026-08-05T09:00:01Z',
+}]));
+// status is SUSPENDED (desk, higher priority, later time)
+// back_price is still 1.92 (the desk did not send a price)
 ```
 
-Merge is **per field**, not per record — that's why the oldest, least-trusted
-feed still contributes `phone`. Re-sending an unchanged payload costs nothing
-(whole-payload hash skip plus a per-row content-hash short-circuit), so polling
-the same endpoint on a timer is cheap by construction. Rows that don't parse go
-to a dead-letter queue instead of failing the batch.
+Re-sending an unchanged payload costs nothing (whole-payload hash skip, then a
+per-row content hash). Rows that do not parse go to a dead-letter queue. The
+batch still commits.
 
 **The ordering rule, exactly:** higher physical time wins, then the logical
 counter, then `priority`, then `source_id` (bytewise), then the field value
@@ -122,16 +139,17 @@ caught up. `compactTombstones` does it on demand.
 
 ## What it's not for
 
-- **You own the backend and the schema.** Use a real sync engine, or plain
-  SQLite. The reconcile machinery is pure overhead when there's one authority.
-- **Relational queries.** No joins, no aggregates, no query language —
-  collections keyed by natural key, plus kv.
-- **Collaborative editing.** Field-level last-writer-wins discards concurrent
-  edits by design; you want CRDTs.
-- **Time-series and charting.** This stores current state, not history — a merge
-  keeps the newest value and drops the previous one.
-- **Small datasets.** Below a few thousand rows, anything works. The value here
-  is what happens at 100k.
+- **One backend you own.** Use that backend's sync engine, or plain SQLite.
+  The merge is overhead when there is a single authority.
+- **Order books, trade history, charts, balances.** One value per field, and
+  the previous value is dropped. Depth, a tape, and an adding balance need a
+  different store.
+- **Relational queries.** No joins, no aggregates. A collection keyed by
+  natural key, plus a kv for everything else.
+- **Collaborative editing.** Last-writer-wins discards the other edit. That
+  wants a CRDT.
+- **A few hundred quiet rows.** Anything works. The cost that matters here is
+  a few thousand live rows with a tick.
 
 ## Repository layout
 

@@ -282,11 +282,13 @@ Three findings here matter more than the timings:
    migration is not justified by this data.** The remaining write-path lever is
    inbound JSON parse, which is ~48% of a full wave and ~70% of a realistic
    one-row-changed poll, and needs no schema change.
-3. **`market close` fails by design.** A market that closes stops arriving from
-   the feed; deletes are soft-delete + filter only with no tombstone
-   reconciliation, so it stays in the book forever. Feeds signal removal by
-   omission and the engine has no way to express it — the top functional gap for
-   every feed-driven use case.
+3. **`market close` failed in this run.** The row was still there after it
+   stopped appearing in a tick. That tick is a delta, not a full book, so
+   omission cannot mean delete or the other 4,950 selections would go with it.
+   The approach since then: a delta feed sends `"_deleted": true` for the
+   selections that left; a feed that always sends the whole book registers
+   `snapshot: true`, and omission is the tombstone. The harness scenario was
+   updated to the delta form.
 
 These scenarios wipe the database first. Without that, a second run finds the
 book already seeded and reads as failure when it is really a dirty DB.

@@ -4,12 +4,12 @@ The React Native module in this repo. Register a feed, ingest its payload, read
 the merged row. Rust owns SQLite. The merge is per field. A tombstone removes a
 row when its version wins.
 
-It was built for an app whose records arrive from more than one place and
-cannot be reconciled upstream. Sync engines replicate a single backend.
-SQLite wrappers store what you insert. This is the step between those: several
-payloads in, one local row out, with the work off the JavaScript thread. The
-root [README](../../README.md) is the full account of that, and the numbers
-against raw SQLite.
+The approach is a live book: the current row for each selection, several feeds,
+a small slice moving per tick. Betting prices are the reference. A last price
+across crypto venues is the same shape. An order book, a trade tape, or a
+balance is not — this store keeps one value per field and drops the previous
+one. The root [README](../../README.md) is the full account, including the
+numbers against raw SQLite.
 
 `openEngine()` installs the host functions. `ingest()` then copies the payload
 in 256 KB slices and the native worker reconciles on the last slice. You do
