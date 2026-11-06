@@ -3,9 +3,11 @@ import {
   openEngine,
   redis,
   ingest,
+  ingestChunked,
   registerSource,
   subscribe,
   subscribeWithCleanup,
+  schemaBufferRowCount,
   EngineError,
 } from '../index';
 
@@ -38,6 +40,16 @@ test('error envelope becomes typed Error', async () => {
   await expect(redis.get('a')).rejects.toMatchObject({ code: 4 });
 });
 
+test('schemaBufferRowCount reads the row count after the field table', () => {
+  const bytes = new Uint8Array([
+    1, 0, 0, 0, // one field
+    1, 0, 0, 0, // name length 1
+    0x61, // 'a'
+    3, 0, 0, 0, // three rows
+  ]);
+  expect(schemaBufferRowCount(bytes.buffer)).toBe(3);
+});
+
 test('ingest parses BatchSummary via the direct method', async () => {
   mockNative.ingestDirect.mockResolvedValue(
     okResp({ inserted: 2, updated: 0, unchanged: 0, dead_lettered: 1, collections: ['people'], skipped: false }),
@@ -46,6 +58,30 @@ test('ingest parses BatchSummary via the direct method', async () => {
   expect(mockNative.ingestDirect).toHaveBeenCalledWith('api', '[...]');
   expect(s.inserted).toBe(2);
   expect(s.collections).toEqual(['people']);
+});
+
+test('ingestChunked copies one slice per turn and unwraps the final envelope', async () => {
+  const calls: Array<{ len: number; finalChunk: boolean }> = [];
+  (globalThis as { __reconcileEngine?: { ingestAppend: Function } }).__reconcileEngine = {
+    ingestAppend: (_id: string, _source: string, buf: ArrayBuffer, finalChunk: boolean) => {
+      calls.push({ len: buf.byteLength, finalChunk });
+      if (!finalChunk) return Promise.resolve('null');
+      return Promise.resolve(
+        okResp({ inserted: 1, updated: 0, unchanged: 0, dead_lettered: 0, collections: [], skipped: false }),
+      );
+    },
+  };
+  const payload = 'x'.repeat(256 * 1024 + 10);
+  try {
+    const summary = await ingestChunked('api', payload);
+    expect(summary.inserted).toBe(1);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].finalChunk).toBe(false);
+    expect(calls[1].finalChunk).toBe(true);
+    expect(calls[0].len + calls[1].len).toBe(payload.length);
+  } finally {
+    delete (globalThis as { __reconcileEngine?: unknown }).__reconcileEngine;
+  }
 });
 
 test('registerSource serializes config as single arg', async () => {

@@ -8,6 +8,13 @@ export type SourceConfig = {
   natural_key_field: string;
   timestamp_field: string | null;
   priority: number;
+  /**
+   * When true, each batch is this source's full set of keys. Keys it omits
+   * become tombstones at the batch's version and compete with other sources
+   * through the same order as an update. Default false: a partial batch never
+   * deletes rows that simply were not in it.
+   */
+  snapshot?: boolean;
 };
 
 export type IngestTimings = {
@@ -40,6 +47,10 @@ export type BatchSummary = {
   changed_keys?: Record<string, string[]>;
   /** Set when any key list was capped — the change set is incomplete. */
   keys_truncated?: boolean;
+  /** Keys that moved from visible to hidden because a tombstone won. */
+  deleted?: number;
+  /** Source timestamps clamped to the local clock plus the skew bound. */
+  clock_clamped?: number;
 };
 
 /**
@@ -154,8 +165,16 @@ export function registerSource(cfg: SourceConfig): Promise<void> {
 }
 
 export function ingest(sourceId: string, payload: string): Promise<BatchSummary> {
-  // Direct method: the payload crosses the boundary as a plain string instead
-  // of being JSON-escaped into a command envelope and parsed twice.
+  // Once the fast path is installed, the payload is sliced and each slice is
+  // copied on its own turn. The engine runs on the native worker when the
+  // last slice arrives, so the JS thread is not inside std::string conversion
+  // of the whole payload or inside ingestBufferSync. Without the fast path
+  // (tests, or a caller that has not installed it) the direct string method
+  // remains.
+  const fp = fastPath();
+  if (fp?.ingestAppend) {
+    return ingestChunked(sourceId, payload);
+  }
   return NativeReconcileEngine.ingestDirect(sourceId, payload).then(unwrap<BatchSummary>);
 }
 
@@ -287,6 +306,28 @@ export type FastPathQueries = {
   queryEntriesObjects(collection: string): unknown[];
   kvGet(key: string): string | null;
   kvSet(key: string, value: string): void;
+  /**
+   * Append one slice of an ingest. `final` runs the engine on the native
+   * worker and resolves to the response envelope. Earlier slices resolve to
+   * the string `"null"`.
+   */
+  ingestAppend(
+    streamId: string,
+    sourceId: string,
+    chunk: ArrayBuffer,
+    finalChunk: boolean,
+  ): Promise<string>;
+  /**
+   * One page of a schema buffer, built on the reader worker. The ArrayBuffer
+   * is the Rust allocation (zero-copy). Cost on the JS thread is adopting
+   * the pointer, not the query.
+   */
+  queryPageAsync(
+    collection: string,
+    fieldsCsv: string,
+    limit: number,
+    offset: number,
+  ): Promise<ArrayBuffer>;
 };
 
 /**
@@ -295,4 +336,134 @@ export type FastPathQueries = {
  */
 export function fastPath(): FastPathQueries | null {
   return (globalThis as { __reconcileEngine?: FastPathQueries }).__reconcileEngine ?? null;
+}
+
+/** Characters (or bytes, for a Uint8Array) copied on one JS turn. */
+const INGEST_CHUNK = 256 * 1024;
+let ingestStreamSeq = 0;
+
+function yieldTurn(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
+/**
+ * Ingest `payload` without holding the JS thread for the whole body.
+ *
+ * A string is sliced on UTF-16 code-unit boundaries that do not split a
+ * surrogate pair, encoded per slice, and appended. A Uint8Array is sliced
+ * as bytes. The native worker concatenates the slices and runs the ingest
+ * when the last one arrives. Between slices a macrotask is scheduled so a
+ * 16 ms timer can run; that is the max-gap the device bench measures.
+ */
+export async function ingestChunked(
+  sourceId: string,
+  payload: string | Uint8Array,
+): Promise<BatchSummary> {
+  const fp = fastPath();
+  if (!fp?.ingestAppend) {
+    if (typeof payload !== 'string') {
+      throw new EngineError(4, 'installFastPath() is required to ingest bytes');
+    }
+    return NativeReconcileEngine.ingestDirect(sourceId, payload).then(unwrap<BatchSummary>);
+  }
+  const id = String(++ingestStreamSeq);
+  const total = typeof payload === 'string' ? payload.length : payload.byteLength;
+  if (total === 0) {
+    return unwrap<BatchSummary>(await fp.ingestAppend(id, sourceId, new ArrayBuffer(0), true));
+  }
+  let last = '';
+  let off = 0;
+  while (off < total) {
+    let end = Math.min(off + INGEST_CHUNK, total);
+    if (typeof payload === 'string' && end < total) {
+      const lead = payload.charCodeAt(end - 1);
+      if (lead >= 0xd800 && lead <= 0xdbff) {
+        end += 1;
+      }
+    }
+    const finalChunk = end >= total;
+    let ab: ArrayBuffer;
+    if (typeof payload === 'string') {
+      const encoded = new TextEncoder().encode(payload.slice(off, end));
+      ab = encoded.buffer.slice(
+        encoded.byteOffset,
+        encoded.byteOffset + encoded.byteLength,
+      ) as ArrayBuffer;
+    } else {
+      const slice = payload.subarray(off, end);
+      ab = slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength) as ArrayBuffer;
+    }
+    last = await fp.ingestAppend(id, sourceId, ab, finalChunk);
+    off = end;
+    if (!finalChunk) {
+      await yieldTurn();
+    }
+  }
+  return unwrap<BatchSummary>(last);
+}
+
+/** Row count from a schema-buffer page. A short page ends a stream. */
+export function schemaBufferRowCount(buf: ArrayBuffer): number {
+  const view = new DataView(buf);
+  if (buf.byteLength < 8) {
+    return 0;
+  }
+  let off = 0;
+  const nFields = view.getUint32(off, true);
+  off += 4;
+  for (let i = 0; i < nFields; i++) {
+    if (off + 4 > buf.byteLength) {
+      return 0;
+    }
+    const len = view.getUint32(off, true);
+    off += 4 + len;
+  }
+  if (off + 4 > buf.byteLength) {
+    return 0;
+  }
+  return view.getUint32(off, true);
+}
+
+export async function queryPageAsync(
+  collection: string,
+  fieldsCsv: string,
+  limit: number,
+  offset: number,
+): Promise<ArrayBuffer> {
+  const fp = fastPath();
+  if (!fp?.queryPageAsync) {
+    throw new EngineError(4, 'installFastPath() is required for queryPageAsync');
+  }
+  return fp.queryPageAsync(collection, fieldsCsv, limit, offset);
+}
+
+/**
+ * Walk a collection one page at a time. Each page is a zero-copy buffer
+ * produced on the reader worker. The callback sees it before the next page
+ * is requested, so only one page is live.
+ */
+export async function forEachPage(
+  collection: string,
+  fieldsCsv: string,
+  pageSize: number,
+  onPage: (page: ArrayBuffer, offset: number) => void | Promise<void>,
+): Promise<number> {
+  let offset = 0;
+  let pages = 0;
+  for (;;) {
+    const buf = await queryPageAsync(collection, fieldsCsv, pageSize, offset);
+    const n = schemaBufferRowCount(buf);
+    if (n === 0) {
+      break;
+    }
+    await onPage(buf, offset);
+    pages += 1;
+    if (n < pageSize) {
+      break;
+    }
+    offset += n;
+  }
+  return pages;
 }

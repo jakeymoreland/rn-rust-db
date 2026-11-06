@@ -41,6 +41,16 @@ pub struct BatchSummary {
     /// keys present are a prefix, not the whole change set.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub keys_truncated: bool,
+    /// Keys that transitioned from visible to hidden (tombstone won).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub deleted: u32,
+    /// Source timestamps clamped by the skew bound during this batch.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub clock_clamped: u32,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Per-collection ceiling on the keys carried in a change event. A batch that
@@ -53,6 +63,8 @@ pub const CHANGED_KEYS_CAP: usize = 1024;
 struct FieldMeta {
     source: String,
     updated_at: i64,
+    #[serde(default)]
+    logical: u64,
     priority: u32,
 }
 
@@ -66,6 +78,13 @@ struct ExistingRow {
     meta_floor_ts: Option<i64>,
     meta_floor_pri: Option<i64>,
     field_count: Option<i64>,
+    meta_floor_logical: Option<i64>,
+    meta_floor_source: Option<String>,
+    deleted: bool,
+    tomb_physical: Option<i64>,
+    tomb_logical: Option<i64>,
+    tomb_priority: Option<i64>,
+    tomb_source: Option<String>,
 }
 
 /// Compact on-disk form of field_meta. In almost every batch, all fields of a
@@ -103,17 +122,19 @@ fn parse_meta(
 /// Serializes the expanded meta map compactly: the modal (source, ts, pri)
 /// triple becomes the default; everything else is an override.
 fn serialize_meta_compact(meta: &BTreeMap<String, FieldMeta>) -> String {
-    let mut counts: HashMap<(&str, i64, u32), usize> = HashMap::new();
+    let mut counts: HashMap<(&str, i64, u64, u32), usize> = HashMap::new();
     for m in meta.values() {
-        *counts.entry((m.source.as_str(), m.updated_at, m.priority)).or_default() += 1;
+        *counts.entry((m.source.as_str(), m.updated_at, m.logical, m.priority)).or_default() += 1;
     }
-    let Some((&(src, ts, pri), _)) = counts.iter().max_by_key(|(_, n)| **n) else {
-        return "{\"v\":2,\"d\":{\"source\":\"\",\"updated_at\":0,\"priority\":0}}".into();
+    let Some((&(src, ts, logical, pri), _)) = counts.iter().max_by_key(|(_, n)| **n) else {
+        return "{\"v\":2,\"d\":{\"source\":\"\",\"updated_at\":0,\"logical\":0,\"priority\":0}}".into();
     };
-    let d = FieldMeta { source: src.to_string(), updated_at: ts, priority: pri };
+    let d = FieldMeta { source: src.to_string(), updated_at: ts, logical, priority: pri };
     let o: BTreeMap<String, FieldMeta> = meta
         .iter()
-        .filter(|(_, m)| m.source != d.source || m.updated_at != d.updated_at || m.priority != d.priority)
+        .filter(|(_, m)| {
+            m.source != d.source || m.updated_at != d.updated_at || m.logical != d.logical || m.priority != d.priority
+        })
         .map(|(k, m)| (k.clone(), m.clone()))
         .collect();
     serde_json::to_string(&CompactMeta { v: 2, d, o }).unwrap()
@@ -131,17 +152,18 @@ fn fields_hash(fields: &BTreeMap<String, String>) -> i64 {
     h.finish() as i64
 }
 
-/// The weakest field meta: (min updated_at, min priority among fields at that
-/// updated_at). A record that cannot beat the floor cannot advance ANY field.
-fn meta_floor(meta: &BTreeMap<String, FieldMeta>) -> (i64, i64) {
-    let floor_ts = meta.values().map(|m| m.updated_at).min().unwrap_or(i64::MIN);
-    let floor_pri = meta
-        .values()
-        .filter(|m| m.updated_at == floor_ts)
-        .map(|m| m.priority as i64)
-        .min()
-        .unwrap_or(0);
-    (floor_ts, floor_pri)
+/// Total order on a stored version. Higher sorts later and wins.
+fn version_key(m: &FieldMeta) -> (i64, u64, u32, &str) {
+    (m.updated_at, m.logical, m.priority, m.source.as_str())
+}
+
+/// The weakest field version. An incoming record that does not beat this
+/// cannot advance any field.
+fn meta_floor(meta: &BTreeMap<String, FieldMeta>) -> (i64, u64, i64, String) {
+    match meta.values().min_by(|a, b| version_key(a).cmp(&version_key(b))) {
+        Some(m) => (m.updated_at, m.logical, m.priority as i64, m.source.clone()),
+        None => (0, 0, 0, String::new()),
+    }
 }
 
 struct WriteRow {
@@ -152,7 +174,14 @@ struct WriteRow {
     content_hash: i64,
     floor_ts: i64,
     floor_pri: i64,
+    floor_logical: i64,
+    floor_source: String,
     field_count: i64,
+    deleted: bool,
+    tomb_physical: Option<i64>,
+    tomb_logical: Option<i64>,
+    tomb_priority: Option<i64>,
+    tomb_source: Option<String>,
 }
 
 struct GroupOutcome {
@@ -161,148 +190,275 @@ struct GroupOutcome {
     inserted: u32,
     updated: u32,
     unchanged: u32,
+    deleted: u32,
     visibly_changed: bool,
     write: Option<WriteRow>,
 }
 
-/// A group's in-flight row state: (fields, per-field merge meta, row updated_at).
-type RowState = (BTreeMap<String, String>, BTreeMap<String, FieldMeta>, i64);
+struct LiveState {
+    fields: BTreeMap<String, String>,
+    meta: BTreeMap<String, FieldMeta>,
+    row_ts: i64,
+    tomb: Option<FieldMeta>,
+}
+
+fn incoming_meta(cfg: &SourceConfig, rec: &CanonicalRecord) -> FieldMeta {
+    FieldMeta {
+        source: rec.source.clone(),
+        updated_at: rec.updated_at,
+        logical: rec.logical,
+        priority: cfg.priority,
+    }
+}
+
+/// Later rows in one batch that share a physical time outrank earlier ones.
+/// Records that already carry a non-zero logical (a hybrid-clock tick) are
+/// left alone so the clock's order is not rewritten.
+fn assign_batch_logical(recs: &mut [CanonicalRecord]) {
+    let mut next: HashMap<i64, u64> = HashMap::new();
+    for rec in recs.iter_mut() {
+        if rec.logical == 0 {
+            let slot = next.entry(rec.updated_at).or_insert(0);
+            let assigned = *slot;
+            *slot = slot.saturating_add(1);
+            rec.logical = assigned;
+        }
+    }
+}
+
+fn load_state(row: &ExistingRow) -> Result<LiveState, EngineError> {
+    let fields: BTreeMap<String, String> =
+        serde_json::from_str(&row.fields_json).map_err(|e| EngineError::Storage(e.to_string()))?;
+    let meta = parse_meta(&row.meta_json, &fields)?;
+    let tomb = match (&row.tomb_physical, &row.tomb_source) {
+        (Some(ts), Some(source)) => Some(FieldMeta {
+            source: source.clone(),
+            updated_at: *ts,
+            logical: row.tomb_logical.unwrap_or(0).max(0) as u64,
+            priority: row.tomb_priority.unwrap_or(0).max(0) as u32,
+        }),
+        _ => None,
+    };
+    Ok(LiveState { fields, meta, row_ts: row.updated_at, tomb })
+}
 
 /// Folds all of one key's records into its final row state, entirely in RAM.
 /// The DB row is parsed at most once per group (and not at all when the hash
 /// short-circuit fires on the first record); the final state serializes once.
+///
+/// Version order, highest wins: physical time, logical counter, priority,
+/// source id. On a complete tie the lexicographically greater field value
+/// wins, so two replicas that ingest the same updates in opposite orders
+/// converge. A tombstone wins an equal version against an update.
 fn merge_group(
     cfg: &SourceConfig,
     db_row: Option<ExistingRow>,
-    ((collection, natural_key), recs): ((String, String), Vec<CanonicalRecord>),
+    ((collection, natural_key), mut recs): ((String, String), Vec<CanonicalRecord>),
 ) -> Result<GroupOutcome, EngineError> {
+    assign_batch_logical(&mut recs);
     let was_insert = db_row.is_none();
     let mut inserted = 0u32;
     let mut updated = 0u32;
     let mut unchanged = 0u32;
+    let mut deleted = 0u32;
     let mut visibly_changed = false;
     let mut wrote = false;
-    // None until inserted or parsed from db_row
-    let mut state: Option<RowState> = None;
+    let mut visible = db_row.as_ref().map(|r| !r.deleted).unwrap_or(false);
+    let mut state: Option<LiveState> = None;
 
     for rec in recs {
-        if state.is_none() && db_row.is_none() {
+        let inc = incoming_meta(cfg, &rec);
+        if state.is_none() {
+            if let Some(row) = db_row.as_ref() {
+                if !rec.deleted && !row.deleted {
+                    if let (Some(h), Some(floor_ts), Some(floor_pri), Some(fc), Some(floor_logical), Some(floor_source)) = (
+                        row.content_hash,
+                        row.meta_floor_ts,
+                        row.meta_floor_pri,
+                        row.field_count,
+                        row.meta_floor_logical,
+                        row.meta_floor_source.as_deref(),
+                    ) {
+                        let floor = FieldMeta {
+                            source: floor_source.to_string(),
+                            updated_at: floor_ts,
+                            logical: floor_logical.max(0) as u64,
+                            priority: floor_pri.max(0) as u32,
+                        };
+                        let cannot_advance = version_key(&inc) <= version_key(&floor);
+                        if cannot_advance
+                            && fields_hash(&rec.fields) == h
+                            && fc == rec.fields.len() as i64
+                        {
+                            unchanged += 1;
+                            continue;
+                        }
+                    }
+                }
+                state = Some(load_state(row)?);
+            }
+        }
+
+        if rec.deleted {
+            let live = state.get_or_insert(LiveState {
+                fields: BTreeMap::new(),
+                meta: BTreeMap::new(),
+                row_ts: rec.updated_at,
+                tomb: None,
+            });
+            let apply = !matches!(&live.tomb, Some(t) if version_key(&inc) <= version_key(t));
+            if !apply {
+                unchanged += 1;
+                continue;
+            }
+            let before_len = live.fields.len();
+            live.tomb = Some(inc.clone());
+            let tomb = inc.clone();
+            let drop_keys: Vec<String> = live
+                .fields
+                .keys()
+                .filter(|k| {
+                    live.meta
+                        .get(*k)
+                        .map(|m| version_key(m) <= version_key(&tomb))
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect();
+            for k in drop_keys {
+                live.fields.remove(&k);
+                live.meta.remove(&k);
+            }
+            live.row_ts = live.row_ts.max(rec.updated_at);
+            wrote = true;
+            let now_visible = !live.fields.is_empty();
+            if visible && !now_visible {
+                deleted += 1;
+                visibly_changed = true;
+            } else if live.fields.len() != before_len {
+                updated += 1;
+                visibly_changed = true;
+            } else {
+                unchanged += 1;
+            }
+            visible = now_visible;
+            continue;
+        }
+
+        if state.is_none() {
             let meta: BTreeMap<String, FieldMeta> = rec
                 .fields
                 .keys()
-                .map(|k| {
-                    (
-                        k.clone(),
-                        FieldMeta {
-                            source: rec.source.clone(),
-                            updated_at: rec.updated_at,
-                            priority: cfg.priority,
-                        },
-                    )
-                })
+                .map(|k| (k.clone(), inc.clone()))
                 .collect();
-            state = Some((rec.fields, meta, rec.updated_at));
-            inserted += 1;
-            visibly_changed = true;
+            state = Some(LiveState {
+                fields: rec.fields,
+                meta,
+                row_ts: rec.updated_at,
+                tomb: None,
+            });
             wrote = true;
+            if !visible {
+                inserted += 1;
+                visibly_changed = true;
+                visible = true;
+            }
             continue;
         }
-        if state.is_none() {
-            let row = db_row.as_ref().unwrap();
-            // Short-circuit (valid only against the pristine DB row):
-            // identical content AND the record cannot beat the meta floor
-            // means no field's value or meta could change — skip the parse.
-            // The exact field count guards against a 64-bit hash collision
-            // swallowing a record that introduces a new field (audit F8).
-            if let (Some(h), Some(floor_ts), Some(floor_pri), Some(fc)) =
-                (row.content_hash, row.meta_floor_ts, row.meta_floor_pri, row.field_count)
-            {
-                let cannot_advance = rec.updated_at < floor_ts
-                    || (rec.updated_at == floor_ts && (cfg.priority as i64) <= floor_pri);
-                if cannot_advance
-                    && fields_hash(&rec.fields) == h
-                    && fc == rec.fields.len() as i64
-                {
-                    unchanged += 1;
-                    continue;
-                }
+
+        let live = state.as_mut().unwrap();
+        if let Some(t) = &live.tomb {
+            if version_key(&inc) <= version_key(t) {
+                unchanged += 1;
+                continue;
             }
-            let fields: BTreeMap<String, String> = serde_json::from_str(&row.fields_json)
-                .map_err(|e| EngineError::Storage(e.to_string()))?;
-            let meta = parse_meta(&row.meta_json, &fields)?;
-            state = Some((fields, meta, row.updated_at));
         }
-        let (fields, meta, row_ts) = state.as_mut().unwrap();
         let mut dirty = false;
-        // `advanced` tracks whether any field won on (timestamp, priority) ordering,
-        // even if the winning value happens to equal the current value. Without this,
-        // a same-value win would never persist its newer FieldMeta, and a later,
-        // genuinely older-but-different value could incorrectly win against it.
         let mut advanced = false;
         for (k, v) in &rec.fields {
-            let wins = match meta.get(k) {
+            let wins = match live.meta.get(k) {
                 None => true,
                 Some(m) => {
-                    // Exact tie from the SAME source is a correction in batch
-                    // order — the incoming record wins (audit S2). Cross-source
-                    // exact ties keep the existing value for stability.
-                    rec.updated_at > m.updated_at
-                        || (rec.updated_at == m.updated_at
-                            && (cfg.priority > m.priority
-                                || (cfg.priority == m.priority && m.source == rec.source)))
+                    let iv = version_key(&inc);
+                    let cv = version_key(m);
+                    iv > cv || (iv == cv && v.as_str() > live.fields.get(k).map(String::as_str).unwrap_or(""))
                 }
             };
             if wins {
                 advanced = true;
-                if fields.get(k) != Some(v) {
-                    fields.insert(k.clone(), v.clone());
+                if live.fields.get(k) != Some(v) {
+                    live.fields.insert(k.clone(), v.clone());
                     dirty = true;
                 }
-                meta.insert(
-                    k.clone(),
-                    FieldMeta {
-                        source: rec.source.clone(),
-                        updated_at: rec.updated_at,
-                        priority: cfg.priority,
-                    },
-                );
+                live.meta.insert(k.clone(), inc.clone());
             }
         }
-        if advanced {
-            // Row-level updated_at must never move backward: a batch that only adds
-            // an older/new field to an already-newer row must not regress the row stamp.
-            *row_ts = (*row_ts).max(rec.updated_at);
-            wrote = true;
-            if dirty {
-                updated += 1;
-                visibly_changed = true;
+        if !advanced {
+            unchanged += 1;
+            continue;
+        }
+        live.row_ts = live.row_ts.max(rec.updated_at);
+        wrote = true;
+        let now_visible = !live.fields.is_empty();
+        if !visible && now_visible {
+            if was_insert {
+                inserted += 1;
             } else {
-                // Advanced but same value: persisted for correctness (newer FieldMeta),
-                // but nothing visibly changed, so no pub/sub event for this collection.
-                unchanged += 1;
+                updated += 1;
             }
+            visibly_changed = true;
+        } else if dirty {
+            updated += 1;
+            visibly_changed = true;
         } else {
             unchanged += 1;
         }
+        visible = now_visible;
     }
 
     let write = if wrote {
-        let (fields, meta, updated_at) = state.unwrap();
-        let (floor_ts, floor_pri) = meta_floor(&meta);
+        let live = state.unwrap();
+        let (floor_ts, floor_logical, floor_pri, floor_source) = if live.meta.is_empty() {
+            if let Some(t) = &live.tomb {
+                (t.updated_at, t.logical as i64, t.priority as i64, t.source.clone())
+            } else {
+                (0, 0, 0, String::new())
+            }
+        } else {
+            let (ts, log, pri, src) = meta_floor(&live.meta);
+            (ts, log as i64, pri, src)
+        };
+        let fields_json = serde_json::to_string(&live.fields).unwrap_or_else(|_| "{}".to_string());
         Some(WriteRow {
             is_insert: was_insert,
-            fields_json: serde_json::to_string(&fields).unwrap(),
-            meta_json: serialize_meta_compact(&meta),
-            updated_at,
-            content_hash: fields_hash(&fields),
+            fields_json,
+            meta_json: serialize_meta_compact(&live.meta),
+            updated_at: live.row_ts,
+            content_hash: fields_hash(&live.fields),
             floor_ts,
             floor_pri,
-            field_count: fields.len() as i64,
+            floor_logical,
+            floor_source,
+            field_count: live.fields.len() as i64,
+            deleted: live.fields.is_empty(),
+            tomb_physical: live.tomb.as_ref().map(|t| t.updated_at),
+            tomb_logical: live.tomb.as_ref().map(|t| t.logical as i64),
+            tomb_priority: live.tomb.as_ref().map(|t| t.priority as i64),
+            tomb_source: live.tomb.map(|t| t.source),
         })
     } else {
         None
     };
-    Ok(GroupOutcome { collection, natural_key, inserted, updated, unchanged, visibly_changed, write })
+    Ok(GroupOutcome {
+        collection,
+        natural_key,
+        inserted,
+        updated,
+        unchanged,
+        deleted,
+        visibly_changed,
+        write,
+    })
 }
 
 pub fn reconcile(
@@ -311,6 +467,17 @@ pub fn reconcile(
     outcome: NormalizeOutcome,
     now_ms: i64,
     content_hash: &str,
+) -> Result<BatchSummary, EngineError> {
+    reconcile_with(store, cfg, outcome, now_ms, content_hash, None)
+}
+
+pub(crate) fn reconcile_with(
+    store: &mut Store,
+    cfg: &SourceConfig,
+    mut outcome: NormalizeOutcome,
+    now_ms: i64,
+    content_hash: &str,
+    clock: Option<&crate::clock::HybridClock>,
 ) -> Result<BatchSummary, EngineError> {
     let tx = store.conn.transaction()?;
     let mut summary = BatchSummary {
@@ -322,7 +489,45 @@ pub fn reconcile(
         timings: None,
         changed_keys: BTreeMap::new(),
         keys_truncated: false,
+        deleted: 0,
+        clock_clamped: 0,
     };
+    if cfg.snapshot {
+        // Omission is a tombstone at the batch's max version. An empty batch
+        // uses the caller clock, which is what "the feed now contains nothing"
+        // means. The tombstone still has to beat each row's version, so a
+        // newer write from another source keeps the row.
+        let present: std::collections::HashSet<String> =
+            outcome.records.iter().map(|r| r.natural_key.clone()).collect();
+        let (clock_ts, clock_log) = outcome
+            .records
+            .iter()
+            .map(|r| (r.updated_at, r.logical))
+            .max()
+            .unwrap_or((now_ms, 0));
+        let mut stmt = tx.prepare(
+            "SELECT natural_key FROM entries WHERE collection = ?1 AND deleted = 0",
+        )?;
+        let live: Vec<String> = stmt
+            .query_map(params![cfg.collection], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for key in live {
+            if present.contains(&key) {
+                continue;
+            }
+            outcome.records.push(CanonicalRecord {
+                collection: cfg.collection.clone(),
+                natural_key: key,
+                source: cfg.source_id.clone(),
+                fields: BTreeMap::new(),
+                updated_at: clock_ts,
+                logical: clock_log,
+                timestamped: true,
+                deleted: true,
+            });
+        }
+    }
     let mut timings = IngestTimings { parse_ms: 0.0, prefetch_ms: 0.0, merge_ms: 0.0, write_ms: 0.0, commit_ms: 0.0 };
     let t_prefetch = std::time::Instant::now();
     let mut changed_collections: Vec<String> = vec![];
@@ -344,7 +549,9 @@ pub fn reconcile(
             for chunk in keys.chunks(900) {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let sql = format!(
-                    "SELECT natural_key, fields, field_meta, updated_at, content_hash, meta_floor_ts, meta_floor_pri, field_count
+                    "SELECT natural_key, fields, field_meta, updated_at, content_hash, meta_floor_ts, meta_floor_pri, field_count,
+                            meta_floor_logical, meta_floor_source, deleted, tombstone_physical, tombstone_logical,
+                            tombstone_priority, tombstone_source
                      FROM entries WHERE collection = ? AND natural_key IN ({placeholders})"
                 );
                 let mut stmt = tx.prepare(&sql)?;
@@ -362,6 +569,13 @@ pub fn reconcile(
                             meta_floor_ts: row.get(5)?,
                             meta_floor_pri: row.get(6)?,
                             field_count: row.get(7)?,
+                            meta_floor_logical: row.get(8)?,
+                            meta_floor_source: row.get(9)?,
+                            deleted: row.get::<_, i64>(10)? != 0,
+                            tomb_physical: row.get(11)?,
+                            tomb_logical: row.get(12)?,
+                            tomb_priority: row.get(13)?,
+                            tomb_source: row.get(14)?,
                         },
                     );
                 }
@@ -416,11 +630,11 @@ pub fn reconcile(
     // actually changed (a group merged N times still writes once).
     {
         let mut ins_stmt = tx.prepare_cached(
-            "INSERT INTO entries(collection, natural_key, fields, field_meta, updated_at, content_hash, meta_floor_ts, meta_floor_pri, field_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO entries(collection, natural_key, fields, field_meta, updated_at, content_hash, meta_floor_ts, meta_floor_pri, field_count, meta_floor_logical, meta_floor_source, deleted, tombstone_physical, tombstone_logical, tombstone_priority, tombstone_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )?;
         let mut upd_stmt = tx.prepare_cached(
-            "UPDATE entries SET fields = ?3, field_meta = ?4, updated_at = ?5, content_hash = ?6, meta_floor_ts = ?7, meta_floor_pri = ?8, field_count = ?9
+            "UPDATE entries SET fields = ?3, field_meta = ?4, updated_at = ?5, content_hash = ?6, meta_floor_ts = ?7, meta_floor_pri = ?8, field_count = ?9, meta_floor_logical = ?10, meta_floor_source = ?11, deleted = ?12, tombstone_physical = ?13, tombstone_logical = ?14, tombstone_priority = ?15, tombstone_source = ?16
              WHERE collection = ?1 AND natural_key = ?2",
         )?;
         for oc in outcomes {
@@ -428,6 +642,7 @@ pub fn reconcile(
             summary.inserted += oc.inserted;
             summary.updated += oc.updated;
             summary.unchanged += oc.unchanged;
+            summary.deleted += oc.deleted;
             if oc.visibly_changed {
                 changed_collections.push(oc.collection.clone());
                 // Bounded per collection: past the cap we stop recording and
@@ -450,7 +665,14 @@ pub fn reconcile(
                     w.content_hash,
                     w.floor_ts,
                     w.floor_pri,
-                    w.field_count
+                    w.field_count,
+                    w.floor_logical,
+                    w.floor_source,
+                    if w.deleted { 1i64 } else { 0i64 },
+                    w.tomb_physical,
+                    w.tomb_logical,
+                    w.tomb_priority,
+                    w.tomb_source
                 ])?;
             }
         }
@@ -472,6 +694,16 @@ pub fn reconcile(
                SELECT id FROM dead_letter WHERE source = ?1 ORDER BY id DESC LIMIT 1000)",
             params![cfg.source_id],
         )?;
+    }
+
+    if let Some(clock) = clock {
+        clock.persist(&tx)?;
+        if let Some(cutoff) = clock.compaction_cutoff(now_ms) {
+            tx.execute(
+                "DELETE FROM entries WHERE deleted = 1 AND tombstone_physical IS NOT NULL AND tombstone_physical < ?1",
+                params![cutoff],
+            )?;
+        }
     }
 
     // Audit S6: the source's content_hash is written in THIS transaction with
@@ -509,6 +741,7 @@ mod tests {
             natural_key_field: "email".into(),
             timestamp_field: None,
             priority,
+            snapshot: false,
         }
     }
 
@@ -522,6 +755,9 @@ mod tests {
             source: source.into(),
             fields,
             updated_at: ts,
+            logical: 0,
+            timestamped: true,
+            deleted: false,
         }
     }
 
@@ -745,9 +981,9 @@ mod tests {
         assert_eq!(h["name"], "Ann");
     }
 
-    // Audit S2: an exact tie (same ts, same priority) from the SAME source is
-    // a correction in batch order — the later record must win. Cross-source
-    // exact ties keep the existing value (stability).
+    // Same physical time and priority: within one batch the later row gets a
+    // higher logical counter and wins. Across sources the greater source id
+    // wins, so the result does not depend on which batch arrived first.
     #[test]
     fn exact_tie_same_source_last_writer_wins() {
         let mut st = Store::open(":memory:").unwrap();
@@ -768,13 +1004,20 @@ mod tests {
     }
 
     #[test]
-    fn exact_tie_cross_source_keeps_existing() {
+    fn exact_tie_cross_source_orders_by_source_id() {
         let mut st = Store::open(":memory:").unwrap();
         reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
         let s = reconcile(&mut st, &cfg("other", 10), outcome(vec![rec("other", "a@x.com", "name", "Intruder", 100)]), 0, "h").unwrap();
-        assert_eq!(s.updated, 0);
+        assert_eq!(s.updated, 1);
         let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
-        assert_eq!(h["name"], "Ann");
+        // "other" > "api", so the tie does not depend on arrival.
+        assert_eq!(h["name"], "Intruder");
+        // The opposite arrival order converges on the same value.
+        let mut st = Store::open(":memory:").unwrap();
+        reconcile(&mut st, &cfg("other", 10), outcome(vec![rec("other", "a@x.com", "name", "Intruder", 100)]), 0, "h").unwrap();
+        reconcile(&mut st, &cfg("api", 10), outcome(vec![rec("api", "a@x.com", "name", "Ann", 100)]), 0, "h").unwrap();
+        let h = crate::commands::hgetall(&st, "entry:people:a@x.com", 0).unwrap();
+        assert_eq!(h["name"], "Intruder");
     }
 
     // Audit F8: a content-hash collision must not swallow a record that
